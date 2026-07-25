@@ -94,6 +94,7 @@ ESP32-S3 は USB 2.0 デバイスとして動作するため、**PC の USB ポ�
 
 ## 今後やること
 
+- **音声バックエンドの差し替え検討** → [docs/voice-backend-plan.md](docs/voice-backend-plan.md)（出荷時は中国のクラウド XiaoZhi 経由。自前サーバー / 国内 API + VOICEVOX へ寄せる設計案と、無償枠・自前ビルドの前提整理）
 - Arduino / PlatformIO での自作スケッチ
 - MCP ツールを増やして手元の他システムと連携させる
 
