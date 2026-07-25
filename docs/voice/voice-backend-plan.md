@@ -2,9 +2,62 @@
 
 出荷時の構成では、音声認識・LLM・読み上げのすべてを中国のクラウドサービス **XiaoZhi（小智）** が処理します。会話内容が外部サーバーへ送られる前提の構成なので、自分の環境で完結させる／国内サービスに寄せる方向を検討します。
 
-このメモは **2026-07-25 時点の調査結果**です。着手前の設計メモであり、動作を確認した構成ではありません。**検証済みの事実と未検証の想定を明示して区別**しています。
+**2026-07-25 時点の調査記録。** 実装を読んで確認した事実と、未検証の想定を分けて書いています。**アバター・MCP ツール・本体 UI は維持する**方針です。
 
-## 制約: 無償枠の実効値を先に確認する
+## 結論から: ファームウェアの再ビルドは不要
+
+当初は「`CONFIG_OTA_URL` を変えるために自前ビルドが必要、しかし自前ビルドは公式アプリとペアリングできない」という詰みを想定していました。実装を読んだ結果、**再ビルドせずに接続先を変更できる**ことが分かりました。
+
+xiaozhi-esp32 の `Ota::GetCheckVersionUrl()`（v2.2.4）が根拠です。
+
+```cpp
+std::string Ota::GetCheckVersionUrl() {
+    Settings settings("wifi", false);
+    std::string url = settings.GetString("ota_url");
+    if (url.empty()) {
+        url = CONFIG_OTA_URL;
+    }
+    return url;
+}
+```
+
+**NVS の `wifi` 名前空間にある `ota_url` が優先され、空のときだけビルド時の `CONFIG_OTA_URL` にフォールバック**します。したがって NVS に `ota_url` を書き込めば、**公式バイナリのまま**接続先を自前サーバーへ向けられます。
+
+## ファームウェアの構成（確認済み）
+
+`firmware/repos.json` により、上流の **[78/xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) の `v2.2.4`** を取得し、`patches/xiaozhi-esp32.patch` を適用する構成です。したがって音声パイプラインのプロトコルは xiaozhi-esp32 v2.2.4 の実装がそのまま基準になります。M5Stack 側のコード（`firmware/main/`）には `hal/`・`apps/`・`stackchan/`（アバターやモーション）が置かれています。
+
+接続先の設定は用途ごとに分離しています（`firmware/main/Kconfig.projbuild`）。
+
+| 設定 | 既定値 | 役割 |
+|---|---|---|
+| `CONFIG_STACKCHAN_SERVER_URL` | `http://47.113.125.164:12800` | StackChan バックエンド。`/stackChan/device/user`・`/stackChan/apps`・`/stackChan/ws` を組み立てる。help に「self-hosted deployment に向けるには `sdkconfig.defaults.local` で上書きせよ」と明記 |
+| `CONFIG_OTA_URL` | `https://api.tenclass.net/xiaozhi/ota/` | XiaoZhi 側の OTA / サーバー情報取得先。**音声パイプラインの接続先はこちら**。NVS `wifi/ota_url` で上書き可能 |
+
+リポジトリには **`server/` として公式バックエンドの完全なソース**も含まれています（Go + MySQL スキーマ + Flutter Web 管理画面 + Docker / Kustomize + デバイスとアプリ間の WebSocket 中継 + XiaoZhi 連携）。アプリ連携機能まで自前化したい場合はこちらも自己ホストできます。
+
+## OTA エンドポイントが返すべき応答（確認済み）
+
+`main/ota.cc`（v2.2.4）は、`ota_url` に対して HTTP で問い合わせ、200 応答の JSON を次のように解釈します。
+
+- **`firmware`**: `{"version": "...", "url": "..."}`。`version` が現在版より新しいと更新が走る。`force: 1` で強制。**更新させたくない場合は現在版と同じ version を返す**
+- **`websocket`**: オブジェクトの各メンバー（文字列・数値）が **NVS 名前空間 `websocket` にそのまま保存**される。ここに音声用の `url` と `token` を入れる
+- **`mqtt`**: 同様に NVS 名前空間 `mqtt` へ保存される（WebSocket 方式なら不要）
+- **`activation`**: `message` / `code` / `challenge` / `timeout_ms`。アクティベーションコード表示のフロー。**自前サーバーでは省略できる**（省略すれば `has_activation_code_` は false のまま）
+- 送信ヘッダは `Activation-Version`（シリアル有無で 1 or 2）、`Device-Id`（MAC アドレス）、`Accept-Language`、`Content-Type: application/json`
+- アクティベーションを使う場合、`ota_url` の末尾に `/activate` を付けたエンドポイントも呼ばれる
+
+## 想定手順（未実施）
+
+1. **NVS イメージを生成する**。ESP-IDF の `nvs_partition_gen.py`（単体の Python スクリプトとして取得可）に CSV を渡し、`wifi` 名前空間に `ota_url = http://<自前ホスト>/xiaozhi/ota/` を持つ 16KB のイメージを作る
+2. **`esptool` で `0x9000` に書き込む**（パーティションテーブル上の `nvs` は offset `0x9000` / size `0x4000`）。この操作で既存の NVS（Wi-Fi 設定・アカウント紐付け）は消える
+3. **公式アプリでペアリングをやり直す**。BLE 設定サーバーが受け付けるコマンドは `setWifi` / `getWifiStatus` / `handshake` の 3 つだけで、`setWifi` は同じ `wifi` 名前空間の ssid / password のみを書くため、**先に入れた `ota_url` は残る**
+4. 本体で AI エージェントに入ると、自前の OTA エンドポイントへ問い合わせが飛ぶ。ここで `firmware`（現在版と同じ version）と `websocket`（自前サーバーの url / token）を返す
+5. **サーバー側**を用意する。LLM は OpenAI 互換 API、読み上げは VOICEVOX、音声認識はローカル処理を想定
+
+**この経路ならファームウェアは公式バイナリのままなので、アバター・MCP ツール・アプリ連携がすべて維持されます。**
+
+## 無償枠の制約（外部 API を使う場合）
 
 候補として「さくらのAI Engine」（OpenAI / Anthropic 互換 API）を調べました。2026-07 のキャンペーン告知に記載された無償枠は次のとおりです。
 
@@ -14,84 +67,29 @@
 | Audio transcriptions（音声認識） | 月 **50** リクエスト |
 | Audio speeches（読み上げ） | 月 **50** リクエスト |
 
-自動課金は発生しない仕様と案内されています。
-
-ここで重要なのは **音声系が月 50 リクエスト**という点です。音声対話は 1 往復で「認識 1 + 読み上げ 1」を消費するため、**月あたり 25 往復程度**しか使えません。したがって、
+自動課金は発生しない仕様と案内されています。**音声系が月 50** なので、1 往復で認識 1 + 読み上げ 1 を消費する音声対話では**月 25 往復程度**しか使えません。したがって、
 
 - **音声パイプラインの丸ごと置き換えには無償枠が不足する**
 - **LLM（頭脳）としてなら 3,000 リクエストで十分**
 
-という結論になります。無償枠の値は変更されうるので、着手時に必ず最新の記載を確認します。
+という切り分けになります。読み上げは VOICEVOX（無償・自前ホスト）、音声認識はローカルに寄せるのが現実的です。無償枠の値は変更されうるので、着手時に最新の記載を確認します。
 
-## 差し替えポイントは 2 つに分離している（確認済み）
+## 未検証・要注意
 
-`firmware/main/Kconfig.projbuild` を読むと、接続先が用途ごとに別の設定になっています。
+- **自前 OTA / WebSocket サーバーが xiaozhi のプロトコルに実際に適合するかは未検証**。応答スキーマは読み取れたが、WebSocket 側の音声フレーム仕様（`hal_ws_avatar.cpp` および上流の protocol 実装）はまだ読んでいない
+- **NVS を書き換えるとアカウント紐付けが消える**ため、ペアリングのやり直しが必要。手順 3 が通ることは未検証（公式ファームのままなので通る見込み）
+- `nvs_partition_gen.py` で生成したイメージが、この版の NVS フォーマットとして正しく読まれるかは未検証
+- **公式版に戻す手段は確立済み**（USB で公式バイナリを書き戻す。手順は [../setup/firmware-flash.md](../setup/firmware-flash.md)）
 
-| 設定 | 既定値 | 役割 |
-|---|---|---|
-| `CONFIG_STACKCHAN_SERVER_URL` | `http://47.113.125.164:12800` | StackChan バックエンド。HAL がここから `/stackChan/device/user`・`/stackChan/apps`・`/stackChan/ws` を組み立てる。help に「**self-hosted deployment に向けるには `sdkconfig.defaults.local` で上書きせよ**」と明記されている |
-| `CONFIG_OTA_URL` | `https://api.tenclass.net/xiaozhi/ota/` | XiaoZhi 側の OTA / サーバー情報取得先。**音声パイプラインの接続先はこちら** |
+## 代替案: コミュニティ製ファーム（採らない）
 
-つまり「アプリ連携・ダンス等の機能」と「音声パイプライン」は別系統で、**音声だけ差し替えるなら `CONFIG_OTA_URL`** が対象になります。
+`AI_StackChan_Ex`（`ronron-gh/AI_StackChan_Ex`）系は SD カード上の YAML で API キーやサービスを切り替えられ、OpenAI 互換構成や VOICEVOX に対応しています。ただし、
 
-さらにリポジトリには **`server/` として公式バックエンドの完全なソース**が含まれています（Go + MySQL スキーマ + Flutter Web 管理画面 + Docker / Kustomize テンプレート + デバイスとアプリ間の WebSocket 中継 + XiaoZhi 連携ロジック）。README も自前ホスト前提の構成になっており、必要なら `CONFIG_STACKCHAN_SERVER_URL` 側も自分で持てます。
+- 歴史的に **SG90 の PWM サーボ前提**。本機は **FEETECH SCS0009 のシリアルサーボ**なので `servo_type` を `SCS`、センター 150/150、UART を GPIO6/7 に設定する必要がある
+- **公式アプリの機能（アバター・MCP ツール群・リモコン連携）は失われる**
 
-## プロビジョニング問題は回避できる（確認済み）
-
-当初「自前ビルドは公式アプリとペアリングできない（`secret_logic` がスタブ）ので Wi-Fi をどう入れるか」が最大の未知でした。これは解決します。
-
-- Wi-Fi 資格情報は `firmware/main/hal/utils/wifi_connect/wifi_station.cc` の `StackChanWifiStation::AddAuth(ssid, password)` が `SsidManager` 経由で **NVS に保存**し、あわせて `esp_wifi_set_config()` も呼ぶ実装
-- ESP-IDF 自身の Wi-Fi NVS 永続化も有効（実機の起動ログに `wifi:config NVS flash: enabled`）
-- **`CONFIG_OTA_URL` を変えるために自前ビルドは必須**なので、同じビルドで**資格情報をコンパイル時に埋め込み、NVS が空なら `AddAuth()` を呼ぶ**だけで済む
-
-結果として、**BLE ペアリングも公式アプリも不要**になり、スタブのハンドシェイクトークン問題を迂回できます。アバターや MCP ツールは公式ファームのまま維持されます。
-
-## 設計候補
-
-### 案 A: 自前サーバーへ向ける（本命）
-
-出荷時ファームの接続先を自前サーバーに変更し、その中で各機能を差し替えます。
-
-- **LLM**: OpenAI 互換エンドポイント（さくらのAI Engine 等）
-- **読み上げ (TTS)**: VOICEVOX を自前ホスト（無償・日本語品質が高い）
-- **音声認識 (STT)**: ローカル処理（短い発話なら小型モデルで現実的）
-
-**検証済みの根拠**: 公式ファームの `firmware/CMakeLists.txt` に、`sdkconfig.defaults.local` を置くとビルド設定を上書きできる仕組みがあり、コメントに self-hosted / custom deployment 向けであることと、`CONFIG_STACKCHAN_SERVER_URL` / `CONFIG_OTA_URL` を固定する用途が明記されています。**接続先を自前に向ける想定は公式に用意されている**と読めます。
-
-**未検証・要注意**:
-
-- **ファームの自前ビルドが必要**（ESP-IDF v5.5.4）。ビルドはクラウド環境で行う
-- **自前ビルドしたファームは公式アプリとペアリングできない**。ハンドシェイクトークンを返す `firmware/main/hal/utils/secret_logic/secret_logic.cpp` は公開版がスタブ（固定文字列）で、weak シンボルとして公式ビルド時に本物が差し込まれる構造。→ ただし上記のとおり **Wi-Fi をコンパイル時に埋め込めばアプリ自体が不要**になるため、これは阻害要因にならない
-- 本体だけで Wi-Fi を設定する画面は無い（`app_setup/workers/connectivity.cpp` はアプリのインストールを促す QR を出すのみ）。画面から入れる導線を作るなら自分で実装することになる
-- **自前の OTA / サーバー実装が XiaoZhi のプロトコルに合っているかは未検証**。`OTA_URL` の応答で WebSocket 接続先やトークンが渡る形式に合わせる必要がある。ここが次に割るべき最大の未知
-- OTA URL を自前に向けると、以後の更新経路も自分で用意する責任が発生する（公式版に戻す手段＝USB 書き込みは常に残る）
-- **アプリ連携が要る機能（ダンス配信・パノラマ・App Store 等）を残したい場合は `server/` の自前ホストが別途必要**。音声だけが目的なら不要
-
-### 案 B: コミュニティ製ファームを使う
-
-`AI_StackChan_Ex`（`ronron-gh/AI_StackChan_Ex`）系は、SD カード上の YAML で API キーやサービス選択を切り替えられ、OpenAI 互換の構成や VOICEVOX に対応しています。
-
-**未検証・要注意**:
-
-- これらのファームは歴史的に **SG90 の PWM サーボ前提**。本機（K151）は **FEETECH SCS0009 のシリアルサーボ**なので、`servo_type` を `SCS` に変更し、センター値を 150/150、UART を GPIO6/7 に設定する必要がある
-- 公式アプリの機能（アバター・MCP ツール群・リモコン連携など）は失われる
-- SD カードに API キーを置く運用になるため、設定後はカードを抜く等の取り扱いが必要
-
-## 方針（確定分）
-
-- **案 A で進める。** アバター・MCP ツール・本体 UI を維持したいので、ファームは公式のまま設定だけ差し替える
-- **音声認識と読み上げは自前（ローカル / VOICEVOX）に寄せ、外部 API は LLM だけにする**。無償枠の形（音声 50 / Chat 3,000）と一致する
-- **Wi-Fi はコンパイル時に埋め込む**。アプリ経由のプロビジョニングは使わない
-- 本機は起動時に MCP ツール（`self.robot.get_head_angles` / `set_head_angles` / `set_led_color` / `create_reminder` / `get_reminders` / `stop_reminder`）を登録するので、差し替え後もこれらを活かす
-
-## 次の手順
-
-1. **`OTA_URL` の応答仕様を確定させる**（残る最大の未知）。XiaoZhi 互換サーバーが返すべき JSON と、そこから WebSocket 接続先・トークンをどう受け取るかをファーム側の実装から読み切る
-2. ESP-IDF v5.5.4 でクラウド環境にビルド環境を用意し、**まず無改変のままビルドが通ることを確認**（既知の良品を作る）
-3. `sdkconfig.defaults.local` で `CONFIG_OTA_URL` を自前エンドポイントに向け、Wi-Fi 埋め込みを追加してビルド
-4. USB で書き込み、シリアルログで接続先が変わったことを確認（公式版に戻す手段は確立済み）
-5. サーバー側（LLM = OpenAI 互換 API / TTS = VOICEVOX / STT = ローカル）を組み立てて会話を通す
+アバターを維持したいので**この案は採りません**。
 
 ## 現状
 
-**着手前の調査段階。** 差し替えポイントとプロビジョニング手段は確認済み、サーバー側の互換性は未検証です。進捗があればこのメモを更新します。
+**着手前。** 差し替えポイント・OTA 応答スキーマ・プロビジョニング手段は実装から確認済み。次は WebSocket 側の音声フレーム仕様の読み取りから。
