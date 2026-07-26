@@ -16,7 +16,8 @@ M5 スタックちゃん（**M5STACK-K151** / M5Stack CoreS3）の開発記録�
 |---|---|
 | [初期設定とペアリング不能問題](docs/setup/pairing-and-firmware.md) | アプリで `No devices found` が出て設定が終わらない問題。シリアルログでの切り分けから、原因（出荷時ファームが古い）と解決までの全記録。踏んだ罠の一覧つき |
 | [公式ファームウェアを USB で書き込む](docs/setup/firmware-flash.md) | M5Burner（GUI）を使わず、公開 API と `esptool` 単体実行ファイルで公式バイナリを書き込む手順。ロールバック方法も記載 |
-| [音声バックエンド差し替えの検討](docs/voice/voice-backend-plan.md) | 出荷時は中国のクラウド XiaoZhi 経由。自前サーバー / 国内 API + VOICEVOX へ寄せる設計案と、無償枠・自前ビルド・プロビジョニングの前提整理 |
+| [音声バックエンド差し替えの検討](docs/voice/voice-backend-plan.md) | 出荷時は中国のクラウド XiaoZhi 経由。自前サーバーへ寄せる設計と、無償枠・自前ビルド・プロビジョニングの前提整理。差し替えポイントと現在の進捗 |
+| [XiaoZhi WebSocket プロトコル](docs/voice/xiaozhi-websocket-protocol.md) | 自前サーバーを書くために必要な仕様のまとめ。OTA 応答スキーマ、hello の交換、音声フレームの形式、JSON メッセージの一覧 |
 
 ## 要点だけ先に
 
@@ -41,9 +42,20 @@ M5 スタックちゃん（**M5STACK-K151** / M5Stack CoreS3）の開発記録�
 | 母艦 | Windows 11。USB 接続すると USB-Serial/JTAG（`VID_303A` / `PID_1001`）としてシリアルポートに現れる |
 | 出荷時ファーム | XiaoZhi ベース（プロジェクト名 `stack-chan`） |
 
+## 進捗
+
+**音声バックエンドの差し替え（2026-07-26）**: プロトコルの読み取りと、自前サーバー（OTA エンドポイント + WebSocket）の実装・検証まで終わりました。実機を使わず、本体を模した試験クライアントで次が通ることを確認しています。
+
+- OTA が現在版と同じ `version` を返し、更新を走らせないこと
+- サーバーの `hello`（`transport` は `websocket` 厳密一致）を返せること
+- 上り Opus（16000Hz mono / 60ms）を復号できること
+- `stt` / `llm` / `tts` を送り、下り Opus（24000Hz）を生成できること
+
+本体の接続先を切り替えるための NVS イメージ（`wifi` 名前空間に `ota_url`、16KB）も生成済みです。ただし書き込むと既存の Wi-Fi 設定とアプリの紐付けが消えて再ペアリングが必要になるため、まだ書いていません。サーバーの実装もまだこのリポジトリには入れていません。
+
 ## 今後やること
 
-- 音声バックエンドの差し替え（→ [検討メモ](docs/voice/voice-backend-plan.md)）
+- 音声バックエンドの差し替えを実機で通す（→ [検討メモ](docs/voice/voice-backend-plan.md)）
 - Arduino / PlatformIO での自作スケッチ
 - MCP ツールを増やして手元の他システムと連携させる
 
