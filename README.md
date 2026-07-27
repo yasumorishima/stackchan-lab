@@ -18,6 +18,7 @@ M5 スタックちゃん（**M5STACK-K151** / M5Stack CoreS3）の開発記録�
 | [公式ファームウェアを USB で書き込む](docs/setup/firmware-flash.md) | M5Burner（GUI）を使わず、公開 API と `esptool` 単体実行ファイルで公式バイナリを書き込む手順。ロールバック方法も記載 |
 | [音声バックエンド差し替えの検討](docs/voice/voice-backend-plan.md) | 出荷時は中国のクラウド XiaoZhi 経由。自前サーバーへ寄せる設計と、無償枠・自前ビルド・プロビジョニングの前提整理。差し替えポイントと現在の進捗 |
 | [XiaoZhi WebSocket プロトコル](docs/voice/xiaozhi-websocket-protocol.md) | 自前サーバーを書くために必要な仕様のまとめ。OTA 応答スキーマ、hello の交換、音声フレームの形式、JSON メッセージの一覧 |
+| [自前サーバーの実装](server/) | 本体の接続先をこのサーバーへ向けるための実装一式。OTA と WebSocket、ローカル音声認識、VOICEVOX での読み上げ、MCP のツール呼び出し。実機なしで検証するための試験クライアントとモックつき |
 
 ## 要点だけ先に
 

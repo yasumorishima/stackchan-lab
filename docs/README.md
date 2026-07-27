@@ -16,6 +16,14 @@
 | [voice-backend-plan.md](voice/voice-backend-plan.md) | 出荷時の XiaoZhi（中国クラウド）から、自前サーバー / 国内 API + VOICEVOX へ寄せる設計検討。差し替えポイント、無償枠の実効値、プロビジョニングの回避策 |
 | [xiaozhi-websocket-protocol.md](voice/xiaozhi-websocket-protocol.md) | 自前サーバーを書くためのプロトコル仕様まとめ。NVS 設定キー、必須ヘッダ、hello の交換、バイナリフレーム構造、JSON メッセージ一覧、MCP でロボットを動かす方法、最小要件 |
 
+## server — 自前サーバーの実装
+
+ドキュメントではなくコードですが、音声まわりの現物はここにあります。
+
+| 場所 | 内容 |
+|---|---|
+| [../server/](../server/) | OTA + WebSocket サーバー、ローカル音声認識（sherpa-onnx / Vosk / faster-whisper）、VOICEVOX での読み上げ、MCP クライアント、試験クライアントとモック |
+
 ## 命名と構成の方針
 
 - **トピックごとに `docs/<topic>/` を作る**（`setup` / `voice` / 今後は `dev`（自作スケッチ）や `hardware` など）
