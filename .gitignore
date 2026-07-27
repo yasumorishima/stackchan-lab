@@ -1,0 +1,5 @@
+server/server.conf
+server/.venv/
+__pycache__/
+*.pyc
+server/*.log

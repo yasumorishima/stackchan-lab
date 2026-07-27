@@ -1,0 +1,18 @@
+[Unit]
+Description=Stack-chan local voice server (XiaoZhi protocol)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yasu
+WorkingDirectory=/home/yasu/stackchan-server
+EnvironmentFile=-/home/yasu/stackchan-server/server.conf
+ExecStart=/home/yasu/stackchan-server/.venv/bin/python /home/yasu/stackchan-server/app.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/yasu/stackchan-server/server.log
+StandardError=append:/home/yasu/stackchan-server/server.log
+
+[Install]
+WantedBy=multi-user.target

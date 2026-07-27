@@ -1,0 +1,26 @@
+# systemd の EnvironmentFile として読ませる設定ファイルの雛形。
+# 実運用では server.conf という名前でコピーし、chmod 600 にしてトークンを書く。
+# このファイル自体には秘密を書かない。
+
+PORT=8000
+# 本体に返す接続先。省略すると起動時に LAN アドレスを自動検出する
+PUBLIC_HOST=192.168.10.111
+
+# 音声認識: sherpa / vosk / whisper / sakura / dry
+STT_BACKEND=sherpa
+SHERPA_DIR=~/models/reazonspeech-k2-v2
+# VOSK_MODEL=~/models/vosk-model-small-ja-0.22
+# WHISPER_MODEL=small
+
+# 読み上げ: voicevox / sakura / tone
+TTS_BACKEND=voicevox
+VOICEVOX_URL=http://127.0.0.1:50021
+VOICEVOX_SPEAKER=3
+
+# 応答生成: sakura / dry
+LLM_BACKEND=dry
+SAKURA_MODEL=gpt-oss-120b
+SAKURA_TOKEN=
+
+# WebSocket の認証トークン（本体には OTA 応答経由で渡る。運用時は変える）
+WS_TOKEN=stackchan-local
