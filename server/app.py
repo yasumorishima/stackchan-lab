@@ -25,6 +25,7 @@ from aiohttp import web
 import local_stt
 import mcp_client
 import opus_codec
+import server_tools
 
 log = logging.getLogger("stackchan")
 
@@ -73,8 +74,18 @@ FRAME_MS = 60
 SYSTEM_PROMPT = os.environ.get(
     "SYSTEM_PROMPT",
     "あなたは卓上ロボット「スタックちゃん」です。親しみやすく、短く話します。"
-    "返答は 2 文以内、読み上げるので記号や箇条書きは使いません。",
+    "返答は 2 文以内、読み上げるので記号や箇条書きは使いません。"
+    "天気などの外の情報や機体の操作は、推測せず必ずツールを使って答えます。",
 )
+# 会話の続きを保つ時間 [s]。本体は一区切りごとに WebSocket を切るので、
+# 接続をまたいで履歴を持たないと毎回はじめましての会話になる
+HISTORY_TTL = float(os.environ.get("HISTORY_TTL", "1800"))
+HISTORY_TURNS = int(os.environ.get("HISTORY_TURNS", "10"))
+
+
+def system_prompt() -> str:
+    """毎回いまの時刻を差し込む。LLM は現在時刻を知らないので聞かれても答えられない。"""
+    return SYSTEM_PROMPT + " 現在は " + server_tools.jst_stamp() + " です。"
 
 
 # ---- 音声ユーティリティ ------------------------------------------------
@@ -132,7 +143,7 @@ async def sakura_chat(session: aiohttp.ClientSession, history, tools=None) -> di
     url = SAKURA_BASE + "/v1/chat/completions"
     payload = {
         "model": SAKURA_MODEL,
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + history,
+        "messages": [{"role": "system", "content": system_prompt()}] + history,
         "temperature": 0.7,
         "max_tokens": 200,
         "stream": False,
@@ -286,7 +297,16 @@ async def ws_handler(request: web.Request):
     decoder = opus_codec.Decoder(UP_RATE, 1)
     encoder = opus_codec.Encoder(DOWN_RATE, 1, FRAME_MS)
     pcm_chunks = []
-    state = {"listening": False, "hello_done": False, "history": [],
+    hist_store = request.app["histories"]
+    now = time.time()
+    for stale in [k for k, v in hist_store.items() if now - v[0] > HISTORY_TTL]:
+        hist_store.pop(stale, None)      # 期限切れを残さない
+    kept = hist_store.get(device_id)
+    history = []
+    if kept and time.time() - kept[0] < HISTORY_TTL:
+        history = kept[1]
+        log.info("restored %d messages of history for %s", len(history), device_id)
+    state = {"listening": False, "hello_done": False, "history": history,
              "stream": None, "mcp": None, "mcp_task": None, "task": None}
 
     async def send_json(obj):
@@ -315,6 +335,18 @@ async def ws_handler(request: web.Request):
         log.info("spoke %d frames (%.1fs) in %d sentences, first audio %.2fs: %s",
                  sent, sent * FRAME_MS / 1000, len(sentences), first or -1, text)
 
+    async def call_tool(name, args):
+        """LLM の関数呼び出しを、サーバー側ツールと本体の MCP ツールへ振り分ける。
+
+        本体側は接続の途中でツール一覧が揃うので、呼ばれた時点の state を見る。
+        """
+        if server_tools.has(name):
+            return await server_tools.call(session, name, args)
+        mcp = state["mcp"]
+        if mcp is None:
+            return "error: 本体のツールが使えません"
+        return await mcp.call(name, args)
+
     async def handle_utterance(pcm, stream):
         if len(pcm) < UP_RATE * 2 * 0.3:
             log.info("utterance too short (%d bytes), ignored", len(pcm))
@@ -329,7 +361,8 @@ async def ws_handler(request: web.Request):
                 text = await transcribe(session, pcm)
             log.info("STT: %s", text)
             await send_json({"type": "stt", "text": text})
-            state["history"] = (state["history"] + [{"role": "user", "content": text}])[-10:]
+            state["history"] = (state["history"]
+                                + [{"role": "user", "content": text}])[-HISTORY_TURNS:]
             mcp = state["mcp"]
             task = state["mcp_task"]
             if mcp is not None and not mcp.tools and task is not None and not task.done():
@@ -339,10 +372,11 @@ async def ws_handler(request: web.Request):
                 except asyncio.TimeoutError:
                     log.warning("mcp handshake still pending, answering without tools")
                 mcp = state["mcp"]
-            reply = await respond(session, state["history"],
-                                  tools=mcp.openai_tools() if mcp else None,
-                                  call_tool=mcp.call if mcp else None)
+            tools = server_tools.specs() + (mcp.openai_tools() if mcp else [])
+            reply = await respond(session, state["history"], tools=tools,
+                                  call_tool=call_tool)
             state["history"].append({"role": "assistant", "content": reply})
+            hist_store[device_id] = (time.time(), state["history"])
             log.info("LLM: %s", reply)
             await send_json({"type": "llm", "emotion": "happy", "text": "😀"})
             await speak(reply)
@@ -442,6 +476,7 @@ async def health(request):
 
 async def on_startup(app):
     app["http"] = aiohttp.ClientSession()
+    app["histories"] = {}      # device_id -> (最終更新, messages)
     if STT_BACKEND in LOCAL_STT:
         # 初回発話でモデル読み込みを待たせない
         await asyncio.to_thread(local_stt.warmup, STT_BACKEND)

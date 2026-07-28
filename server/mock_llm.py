@@ -4,6 +4,10 @@
 tool_calls の解釈・音声文字起こしの応答処理）が正しいかを検証するために使う。
 本物のエンドポイントと同じパスを同じ形で返すので、切り替えは SAKURA_BASE だけ。
 
+ツールの選び方だけは本物の LLM の代わりに素朴な語判定で決める。狙いは
+「サーバーが tools を正しく渡し、返した tool_calls を実行して結果を戻せるか」の検証で、
+どのツールを選ぶかの賢さではない。
+
   ./.venv/bin/python mock_llm.py            # 127.0.0.1:8100 で待つ
 """
 import json
@@ -14,8 +18,29 @@ from aiohttp import web
 
 log = logging.getLogger("mock_llm")
 PORT = int(os.environ.get("MOCK_PORT", "8100"))
-seen = {"chat": 0, "stt": 0, "tools_offered": 0, "tool_result_seen": 0, "tts": 0}
+seen = {"chat": 0, "stt": 0, "tools_offered": 0, "tool_result_seen": 0, "tts": 0,
+        "called": []}
 VOICEVOX = os.environ.get("VOICEVOX_URL", "http://127.0.0.1:50021")
+
+
+def pick_tool(text, tools):
+    """発話からツールを選ぶ。名前で探すので、渡ってきていなければ選ばない。"""
+    names = [t.get("function", {}).get("name", "") for t in tools]
+    if "天気" in text and "get_weather" in names:
+        when = "tomorrow" if any(w in text for w in ("明日", "あした", "あす")) else "today"
+        place = None
+        for p in ("横浜", "東京", "大阪", "札幌", "那覇"):
+            if p in text:
+                place = p
+        args = {"when": when}
+        if place:
+            args["place"] = place
+        return "get_weather", args
+    if "音量" in text:
+        for n in names:
+            if "volume" in n:
+                return n, {"volume": 50}
+    return None, None
 
 
 async def chat(request):
@@ -26,25 +51,33 @@ async def chat(request):
     if tools:
         seen["tools_offered"] = len(tools)
     auth = request.headers.get("Authorization", "")
+    system = next((m.get("content", "") for m in msgs if m.get("role") == "system"), "")
+    seen["system_has_time"] = "現在は" in system
     log.info("chat #%d messages=%d tools=%d auth=%s",
-             seen["chat"], len(msgs), len(tools), "yes" if auth.startswith("Bearer ") else "NO")
+             seen["chat"], len(msgs), len(tools),
+             "yes" if auth.startswith("Bearer ") else "NO")
 
     # 直前が tool の結果なら、それを読んだ体で最終回答を返す
     if msgs and msgs[-1].get("role") == "tool":
         seen["tool_result_seen"] += 1
-        content = "音量を変えました。%s" % (msgs[-1].get("content") or "")
-        return web.json_response({"choices": [{"message": {"role": "assistant",
-                                                           "content": content}}]})
+        result = msgs[-1].get("content") or ""
+        log.info("tool result: %s", result)
+        return web.json_response({"choices": [{"message": {
+            "role": "assistant",
+            "content": "調べました。%s ということです。" % result}}]})
 
-    # ツールが提示されていれば 1 回だけ関数呼び出しを返す
-    if tools and seen["chat"] == 1:
-        fn = tools[0]["function"]["name"]
+    user = next((m.get("content", "") for m in reversed(msgs)
+                 if m.get("role") == "user"), "")
+    name, args = pick_tool(user, tools)
+    if name:
+        seen["called"].append(name)
+        log.info("-> tool_call %s %s", name, args)
         return web.json_response({"choices": [{"message": {
             "role": "assistant",
             "content": "",
-            "tool_calls": [{"id": "call_1", "type": "function",
-                            "function": {"name": fn,
-                                         "arguments": json.dumps({"volume": 50})}}],
+            "tool_calls": [{"id": "call_%d" % seen["chat"], "type": "function",
+                            "function": {"name": name,
+                                         "arguments": json.dumps(args)}}],
         }}]})
 
     return web.json_response({"choices": [{"message": {
