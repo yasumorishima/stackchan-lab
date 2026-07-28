@@ -16,6 +16,11 @@ import os
 
 from aiohttp import web
 
+from places import PLACES
+
+# 本物の LLM なら発話から地名を拾える。モックはツール表と同じ語で代用する
+PLACE_WORDS = sorted((p for p in PLACES if not p.isascii()), key=len, reverse=True)
+
 log = logging.getLogger("mock_llm")
 PORT = int(os.environ.get("MOCK_PORT", "8100"))
 seen = {"chat": 0, "stt": 0, "tools_offered": 0, "tool_result_seen": 0, "tts": 0,
@@ -29,9 +34,10 @@ def pick_tool(text, tools):
     if "天気" in text and "get_weather" in names:
         when = "tomorrow" if any(w in text for w in ("明日", "あした", "あす")) else "today"
         place = None
-        for p in ("横浜", "東京", "大阪", "札幌", "那覇"):
+        for p in PLACE_WORDS:          # 長いものから当てる（「東京」より「東京都」）
             if p in text:
                 place = p
+                break
         args = {"when": when}
         if place:
             args["place"] = place

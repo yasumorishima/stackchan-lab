@@ -24,16 +24,29 @@ CITIES = [
 SUFFIX = ("都", "道", "府", "県", "市", "区", "町", "村")
 
 
+def best_jp(results):
+    """日本の候補から目的地らしいものを選ぶ。
+
+    先頭が目的地とは限らない。「Tottori」は 1 位が釧路市の一地区（PPL・人口なし）で、
+    鳥取市（PPLA・188,465人）は 4 位に出る。行政の中心を表す feature_code と
+    人口で並べ替えてから採る。
+    """
+    jp = [h for h in (results or []) if h.get("country_code") == "JP"]
+    if not jp:
+        return None
+    rank = {"PPLC": 3, "PPLA": 2, "PPLA2": 1}
+    jp.sort(key=lambda h: (rank.get(h.get("feature_code"), 0), h.get("population") or 0),
+            reverse=True)
+    return jp[0]
+
+
 def fetch(name):
     url = ("https://geocoding-api.open-meteo.com/v1/search?"
            + urllib.parse.urlencode({"name": name, "count": 20,
                                      "language": "ja", "format": "json"}))
     with urllib.request.urlopen(url, timeout=30) as r:
         body = json.loads(r.read())
-    for hit in body.get("results") or []:
-        if hit.get("country_code") == "JP":
-            return hit
-    return None
+    return best_jp(body.get("results"))
 
 
 def variants(word):

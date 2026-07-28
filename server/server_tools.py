@@ -28,6 +28,10 @@ FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 DEFAULT_PLACE = os.environ.get("WEATHER_PLACE", "横浜")
 CACHE_TTL = float(os.environ.get("WEATHER_CACHE_TTL", "600"))
+# 取得先が落ちている時に古い値で答える上限 [s]。これを超えたら黙って古い値を読まない
+STALE_MAX = float(os.environ.get("WEATHER_STALE_MAX", "21600"))
+MAX_PLACE_LEN = 40      # LLM が返す引数は信用しない
+CACHE_MAX = 64
 
 # WMO 天気コード -> 日本語。サイトの lib/weather.ts と同じ表
 WEATHER_LABELS = {
@@ -63,6 +67,27 @@ def label(code) -> str:
         return "不明"
 
 
+def _part(fmt, v):
+    """値があるときだけ書式化する。
+
+    API は値に null を返すことがある。そこを 0 で埋めると「最高 0.0 度」と
+    読み上げてしまうので、欠けた項目は言わない。
+    """
+    try:
+        return fmt % float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _join(parts, sep=" "):
+    return sep.join(p for p in parts if p)
+
+
+def _trim(cache, limit=CACHE_MAX):
+    while len(cache) > limit:
+        cache.pop(next(iter(cache)), None)
+
+
 def _strip_suffix(name: str) -> str:
     w = name.strip()
     while len(w) > 2 and w[-1] in SUFFIX:
@@ -77,7 +102,7 @@ async def resolve_place(session, name: str):
     Open-Meteo の geocoding は日本語名を引けない（「札幌」は 0 件）ので、
     表に無い場合の追加検索は ASCII の名前に限る。
     """
-    key = (name or "").strip()
+    key = (name or "").strip()[:MAX_PLACE_LEN]
     if not key:
         return None
     for cand in (key, key.lower(), _strip_suffix(key)):
@@ -96,13 +121,17 @@ async def resolve_place(session, name: str):
     except Exception:
         log.exception("geocode failed: %s", key)
         return None
+    # 先頭が目的地とは限らない（gen_places.py と同じ選び方をする）
+    jp = [h for h in (body.get("results") or []) if h.get("country_code") == "JP"]
+    rank = {"PPLC": 3, "PPLA": 2, "PPLA2": 1}
+    jp.sort(key=lambda h: (rank.get(h.get("feature_code"), 0), h.get("population") or 0),
+            reverse=True)
     found = None
-    for h in body.get("results") or []:
-        if h.get("country_code") == "JP":
-            found = (round(h["latitude"], 4), round(h["longitude"], 4),
-                     h.get("name") or key)
-            break
+    if jp:
+        found = (round(jp[0]["latitude"], 4), round(jp[0]["longitude"], 4),
+                 jp[0].get("name") or key)
     _geocode_cache[key.lower()] = found
+    _trim(_geocode_cache, 256)
     return found
 
 
@@ -133,6 +162,7 @@ async def _forecast(session, lat: float, lon: float):
                 body = await r.json()
                 if r.status == 200:
                     _forecast_cache[ck] = (time.monotonic(), body)
+                    _trim(_forecast_cache)
                     return body, 0.0
                 last = "http %d %s" % (r.status, str(body)[:120])
         except Exception as e:
@@ -140,6 +170,9 @@ async def _forecast(session, lat: float, lon: float):
         log.warning("open-meteo retry %d (%s)", attempt + 1, last)
     if hit:
         age = time.monotonic() - hit[0]
+        if age > STALE_MAX:
+            log.warning("cached forecast too old (%.0fs), not using it", age)
+            raise RuntimeError("no fresh forecast (cache %.0fs old)" % age)
         log.warning("open-meteo failed, falling back to cache (%.0fs old)", age)
         return hit[1], age
     raise RuntimeError(last or "open-meteo unreachable")
@@ -153,7 +186,7 @@ async def get_weather(session, args) -> str:
     when = str(args.get("when") or "today")
     spot = await resolve_place(session, place)
     if spot is None:
-        return "error: 「%s」の場所が分かりませんでした" % place
+        return "error: 「%s」の場所が分かりませんでした" % place[:20]
     lat, lon, shown = spot
     try:
         data, age = await _forecast(session, lat, lon)
@@ -163,10 +196,14 @@ async def get_weather(session, args) -> str:
     stale = " ※%d分前の情報" % int(age / 60) if age > 900 else ""
     cur = data.get("current") or {}
     daily = data.get("daily") or {}
-    now_part = "現在 %.1f度 %s 湿度%d%% 風%.1fm/s" % (
-        cur.get("temperature_2m", 0.0), label(cur.get("weather_code")),
-        int(cur.get("relative_humidity_2m") or 0), cur.get("wind_speed_10m", 0.0))
+    now_bits = [_part("%.1f度", cur.get("temperature_2m")),
+                label(cur.get("weather_code")) if cur.get("weather_code") is not None else None,
+                _part("湿度%.0f%%", cur.get("relative_humidity_2m")),
+                _part("風%.1fm/s", cur.get("wind_speed_10m"))]
+    now_part = ("現在 " + _join(now_bits)) if any(now_bits) else ""
     if when == "now":
+        if not now_part:
+            return "error: %s の実況が取れませんでした" % shown
         return "%s の天気: %s%s" % (shown, now_part, stale)
     i = WHEN_OFFSET.get(when, 0)
     days = daily.get("time") or []
@@ -174,12 +211,17 @@ async def get_weather(session, args) -> str:
         return "error: %s の予報は取れません" % when
     d = datetime.date.fromisoformat(days[i])
     head = "%d月%d日(%s)" % (d.month, d.day, WDAY[d.weekday()])
-    line = "%s %s %s 最高%.1f度 最低%.1f度 降水確率%d%%" % (
-        shown, head, label((daily.get("weather_code") or [None])[i]),
-        (daily.get("temperature_2m_max") or [0])[i],
-        (daily.get("temperature_2m_min") or [0])[i],
-        int((daily.get("precipitation_probability_max") or [0])[i] or 0))
-    if i == 0:
+    code = (daily.get("weather_code") or [None])[i]
+    bits = [label(code) if code is not None else None,
+            _part("最高%.1f度", (daily.get("temperature_2m_max") or [None])[i]),
+            _part("最低%.1f度", (daily.get("temperature_2m_min") or [None])[i]),
+            _part("降水確率%.0f%%",
+                  (daily.get("precipitation_probability_max") or [None])[i])]
+    if not any(bits):
+        # 日付と地名だけ読み上げても意味がない。取れなかったと言う
+        return "error: %s の予報が取れませんでした" % shown
+    line = _join([shown, head] + bits)
+    if i == 0 and now_part:
         line = line + " / " + now_part
     return line + stale
 

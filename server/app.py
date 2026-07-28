@@ -372,11 +372,21 @@ async def ws_handler(request: web.Request):
                 except asyncio.TimeoutError:
                     log.warning("mcp handshake still pending, answering without tools")
                 mcp = state["mcp"]
-            tools = server_tools.specs() + (mcp.openai_tools() if mcp else [])
+            # 同名のツールが 2 つ並ぶと API が弾く。振り分けはサーバー側を先に見るので、
+            # 名前が衝突した本体側ツールはどのみち呼べない（現行ファームには無い）
+            taken = {t["function"]["name"] for t in server_tools.specs()}
+            device_tools = []
+            for t in (mcp.openai_tools() if mcp else []):
+                if t["function"]["name"] in taken:
+                    log.warning("device tool %s is shadowed by a server tool",
+                                t["function"]["name"])
+                    continue
+                device_tools.append(t)
+            tools = server_tools.specs() + device_tools
             reply = await respond(session, state["history"], tools=tools,
                                   call_tool=call_tool)
             state["history"].append({"role": "assistant", "content": reply})
-            hist_store[device_id] = (time.time(), state["history"])
+            hist_store[device_id] = (time.time(), list(state["history"]))
             log.info("LLM: %s", reply)
             await send_json({"type": "llm", "emotion": "happy", "text": "😀"})
             await speak(reply)
