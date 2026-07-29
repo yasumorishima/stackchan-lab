@@ -75,17 +75,40 @@ SYSTEM_PROMPT = os.environ.get(
     "SYSTEM_PROMPT",
     "あなたは卓上ロボット「スタックちゃん」です。親しみやすく、短く話します。"
     "返答は 2 文以内、読み上げるので記号や箇条書きは使いません。"
-    "天気などの外の情報や機体の操作は、推測せず必ずツールを使って答えます。",
+    "天気などの外の情報や機体の操作は、推測せず必ずツールを使って答えます。"
+    "前のやり取りに天気の数値が出ていても、新しく聞かれたら必ずツールを呼び直します。"
+    "場所や日が変われば以前の数値は当てはまりません。過去の数値を言い換えて答えません。"
+    "ユーザーの発話の先頭にある丸括弧はその発話の時刻です。"
+    "時刻を聞かれたら直近の括弧の値を答えます。",
 )
 # 会話の続きを保つ時間 [s]。本体は一区切りごとに WebSocket を切るので、
 # 接続をまたいで履歴を持たないと毎回はじめましての会話になる
 HISTORY_TTL = float(os.environ.get("HISTORY_TTL", "1800"))
-HISTORY_TURNS = int(os.environ.get("HISTORY_TURNS", "10"))
+# 保持するメッセージ数。ツール往復も履歴に残すので、天気のような
+# ツールを使う発話は 1 往復で 4 件（user / assistant+tool_calls / tool /
+# assistant）消費する。以前と同じ体感の長さを保つため 10 から広げた。
+HISTORY_TURNS = int(os.environ.get("HISTORY_TURNS", "20"))
 
 
 def system_prompt() -> str:
-    """毎回いまの時刻を差し込む。LLM は現在時刻を知らないので聞かれても答えられない。"""
-    return SYSTEM_PROMPT + " 現在は " + server_tools.jst_stamp() + " です。"
+    """システム文は固定にする（現在時刻をここに入れない）。
+
+    tools はテンプレート上システム文の後ろに描画されるので、ここが発話ごとに
+    変わると tools 約 250 トークンごとプロンプトキャッシュが捨てられる。
+    RPi5 + qwen2.5:3b の実測で LLM 1 往復が 35s と 7.8s に分かれた
+    （再利用トークン 96 対 360）。時刻は stamped_user() で発話側へ添える。
+    """
+    return SYSTEM_PROMPT
+
+
+def stamped_user(text: str) -> dict:
+    """ユーザー発話に、それを言われた時刻を添えた履歴エントリを作る。
+
+    末尾へ足すだけなのでキャッシュ済みの接頭辞を壊さない。過去の発話も
+    言われた時刻を保ったまま残るので「さっき」の解釈にも使える。
+    """
+    return {"role": "user",
+            "content": "（" + server_tools.jst_stamp() + "）" + text}
 
 
 # ---- 音声ユーティリティ ------------------------------------------------
@@ -231,18 +254,85 @@ async def transcribe(session, pcm: bytes) -> str:
     return "（ドライラン: 音声 %.1f 秒を受信しました）" % (len(pcm) / 2 / UP_RATE)
 
 
-async def respond(session, history, tools=None, call_tool=None) -> str:
-    """LLM に投げる。tool_calls が返ったら本体の MCP ツールを実行して結果を戻す。"""
+TOOL_TAG_RE = re.compile(r"</?tool_call>|</?function_call>|</?tool_response>",
+                         re.IGNORECASE)
+TOOL_KEY_RE = re.compile(r"\"(?:name|arguments|parameters)\"\s*:")
+FALLBACK_REPLY = "うまく答えられませんでした。もう一度お願いします。"
+
+
+def _drop_tool_json(text: str) -> str:
+    """釣り合いの取れた {...} のうち、ツール呼び出しらしいものを丸ごと落とす。
+
+    入れ子があるので正規表現ではなく括弧を数えて切り出す。
+    """
+    out = []
+    i = 0
+    while i < len(text):
+        if text[i] != "{":
+            out.append(text[i])
+            i += 1
+            continue
+        depth = 0
+        j = i
+        while j < len(text):
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if depth != 0:
+            # 閉じていない = 生成が途中で切れた。以降は捨てる
+            break
+        block = text[i:j + 1]
+        if not TOOL_KEY_RE.search(block):
+            out.append(block)
+        i = j + 1
+    return "".join(out)
+
+
+def clean_reply(text) -> str:
+    """ツール呼び出しの断片を読み上げさせない。
+
+    生成が max_tokens で切れるとツール呼び出しが壊れ、閉じタグや JSON の
+    かけらが本文に残る（qwen2.5:3b の実測で本文が "</tool_call>" だけに
+    なった）。そのまま合成すると意味のない音を読み上げるので落とす。
+    どのモデルでも起きうるので、バックエンドに関係なく通す。
+    """
+    text = TOOL_TAG_RE.sub("", text or "")
+    text = _drop_tool_json(text)
+    # 壊れた JSON の落ち穂（対応の取れない括弧）は読み上げても無意味
+    text = re.sub(r"[{}\[\]]", "", text)
+    return re.sub(r"[ 	]+", " ", text).strip()
+
+
+async def respond(session, history, tools=None, call_tool=None):
+    """LLM に投げる。tool_calls が返ったら本体の MCP ツールを実行して結果を戻す。
+
+    返り値は (最終文, 途中のツール往復)。ツール往復を履歴へ残さないと、
+    次の省略形の追い質問（「じゃあ鳥取はどう？」）でモデルがツールを
+    呼び直さない。qwen2.5:3b の実測では数値の作り話か「まだ調べてません」に
+    なった。文脈にツールを使った跡が見えている必要がある。
+    """
     if LLM_BACKEND != "sakura":
-        return "ドライランです。音声の往復だけ確認しています。"
+        return "ドライランです。音声の往復だけ確認しています。", []
     msgs = list(history)
+    trace = []
     for _ in range(MAX_TOOL_ROUNDS):
         msg = await sakura_chat(session, msgs, tools)
         calls = msg.get("tool_calls") or []
         if not calls or call_tool is None:
-            return (msg.get("content") or "").strip()
-        msgs.append({"role": "assistant", "content": msg.get("content") or "",
-                     "tool_calls": calls})
+            reply = clean_reply(msg.get("content"))
+            if not reply:
+                log.warning("空の応答（本文=%r）",
+                            (msg.get("content") or "")[:120])
+                reply = FALLBACK_REPLY
+            return reply, trace
+        step = {"role": "assistant", "content": msg.get("content") or "",
+                "tool_calls": calls}
+        msgs.append(step)
+        trace.append(step)
         for c in calls:
             fn = c.get("function") or {}
             name = fn.get("name") or ""
@@ -255,9 +345,23 @@ async def respond(session, history, tools=None, call_tool=None) -> str:
             except Exception as e:
                 result = "error: %s" % e
             log.info("tool %s(%s) -> %s", name, args, str(result)[:200])
-            msgs.append({"role": "tool", "tool_call_id": c.get("id") or "",
-                         "content": str(result)})
-    return "うまく答えられませんでした。"
+            out = {"role": "tool", "tool_call_id": c.get("id") or "",
+                   "content": str(result)}
+            msgs.append(out)
+            trace.append(out)
+    return "うまく答えられませんでした。", trace
+
+
+def trim_history(msgs):
+    """直近 HISTORY_TURNS 件へ切り詰める。ただし tool を孤立させない。
+
+    tool メッセージは tool_calls を持つ assistant の直後でなければ
+    API 側で 400 になる。切った先頭がその途中なら user まで捨てる。
+    """
+    msgs = msgs[-HISTORY_TURNS:]
+    while msgs and msgs[0].get("role") != "user":
+        msgs.pop(0)
+    return msgs
 
 
 # ---- OTA ---------------------------------------------------------------
@@ -361,8 +465,7 @@ async def ws_handler(request: web.Request):
                 text = await transcribe(session, pcm)
             log.info("STT: %s", text)
             await send_json({"type": "stt", "text": text})
-            state["history"] = (state["history"]
-                                + [{"role": "user", "content": text}])[-HISTORY_TURNS:]
+            state["history"] = trim_history(state["history"] + [stamped_user(text)])
             mcp = state["mcp"]
             task = state["mcp_task"]
             if mcp is not None and not mcp.tools and task is not None and not task.done():
@@ -383,9 +486,11 @@ async def ws_handler(request: web.Request):
                     continue
                 device_tools.append(t)
             tools = server_tools.specs() + device_tools
-            reply = await respond(session, state["history"], tools=tools,
-                                  call_tool=call_tool)
+            reply, trace = await respond(session, state["history"], tools=tools,
+                                         call_tool=call_tool)
+            state["history"].extend(trace)
             state["history"].append({"role": "assistant", "content": reply})
+            state["history"] = trim_history(state["history"])
             hist_store[device_id] = (time.time(), list(state["history"]))
             log.info("LLM: %s", reply)
             await send_json({"type": "llm", "emotion": "happy", "text": "😀"})
