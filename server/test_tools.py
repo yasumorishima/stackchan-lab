@@ -90,6 +90,92 @@ async def main():
 
         server_tools.FORECAST_URL = real
 
+    # ---- モデルが when を落とした時の補い方（通信なし） ----
+    import app  # noqa: E402  ここでしか使わない
+
+    WHEN_TEXT = [
+        ("今日はどうなの", "today"),
+        ("きょうの天気", "today"),
+        ("あしたはどう", "tomorrow"),
+        ("明日の大阪", "tomorrow"),
+        ("あさっては", "day_after_tomorrow"),
+        ("明後日の天気", "day_after_tomorrow"),
+        ("今の天気", "now"),
+        ("現在の気温", "now"),
+        ("じゃあ鳥取はどう", None),
+        ("鳥取は", None),
+    ]
+    for text, want in WHEN_TEXT:
+        got = server_tools.when_from_text(text)
+        mark = "OK" if got == want else "NG"
+        if got != want:
+            ok = False
+        print("%-4s 発話から when: %-14s -> %s (期待 %s)" % (mark, text, got, want))
+
+    INFER = [
+        ({"utterance": "今日はどうなの", "last_when": "tomorrow"}, "today",
+         "発話の日が引き継ぎより強い"),
+        ({"utterance": "じゃあ鳥取はどう", "last_when": "tomorrow"}, "tomorrow",
+         "日を言わない追い質問は直前の日を引き継ぐ"),
+        ({"utterance": "鳥取は", "last_when": None}, "today",
+         "引き継ぐものが無ければ today"),
+        ({"utterance": "鳥取は", "last_when": "ゆるふわ"}, "today",
+         "知らない値は引き継がない"),
+        (None, "today", "文脈が無くても落ちない"),
+    ]
+    for ctx, want, memo in INFER:
+        got = server_tools.infer_when(ctx)
+        mark = "OK" if got == want else "NG"
+        if got != want:
+            ok = False
+        print("%-4s infer_when: %-30s -> %s (期待 %s)" % (mark, memo, got, want))
+
+    STAMPED = [
+        ("（2026年7月30日(木) 7時32分）鳥取は", "鳥取は", None),
+        ("（2026年7月30日(木) 7時32分）今日はどうなの", "今日はどうなの", "today"),
+        ("（7月30日(木)）あしたの大阪", "あしたの大阪", "tomorrow"),
+    ]
+    for stamped, want_text, want_when in STAMPED:
+        hist = [{"role": "user", "content": stamped}]
+        got_text = app.last_user_text(hist)
+        got_when = server_tools.when_from_text(got_text)
+        good = got_text == want_text and got_when == want_when
+        if not good:
+            ok = False
+        print("%-4s 時刻を外して日を読む: %-14s -> %s / %s"
+              % ("OK" if good else "NG", stamped[:20], got_text, got_when))
+
+    # 引き継ぎは「少し前に調べた時」だけ（何十分も前の日を継がない）
+    import time as _t
+    app.when_store.clear()
+    checks = [("覚えが無ければ None", app.remembered_when("dev"), None)]
+    app.when_store["dev"] = (_t.time(), "tomorrow")
+    checks.append(("直後なら引き継ぐ", app.remembered_when("dev"), "tomorrow"))
+    app.when_store["dev"] = (_t.time() - app.WHEN_TTL - 1, "tomorrow")
+    checks.append(("古ければ引き継がない", app.remembered_when("dev"), None))
+    checks.append(("古い覚えは捨てる", "dev" in app.when_store, False))
+    app.when_store["other"] = (_t.time(), "now")
+    checks.append(("別の機体とは混ざらない", app.remembered_when("dev"), None))
+    checks.append(("その機体の分は残る", app.remembered_when("other"), "now"))
+    app.when_store.clear()
+    for memo, got, want in checks:
+        mark = "OK" if got == want else "NG"
+        if got != want:
+            ok = False
+        print("%-4s 引き継ぎ: %-22s -> %s (期待 %s)" % (mark, memo, got, want))
+
+    # 過去の日は今日として答えない
+    PASTS = [("昨日の天気", "past"), ("おとといの天気", "past"),
+             ("今週の天気は", None), ("今度の日曜は", None),
+             ("大阪に住んでいますが天気は", None), ("今の天気", "now"),
+             ("昨日は暑かったけど今日はどう", "today")]
+    for text, want in PASTS:
+        got = server_tools.when_from_text(text)
+        mark = "OK" if got == want else "NG"
+        if got != want:
+            ok = False
+        print("%-4s 日の読み取り: %-22s -> %s (期待 %s)" % (mark, text, got, want))
+
     print("jst:", server_tools.jst_stamp())
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

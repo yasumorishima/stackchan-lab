@@ -1,9 +1,13 @@
+"""読み上げ前の後始末（clean_reply / shorten_reply）の単体試験。
+
+  ./.venv/bin/python test_clean.py
+"""
 import sys
 
 sys.path.insert(0, "/home/yasu/stackchan-server")
 import app
 
-CASES = [
+CLEAN = [
     ("</tool_call>", ""),
     ("こんにちは。", "こんにちは。"),
     ('はい<tool_call>{"name": "get_weather", "arguments": {}}', "はい"),
@@ -12,14 +16,63 @@ CASES = [
     ('途中で切れた {"name": "get_weather"', "途中で切れた"),
     ("", ""),
     ("21時15分です。", "21時15分です。"),
+    # 発話に添えた時刻をそのまま書き写してくる（qwen2.5:3b の実測）
+    ("どういたしまして。（2026年7月31日(金) 7時00分)", "どういたしまして。"),
+    ("（2026年7月31日(金) 7時00分）おはよう。", "おはよう。"),
+    ("こんにちは。(7月31日)", "こんにちは。"),
+    ("いま (7時00分) です。", "いま です。"),
+    # 曜日を書き損じることもある（実測で "(now)" になった）
+    ("横浜はくもりです。（2026年7月30日(now))", "横浜はくもりです。"),
+    # 時刻を聞かれた答えは残す（括弧で囲まれていない）
+    ("いまは7時00分です。", "いまは7時00分です。"),
+    # 日時でない丸括弧は消さない
+    ("これは（大阪）の天気です。", "これは（大阪）の天気です。"),
+    ("最高32.8度(晴れ)です。", "最高32.8度(晴れ)です。"),
+    # 箇条書きと改行は声に出ない
+    ("- 晴れです" + chr(10) + "- 32度です", "晴れです 32度です"),
+    ("1. 晴れ" + chr(10) + "2. 32度", "晴れ 32度"),
+    ("## 天気" + chr(10) + "晴れです。", "天気 晴れです。"),
+    ("・晴れ", "晴れ"),
+    # 行頭のマイナスは気温の符号かもしれない。空白が続く時だけ箇条書き
+    ("-3度です。", "-3度です。"),
+    ("-3度から-1度です。", "-3度から-1度です。"),
+    ("- 3度です。", "3度です。"),
+]
+
+SHORTEN = [
+    ("こんにちは。", "こんにちは。", "そのまま"),
+    ("晴れです。32度です。降水確率は41%です。", "晴れです。32度です。", "3 文目を落とす"),
+    ("晴れです。32度です。", "晴れです。32度です。", "2 文はそのまま"),
+    ("はい。", "はい。", "1 文"),
+    ("", "", "空"),
+    # 1 文が長すぎる場合は読点で切る
+    ("あ" * 100 + "、" + "い" * 100 + "。", "あ" * 100 + "、", "長い 1 文は読点で切る"),
+    # 読点が早すぎる位置にしか無ければ字数で切る
+    ("あ、" + "い" * 300, "あ、" + "い" * (app.MAX_REPLY_CHARS - 2) + "。",
+     "読点が早すぎるなら字数で切る"),
 ]
 
 ng = 0
-for text, want in CASES:
+print("== clean_reply ==")
+for text, want in CLEAN:
     got = app.clean_reply(text)
     mark = "OK" if got == want else "NG"
     ng += got != want
-    print("%s %-52r -> %r" % (mark, text, got))
+    print("%s %-46r -> %r" % (mark, text[:46], got))
     if got != want:
         print("   期待: %r" % want)
-print("\n%d/%d 正解" % (len(CASES) - ng, len(CASES)))
+
+print("== shorten_reply ==")
+for text, want, memo in SHORTEN:
+    got = app.shorten_reply(text)
+    mark = "OK" if got == want else "NG"
+    ng += got != want
+    print("%s %-24s 入力%3d字 -> %3d字" % (mark, memo, len(text), len(got)))
+    if got != want:
+        print("   期待: %r" % want[:80])
+        print("   実際: %r" % got[:80])
+
+total = len(CLEAN) + len(SHORTEN)
+print("")
+print("%d/%d 正解" % (total - ng, total))
+sys.exit(1 if ng else 0)

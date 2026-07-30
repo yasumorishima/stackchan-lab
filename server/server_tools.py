@@ -179,11 +179,70 @@ async def _forecast(session, lat: float, lon: float):
 
 
 WHEN_OFFSET = {"today": 0, "tomorrow": 1, "day_after_tomorrow": 2}
+WHEN_VALUES = ("now", "today", "tomorrow", "day_after_tomorrow")
+
+# 発話から日を読む表。長い語を先に見る（「明後日」を「明日」で拾わないため、
+# また「今日」を「今」で拾わないため、並び順に意味がある）
+PAST = "past"
+DAY_WORDS = (
+    ("day_after_tomorrow", ("明後日", "あさって", "アサッテ")),
+    ("tomorrow", ("明日", "あした", "あす", "アシタ")),
+    ("today", ("今日", "きょう", "本日", "キョウ")),
+    ("now", ("現在", "今の", "いまの", "今は", "いまは", "今すぐ",
+             "只今", "ただいま", "現時点")),
+    # 過去は最後に見る（「昨日は暑かったけど今日はどう」は today を採りたい）
+    (PAST, ("一昨日", "おととい", "昨日", "きのう", "昨夜", "ゆうべ")),
+)
 
 
-async def get_weather(session, args) -> str:
+def when_from_text(text: str):
+    """発話に日を表す語があれば返す。無ければ None。"""
+    text = text or ""
+    for when, words in DAY_WORDS:
+        for w in words:
+            if w in text:
+                return when
+    return None
+
+
+def infer_when(ctx) -> str:
+    """モデルが when を落としたときの補い方。推測せず順に確かめる。
+
+    1. 発話に日を表す語があればそれを使う（「今日はどうなの」→ today）
+    2. 無ければ同じ会話で直前に調べた日を引き継ぐ（「じゃあ鳥取は？」）
+    3. どちらも無ければ today
+
+    2 が要るのは、省略形の追い質問で qwen2.5:3b が when を落とすため。
+    既定の today で埋めると「あしたの大阪」の直後の「じゃあ鳥取は？」に
+    今日の天気を答えてしまい、しかも本人は明日だと思って聞いている。
+    when を required にして解決しようとすると、モデルがツールを呼ぶのを
+    やめて数値を作り話した（2026-07-30 実測）ので、サーバー側で補う。
+    """
+    ctx = ctx or {}
+    w = when_from_text(ctx.get("utterance") or "")
+    if w:
+        log.info("when を発話から補った: %s", w)
+        return w
+    prev = ctx.get("last_when")
+    if prev in WHEN_VALUES:
+        log.info("when を直前の質問から引き継いだ: %s", prev)
+        return prev
+    return "today"
+
+
+async def get_weather(session, args, ctx=None) -> str:
     place = str(args.get("place") or DEFAULT_PLACE)
-    when = str(args.get("when") or "today")
+    when = str(args.get("when") or "")
+    if when not in WHEN_VALUES:
+        if when:
+            log.warning("知らない when=%r は無視して補う", when[:20])
+        when = infer_when(ctx)
+    if when == PAST:
+        # 予報しか取れないので、今日として答えず分からないと言う
+        return "error: 過去の天気は分かりません。今日からあさってまでなら調べられます"
+    if isinstance(ctx, dict):
+        # 次の追い質問で引き継げるように、実際に使った値を呼び出し側へ返す
+        ctx["resolved_when"] = when
     spot = await resolve_place(session, place)
     if spot is None:
         return "error: 「%s」の場所が分かりませんでした" % place[:20]
@@ -256,5 +315,6 @@ def has(name: str) -> bool:
     return name in HANDLERS
 
 
-async def call(session, name: str, args: dict) -> str:
-    return await HANDLERS[name](session, args or {})
+async def call(session, name: str, args: dict, ctx=None) -> str:
+    """ctx = 呼び出しの文脈（発話・直前に調べた日）。無くても動く。"""
+    return await HANDLERS[name](session, args or {}, ctx)

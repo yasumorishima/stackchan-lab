@@ -54,6 +54,22 @@ WS_TOKEN = os.environ.get("WS_TOKEN", "stackchan-local")
 SAKURA_BASE = os.environ.get("SAKURA_BASE", "https://api.ai.sakura.ad.jp")
 SAKURA_TOKEN = os.environ.get("SAKURA_TOKEN", "")
 SAKURA_MODEL = os.environ.get("SAKURA_MODEL", "gpt-oss-120b")
+# 本番（さくら）が使えない時に落ちる先。ネットが切れても・トークンが切れても
+# 会話を続けるための保険。STT と TTS は既定でローカルなので、LLM だけ用意すれば
+# 家の中だけで会話が成立する。空文字にすると無効
+FALLBACK_LLM_BASE = os.environ.get("FALLBACK_LLM_BASE", "http://127.0.0.1:11434")
+FALLBACK_LLM_MODEL = os.environ.get("FALLBACK_LLM_MODEL", "qwen2.5:3b")
+FALLBACK_LLM_TOKEN = os.environ.get("FALLBACK_LLM_TOKEN", "dummy")
+# 本番の待ち時間 [s]。落ちる先がある時は長く待たない（待つぶんだけ本体が黙る）。
+# 1 発話でツール往復ぶん 2 回叩くので、60s だと最悪 2 分間無言になる
+LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "60"))
+# 30 秒は暫定。さくらの実応答時間を測れていないので、短くし過ぎると
+# 「動いているのに遅いだけ」の本番を切ってローカルへ落としてしまう
+PRIMARY_LLM_TIMEOUT = float(os.environ.get("PRIMARY_LLM_TIMEOUT", "30"))
+# 本番が駄目だった後、しばらくは本番を試さずローカルへ直行する [s]。
+# 落ちている間ずっと毎回 timeout ぶん待たされるのを防ぐ
+PRIMARY_COOLDOWN = float(os.environ.get("PRIMARY_COOLDOWN", "120"))
+_primary_down_until = 0.0
 SAKURA_STT_MODEL = os.environ.get("SAKURA_STT_MODEL", "")
 
 # stt: sherpa / vosk / whisper / sakura / dry   tts: voicevox / sakura / tone   llm: sakura / dry
@@ -73,14 +89,32 @@ FRAME_MS = 60
 
 SYSTEM_PROMPT = os.environ.get(
     "SYSTEM_PROMPT",
-    "あなたは卓上ロボット「スタックちゃん」です。親しみやすく、短く話します。"
-    "返答は 2 文以内、読み上げるので記号や箇条書きは使いません。"
-    "天気などの外の情報や機体の操作は、推測せず必ずツールを使って答えます。"
-    "前のやり取りに天気の数値が出ていても、新しく聞かれたら必ずツールを呼び直します。"
-    "場所や日が変われば以前の数値は当てはまりません。過去の数値を言い換えて答えません。"
-    "ユーザーの発話の先頭にある丸括弧はその発話の時刻です。"
-    "時刻を聞かれたら直近の括弧の値を答えます。",
+    "あなたは卓上ロボット「スタックちゃん」です。短く親しみやすく話します。"
+    "天気や機体の操作は、推測せず必ずツールを使って答えます。"
+    "前のやり取りに数値が出ていても、聞かれたらツールを呼び直します。"
+    "発話の先頭の丸括弧はその発話の時刻です。",
 )
+# 読み上げる文の数と長さの上限。システム文で頼むのではなく code 側で切る
+MAX_SENTENCES = int(os.environ.get("MAX_SENTENCES", "2"))
+MAX_REPLY_CHARS = int(os.environ.get("MAX_REPLY_CHARS", "160"))
+# 直前に調べた「いつの天気か」を Device-Id ごとに覚える時間 [s]。
+# 省略形の追い質問（「じゃあ鳥取は？」）で引き継ぐためだが、長く持つと
+# 何十分も前の「明日」を新しい質問に継いでしまうので会話の間だけにする
+WHEN_TTL = float(os.environ.get("WHEN_TTL", "180"))
+when_store = {}            # device_id -> (調べた時刻, when)
+
+
+def remembered_when(device_id):
+    """少し前に調べた「いつの天気か」。古ければ忘れる。"""
+    hit = when_store.get(device_id)
+    if not hit:
+        return None
+    if time.time() - hit[0] > WHEN_TTL:
+        when_store.pop(device_id, None)
+        return None
+    return hit[1]
+
+
 # 会話の続きを保つ時間 [s]。本体は一区切りごとに WebSocket を切るので、
 # 接続をまたいで履歴を持たないと毎回はじめましての会話になる
 HISTORY_TTL = float(os.environ.get("HISTORY_TTL", "1800"))
@@ -158,14 +192,35 @@ def tone_pcm(rate: int, seconds=0.6, freq=660.0) -> bytes:
 
 
 # ---- 外部サービス ------------------------------------------------------
-async def sakura_chat(session: aiohttp.ClientSession, history, tools=None) -> dict:
-    """OpenAI 互換の chat completions を叩き、assistant メッセージをそのまま返す。
+class ChatHTTPError(RuntimeError):
+    """chat completions が 200 以外を返した。status で切り分けるため型を持つ。"""
+
+    def __init__(self, status, body):
+        RuntimeError.__init__(self, "chat %d: %s" % (status, str(body)[:300]))
+        self.status = status
+
+
+# 「向こう側の都合」で失敗した時だけ落ちる。400/404/422 は自分の組み立てが
+# 悪いので、ローカルへ投げ直しても同じように失敗する＝そのまま上げる
+FALL_BACK_ON_STATUS = (401, 402, 403, 408, 425, 429, 500, 502, 503, 504)
+
+
+def should_fall_back(e) -> bool:
+    if isinstance(e, ChatHTTPError):
+        return e.status in FALL_BACK_ON_STATUS
+    # 接続不能・名前解決不能・timeout 等はネット側の問題なので落ちる
+    return True
+
+
+async def chat_once(session: aiohttp.ClientSession, history, tools,
+                    base: str, model: str, token: str,
+                    timeout: float = None) -> dict:
+    """OpenAI 互換の chat completions を 1 回叩き、assistant メッセージを返す。
 
     tool_calls を落とさないよう、本文の文字列ではなく message 辞書を返す。
     """
-    url = SAKURA_BASE + "/v1/chat/completions"
     payload = {
-        "model": SAKURA_MODEL,
+        "model": model,
         "messages": [{"role": "system", "content": system_prompt()}] + history,
         "temperature": 0.7,
         "max_tokens": 200,
@@ -174,14 +229,49 @@ async def sakura_chat(session: aiohttp.ClientSession, history, tools=None) -> di
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
-    headers = {"Authorization": "Bearer " + SAKURA_TOKEN,
+    headers = {"Authorization": "Bearer " + token,
                "Content-Type": "application/json", "Accept": "application/json"}
-    async with session.post(url, json=payload, headers=headers,
-                            timeout=aiohttp.ClientTimeout(total=60)) as r:
+    async with session.post(base + "/v1/chat/completions", json=payload,
+                            headers=headers,
+                            timeout=aiohttp.ClientTimeout(
+                                total=timeout or LLM_TIMEOUT)) as r:
         body = await r.json()
         if r.status != 200:
-            raise RuntimeError("sakura chat %d: %s" % (r.status, body))
+            raise ChatHTTPError(r.status, body)
         return body["choices"][0]["message"]
+
+
+async def sakura_chat(session: aiohttp.ClientSession, history, tools=None) -> dict:
+    """まず本番へ。向こうの都合で駄目ならローカルの小さいモデルへ落ちる。
+
+    ネットが切れても・トークンが切れても黙り込まないようにするための保険。
+    落ちた事実はログに残す（黙って別のモデルで答えると原因が追えない）。
+    """
+    global _primary_down_until
+    usable = bool(FALLBACK_LLM_BASE) and FALLBACK_LLM_BASE != SAKURA_BASE
+    if usable and time.time() < _primary_down_until:
+        # 直前に駄目だったので本番は試さない（待ち時間ぶん黙るのを避ける）
+        return await chat_once(session, history, tools, FALLBACK_LLM_BASE,
+                               FALLBACK_LLM_MODEL, FALLBACK_LLM_TOKEN)
+    try:
+        msg = await chat_once(session, history, tools,
+                              SAKURA_BASE, SAKURA_MODEL, SAKURA_TOKEN,
+                              PRIMARY_LLM_TIMEOUT if usable else LLM_TIMEOUT)
+        if _primary_down_until:
+            log.info("本番 LLM (%s) が戻りました", SAKURA_MODEL)
+            _primary_down_until = 0.0
+        return msg
+    except Exception as e:
+        if not usable or not should_fall_back(e):
+            raise
+        _primary_down_until = time.time() + PRIMARY_COOLDOWN
+        log.warning("本番 LLM (%s) が使えないのでローカル (%s) へ切り替えます"
+                    "（%.0f 秒は本番を試しません）: %s",
+                    SAKURA_MODEL, FALLBACK_LLM_MODEL, PRIMARY_COOLDOWN, e)
+        msg = await chat_once(session, history, tools, FALLBACK_LLM_BASE,
+                              FALLBACK_LLM_MODEL, FALLBACK_LLM_TOKEN)
+        log.info("ローカル LLM (%s) で応答しました", FALLBACK_LLM_MODEL)
+        return msg
 
 
 async def sakura_stt(session: aiohttp.ClientSession, pcm: bytes) -> str:
@@ -257,7 +347,18 @@ async def transcribe(session, pcm: bytes) -> str:
 TOOL_TAG_RE = re.compile(r"</?tool_call>|</?function_call>|</?tool_response>",
                          re.IGNORECASE)
 TOOL_KEY_RE = re.compile(r"\"(?:name|arguments|parameters)\"\s*:")
+# 発話へ添えた時刻（server_tools.jst_stamp の形）を、そのまま返答に書き写して
+# くることがある。読み上げても邪魔なので落とす。jst_stamp の形だけを狙う
+# （年・曜日・時刻はどれも欠けうるが、括弧の中が日時だけの場合に限る）
+STAMP_ECHO_RE = re.compile(
+    r"[（(]\s*(?:\d{4}\s*年\s*)?\d{1,2}\s*月\s*\d{1,2}\s*日\s*"
+    r"(?:[（(][^（()）]{1,4}[）)]\s*)?"
+    r"(?:\d{1,2}\s*時\s*\d{1,2}\s*分?\s*)?[）)]"
+    r"|[（(]\s*\d{1,2}\s*時\s*\d{1,2}\s*分\s*[）)]")
 FALLBACK_REPLY = "うまく答えられませんでした。もう一度お願いします。"
+NEWLINES = chr(10) + chr(13)
+# 行頭の箇条書き・見出し記号（読み上げると邪魔になる）
+BULLET_RE = re.compile("(?m)^[ 　]*(?:[-*+#>]+[ 　]+|・[ 　]*|[0-9]+[.)][ 　]+)")
 
 
 def _drop_tool_json(text: str) -> str:
@@ -301,10 +402,41 @@ def clean_reply(text) -> str:
     どのモデルでも起きうるので、バックエンドに関係なく通す。
     """
     text = TOOL_TAG_RE.sub("", text or "")
+    text = STAMP_ECHO_RE.sub("", text)
+    # 箇条書きや見出しの記号は読み上げても意味が無い。改行も声には出ない
+    text = BULLET_RE.sub("", text)
+    text = re.sub("[" + NEWLINES + "]+", " ", text)
     text = _drop_tool_json(text)
     # 壊れた JSON の落ち穂（対応の取れない括弧）は読み上げても無意味
     text = re.sub(r"[{}\[\]]", "", text)
     return re.sub(r"[ 	]+", " ", text).strip()
+
+
+def plain_sentences(text: str):
+    """文の数を数えるための素直な分割（読み上げ用の塊 split_sentences とは別物）。
+
+    split_sentences は 8 字未満の断片を前の文へくっつけるので、
+    「晴れです。32度です。」が 1 塊になり文数として使えない。
+    """
+    return [s for s in re.split("(?<=[。．！？!?])", text or "") if s.strip()]
+
+
+def shorten_reply(text: str) -> str:
+    """読み上げる長さを code 側で切る。
+
+    「2 文以内」をシステム文で頼むと、その指示ぶんだけツール選択が弱くなる
+    （qwen2.5:3b 実測: 指示なし 呼び出し 7/9、指示ありの長いシステム文 1/9）。
+    形は code で守る方が確実で、プロンプトも短く保てる。
+    """
+    parts = plain_sentences(text)
+    if len(parts) > MAX_SENTENCES:
+        text = "".join(parts[:MAX_SENTENCES])
+    if len(text) > MAX_REPLY_CHARS:
+        head = text[:MAX_REPLY_CHARS]
+        cut = max(head.rfind("、"), head.rfind("。"))
+        # 区切りが早すぎる位置なら、そこで切ると意味が残らないので字数で切る
+        text = head[:cut + 1] if cut >= MAX_REPLY_CHARS // 2 else head + "。"
+    return text.strip()
 
 
 async def respond(session, history, tools=None, call_tool=None):
@@ -323,12 +455,17 @@ async def respond(session, history, tools=None, call_tool=None):
         msg = await sakura_chat(session, msgs, tools)
         calls = msg.get("tool_calls") or []
         if not calls or call_tool is None:
-            reply = clean_reply(msg.get("content"))
+            reply = shorten_reply(clean_reply(msg.get("content")))
             if not reply:
                 log.warning("空の応答（本文=%r）",
                             (msg.get("content") or "")[:120])
                 reply = FALLBACK_REPLY
             return reply, trace
+        for c in calls:
+            if not c.get("id"):
+                # id を返さない実装（ローカルのモデル等）がある。空 id を履歴に
+                # 残すと、別の API へ送り直した時に弾かれうるのでここで振る
+                c["id"] = "call_" + uuid.uuid4().hex[:8]
         step = {"role": "assistant", "content": msg.get("content") or "",
                 "tool_calls": calls}
         msgs.append(step)
@@ -336,20 +473,44 @@ async def respond(session, history, tools=None, call_tool=None):
         for c in calls:
             fn = c.get("function") or {}
             name = fn.get("name") or ""
+            args = {}
+            broken = False
             try:
                 args = json.loads(fn.get("arguments") or "{}")
+                broken = not isinstance(args, dict)
             except Exception:
+                broken = True
+            if broken:
+                # 既定の場所・既定の日で黙って答えると、聞かれていないことに
+                # 答えることになる。読み直してもらう
                 args = {}
-            try:
-                result = await call_tool(name, args)
-            except Exception as e:
-                result = "error: %s" % e
+                result = ("error: 引数が読み取れませんでした。"
+                          "場所と日を入れて呼び直してください")
+                log.warning("壊れた引数: %s(%r)", name,
+                            (fn.get("arguments") or "")[:120])
+            else:
+                try:
+                    result = await call_tool(name, args)
+                except Exception as e:
+                    result = "error: %s" % e
             log.info("tool %s(%s) -> %s", name, args, str(result)[:200])
-            out = {"role": "tool", "tool_call_id": c.get("id") or "",
+            out = {"role": "tool", "tool_call_id": c["id"],
                    "content": str(result)}
             msgs.append(out)
             trace.append(out)
     return "うまく答えられませんでした。", trace
+
+
+def last_user_text(history) -> str:
+    """履歴の末尾にある発話の本文。添えた時刻の丸括弧は外す。
+
+    when を発話の言葉から読む（server_tools.when_from_text）ので、
+    stamped_user() が付けた時刻がそのまま混ざっていると邪魔になる。
+    """
+    for m in reversed(history):
+        if m.get("role") == "user":
+            return STAMP_ECHO_RE.sub("", str(m.get("content") or "")).strip()
+    return ""
 
 
 def trim_history(msgs):
@@ -445,7 +606,12 @@ async def ws_handler(request: web.Request):
         本体側は接続の途中でツール一覧が揃うので、呼ばれた時点の state を見る。
         """
         if server_tools.has(name):
-            return await server_tools.call(session, name, args)
+            ctx = {"utterance": last_user_text(state["history"]),
+                   "last_when": remembered_when(device_id)}
+            result = await server_tools.call(session, name, args, ctx)
+            if ctx.get("resolved_when"):
+                when_store[device_id] = (time.time(), ctx["resolved_when"])
+            return result
         mcp = state["mcp"]
         if mcp is None:
             return "error: 本体のツールが使えません"
