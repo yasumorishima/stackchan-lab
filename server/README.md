@@ -20,6 +20,7 @@ NVS の `wifi/ota_url` を書き換えるだけで接続先が変わります（
 | `test_gateway.py` | 既定経路の読み取りの単体試験（経路表を差し替えるので回線に依存しない） |
 | `test_hello_grace.py` | 本体の hello が届かない時にサーバーから先に hello を出すかの確認 |
 | `test_firmware_handshake.py` | ファームの WebSocket 握手を byte 単位で写して通ることを確認する |
+| `test_broken_mcp.py` | 壊れた mcp メッセージ 1 通で対話ごと落ちないことの確認 |
 | `mock_llm.py` | さくらの AI Engine の代役（OpenAI 互換 + VOICEVOX 形式 TTS の中継） |
 | `bench_stt.py` / `bench_stt_opus.py` / `bench_stt_cer.py` | 音声認識の速度・精度の測定 |
 | `bench_tts.py` | VOICEVOX の合成速度の測定 |

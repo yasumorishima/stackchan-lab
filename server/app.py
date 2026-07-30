@@ -754,67 +754,76 @@ async def ws_handler(request: web.Request):
 
     state["hello_task"] = asyncio.create_task(hello_grace())
 
-    async for msg in ws:
-        if msg.type == aiohttp.WSMsgType.BINARY:
-            if state["listening"]:
+    # 受信ループの途中で例外が出ても libopus の解放とタスクの
+    # 打ち切りは必ず通す（漏らすとネイティブ側が残る）
+    try:
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.BINARY:
+                if state["listening"]:
+                    try:
+                        chunk = decoder.decode(msg.data)
+                        pcm_chunks.append(chunk)
+                        if state["stream"] is not None:
+                            await state["stream"].feed(chunk)
+                    except Exception:
+                        log.exception("opus decode failed (%d bytes)", len(msg.data))
+            elif msg.type == aiohttp.WSMsgType.TEXT:
                 try:
-                    chunk = decoder.decode(msg.data)
-                    pcm_chunks.append(chunk)
-                    if state["stream"] is not None:
-                        await state["stream"].feed(chunk)
+                    data = json.loads(msg.data)
                 except Exception:
-                    log.exception("opus decode failed (%d bytes)", len(msg.data))
-        elif msg.type == aiohttp.WSMsgType.TEXT:
-            try:
-                data = json.loads(msg.data)
-            except Exception:
-                log.warning("non-json text frame: %r", msg.data[:200])
-                continue
-            mtype = data.get("type")
-            log.info("<- %s", msg.data[:300])
-            if mtype == "hello":
-                await open_channel(
-                    bool((data.get("features") or {}).get("mcp")))
-            elif mtype == "listen":
-                ls = data.get("state")
-                if ls in ("start", "detect"):
-                    state["listening"] = True
-                    pcm_chunks.clear()
-                    state["stream"] = (local_stt.VoskStream(UP_RATE)
-                                       if STT_BACKEND == "vosk" else None)
-                elif ls == "stop":
+                    log.warning("non-json text frame: %r", msg.data[:200])
+                    continue
+                mtype = data.get("type")
+                log.info("<- %s", msg.data[:300])
+                if mtype == "hello":
+                    await open_channel(
+                        bool((data.get("features") or {}).get("mcp")))
+                elif mtype == "listen":
+                    ls = data.get("state")
+                    if ls in ("start", "detect"):
+                        state["listening"] = True
+                        pcm_chunks.clear()
+                        state["stream"] = (local_stt.VoskStream(UP_RATE)
+                                           if STT_BACKEND == "vosk" else None)
+                    elif ls == "stop":
+                        state["listening"] = False
+                        pcm = b"".join(pcm_chunks)
+                        pcm_chunks.clear()
+                        stream = state["stream"]
+                        state["stream"] = None
+                        prev = state["task"]
+                        if prev is not None and not prev.done():
+                            log.info("前の発話を処理中なので中断する")
+                            prev.cancel()
+                        # 受信ループの中で待つと、本体からの MCP 応答を読めなくなる
+                        state["task"] = asyncio.create_task(handle_utterance(pcm, stream))
+                elif mtype == "abort":
                     state["listening"] = False
-                    pcm = b"".join(pcm_chunks)
                     pcm_chunks.clear()
-                    stream = state["stream"]
                     state["stream"] = None
-                    prev = state["task"]
-                    if prev is not None and not prev.done():
-                        log.info("前の発話を処理中なので中断する")
-                        prev.cancel()
-                    # 受信ループの中で待つと、本体からの MCP 応答を読めなくなる
-                    state["task"] = asyncio.create_task(handle_utterance(pcm, stream))
-            elif mtype == "abort":
-                state["listening"] = False
-                pcm_chunks.clear()
-                state["stream"] = None
-                if state["task"] is not None and not state["task"].done():
-                    state["task"].cancel()
-            elif mtype == "mcp":
-                if state["mcp"] is not None:
-                    state["mcp"].handle(data.get("payload") or {})
-                else:
-                    log.info("mcp message before handshake: %s", msg.data[:200])
-        elif msg.type == aiohttp.WSMsgType.ERROR:
-            log.error("ws error: %s", ws.exception())
+                    if state["task"] is not None and not state["task"].done():
+                        state["task"].cancel()
+                elif mtype == "mcp":
+                    if state["mcp"] is not None:
+                        try:
+                            state["mcp"].handle(data.get("payload") or {})
+                        except Exception:
+                            # 壊れた 1 通で対話ごと落とさない。例えば id に配列が
+                            # 来ると待ち行列の引き当てが unhashable で例外になる
+                            log.exception("mcp message failed: %s", msg.data[:200])
+                    else:
+                        log.info("mcp message before handshake: %s", msg.data[:200])
+            elif msg.type == aiohttp.WSMsgType.ERROR:
+                log.error("ws error: %s", ws.exception())
 
-    decoder.close()
-    encoder.close()
-    for t in (state["task"], state["mcp_task"], state["hello_task"]):
-        if t is not None and not t.done():
-            t.cancel()
-    log.info("WS closed device=%s session=%s (hello_done=%s)",
-             device_id, session_id, state["hello_done"])
+    finally:
+        decoder.close()
+        encoder.close()
+        for t in (state["task"], state["mcp_task"], state["hello_task"]):
+            if t is not None and not t.done():
+                t.cancel()
+        log.info("WS closed device=%s session=%s (hello_done=%s)",
+                 device_id, session_id, state["hello_done"])
     return ws
 
 
