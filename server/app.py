@@ -88,6 +88,8 @@ def _primary_ipv4() -> str:
 
 PUBLIC_HOST = os.environ.get("PUBLIC_HOST") or _primary_ipv4()
 WS_TOKEN = os.environ.get("WS_TOKEN", "stackchan-local")
+# 本体の hello をこの秒数待って来なければ、こちらから先に server hello を送る
+HELLO_GRACE = float(os.environ.get("HELLO_GRACE", "3"))
 
 SAKURA_BASE = os.environ.get("SAKURA_BASE", "https://api.ai.sakura.ad.jp")
 SAKURA_TOKEN = os.environ.get("SAKURA_TOKEN", "")
@@ -610,10 +612,54 @@ async def ws_handler(request: web.Request):
         history = kept[1]
         log.info("restored %d messages of history for %s", len(history), device_id)
     state = {"listening": False, "hello_done": False, "history": history,
-             "stream": None, "mcp": None, "mcp_task": None, "task": None}
+             "stream": None, "mcp": None, "mcp_task": None, "task": None,
+             "hello_task": None}
 
     async def send_json(obj):
         await ws.send_str(json.dumps(obj, ensure_ascii=False))
+
+    async def open_channel(features_mcp: bool):
+        """本体へ server hello を返してチャネルを開く。二重には送らない。"""
+        if state["hello_done"]:
+            return
+        state["hello_done"] = True
+        await send_json({
+            "type": "hello",
+            "transport": "websocket",   # この値は本体が厳密に比較する
+            "session_id": session_id,
+            "audio_params": {"sample_rate": DOWN_RATE,
+                             "frame_duration": FRAME_MS},
+        })
+        if not features_mcp:
+            return
+        mcp = mcp_client.McpSession(send_json)
+        state["mcp"] = mcp
+
+        async def _handshake():
+            try:
+                await mcp.handshake()
+            except Exception:
+                log.exception("mcp handshake failed")
+                state["mcp"] = None
+
+        state["mcp_task"] = asyncio.create_task(_handshake())
+
+    async def hello_grace():
+        """本体の hello が届かないまま黙って切られるのを防ぐ保険。
+
+        本体は自分の hello を送ったあと server hello を 10 秒待ち、来なければ
+        SERVER_TIMEOUT で切る。往路の hello が落ちるとこちらは何も受け取れず、
+        本体だけが待って切れる。少し待って来なければこちらから先に開く。
+        現行ファームの hello は必ず mcp を名乗るので、その前提で開く。
+        """
+        await asyncio.sleep(HELLO_GRACE)
+        if state["hello_done"]:
+            return
+        log.warning("hello が %.1f 秒来ないので server hello を先に送る", HELLO_GRACE)
+        try:
+            await open_channel(True)
+        except Exception:
+            log.exception("先出しの server hello に失敗した")
 
     async def speak(text: str):
         # 文ごとに合成して送る。次の文は今の文を流している裏で作る（初音までを短く）
@@ -706,6 +752,8 @@ async def ws_handler(request: web.Request):
             await send_json({"type": "tts", "state": "stop"})
             await send_json({"type": "stt", "text": "エラー: %s" % e})
 
+    state["hello_task"] = asyncio.create_task(hello_grace())
+
     async for msg in ws:
         if msg.type == aiohttp.WSMsgType.BINARY:
             if state["listening"]:
@@ -725,26 +773,8 @@ async def ws_handler(request: web.Request):
             mtype = data.get("type")
             log.info("<- %s", msg.data[:300])
             if mtype == "hello":
-                await send_json({
-                    "type": "hello",
-                    "transport": "websocket",   # この値は本体が厳密に比較する
-                    "session_id": session_id,
-                    "audio_params": {"sample_rate": DOWN_RATE,
-                                     "frame_duration": FRAME_MS},
-                })
-                state["hello_done"] = True
-                if (data.get("features") or {}).get("mcp"):
-                    mcp = mcp_client.McpSession(send_json)
-                    state["mcp"] = mcp
-
-                    async def _handshake():
-                        try:
-                            await mcp.handshake()
-                        except Exception:
-                            log.exception("mcp handshake failed")
-                            state["mcp"] = None
-
-                    state["mcp_task"] = asyncio.create_task(_handshake())
+                await open_channel(
+                    bool((data.get("features") or {}).get("mcp")))
             elif mtype == "listen":
                 ls = data.get("state")
                 if ls in ("start", "detect"):
@@ -780,7 +810,7 @@ async def ws_handler(request: web.Request):
 
     decoder.close()
     encoder.close()
-    for t in (state["task"], state["mcp_task"]):
+    for t in (state["task"], state["mcp_task"], state["hello_task"]):
         if t is not None and not t.done():
             t.cancel()
     log.info("WS closed device=%s session=%s (hello_done=%s)",
