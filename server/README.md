@@ -77,6 +77,12 @@ docker run -d --name voicevox --restart unless-stopped -p 127.0.0.1:50021:50021 
 # サーバー側ツールだけ（本体も LLM も要らない）
 ./.venv/bin/python test_tools.py
 
+# 回線にも本体にも依存しないもの
+./.venv/bin/python test_gateway.py            # 既定経路の読み取り
+./.venv/bin/python test_firmware_handshake.py # ファームの握手を byte 単位で写して当てる
+./.venv/bin/python test_hello_grace.py        # hello が来ない時にこちらから先に出すか
+./.venv/bin/python test_broken_mcp.py         # 壊れた mcp 1 通で落ちないか
+
 # 素の往復（合成音声を Opus で送って、認識・応答・読み上げまで）
 TEST_TEXT="今日の天気を教えて。" ./.venv/bin/python test_client.py
 
@@ -84,6 +90,27 @@ TEST_TEXT="今日の天気を教えて。" ./.venv/bin/python test_client.py
 ./.venv/bin/python mock_llm.py &
 SAKURA_BASE=http://127.0.0.1:8100 SAKURA_TOKEN=dummy LLM_BACKEND=sakura ./.venv/bin/python app.py
 ```
+
+## 本体が繋がるのに黙って切れる時（2026-07-30）
+
+本体は接続してくるのに、こちらの受信ログが 0 行のまま 15 秒ほどで切れることがあります。
+ファーム（上流 xiaozhi-esp32 v2.2.4）の待ち時間は 2 段です。
+
+1. 握手要求を送り、完了を 10 秒待つ（判定は応答に `HTTP/1.1 101` を含むかだけ）
+2. 成功して初めて `hello` を送り、サーバーの `hello` をさらに 10 秒待つ
+
+**1 で切れた場合、`hello` は 1 バイトも出ません。** 受信 0 行は「本体が送っていない」
+場合と「送ったが届いていない」場合の両方でそう見えます。切り分けの順に見てください。
+
+- **まずファイアウォール**。本体は同じ LAN から来ます。待ち受けだけ合っていても
+  経路で落ちていれば繋がりません（`ufw` が既定拒否なら 8000 番を LAN 限定で開ける）
+- **握手が本体の形で通るか**は `test_firmware_handshake.py` で確認できます。
+  ファームの WebSocket クライアントの要求を byte 単位で写してあります
+- **`hello` の往路が落ちている場合の保険**として、`HELLO_GRACE`（既定 3 秒）待って
+  本体の `hello` が来なければ、サーバーから先に `hello` を送ります。ファーム側は
+  `hello` の順序を問わないので先に送っても壊れません。発動するとログに
+  「hello が 3.0 秒来ないので server hello を先に送る」と残るので、
+  **この行が出ていれば往路が落ちていた証拠**になります
 
 ## 覚え書き
 
@@ -95,6 +122,8 @@ SAKURA_BASE=http://127.0.0.1:8100 SAKURA_TOKEN=dummy LLM_BACKEND=sakura ./.venv/
 - 設定ファイルを `.env` という名前にしていないのは、手元の環境で
   資格情報保護のフックが `.env` を含むコマンドを止めるためです。
 - `server.conf` は追跡しません。トークンはここだけに置きます。
+- 受信ループは `try/finally` で囲ってあります。後始末で libopus の decoder/encoder を
+  解放しており、ここを飛ばすとネイティブ側が接続ごとに残るためです。
 
 ## 実物の LLM で通した記録（2026-07-29）
 
