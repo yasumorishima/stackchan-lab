@@ -41,11 +41,24 @@ def _default_gateway() -> str:
     try:
         with open("/proc/net/route", encoding="ascii") as f:
             next(f)                       # 見出し行
+            # 列は Iface / Destination / Gateway / Flags / RefCnt / Use / Metric / Mask / ...
             for line in f:
                 cols = line.split()
-                # 宛先が 0.0.0.0 の行が既定経路。3 列目がゲートウェイ（little endian の hex）
-                if len(cols) > 2 and cols[1] == "00000000":
-                    return socket.inet_ntoa(struct.pack("<L", int(cols[2], 16)))
+                if len(cols) < 8:
+                    continue
+                # 宛先とマスクが両方 0 の行だけが本当の既定経路。宛先だけ見ると
+                # VPN が張る 0.0.0.0/1（マスク 00000080）も既定経路と誤認する
+                if cols[1] != "00000000" or cols[7] != "00000000":
+                    continue
+                # RTF_UP(0x1) | RTF_GATEWAY(0x2) が立っている行だけ採る
+                if int(cols[3], 16) & 0x3 != 0x3:
+                    continue
+                gw = socket.inet_ntoa(struct.pack("<L", int(cols[2], 16)))
+                # ppp0 等の point-to-point 経路はゲートウェイが 0.0.0.0 になる。
+                # Linux は connect("0.0.0.0") を loopback 宛として成功させるため、
+                # これを返すと送信元が 127.0.0.1 になり次の手に進めなくなる（実測）
+                if gw != "0.0.0.0":
+                    return gw
     except Exception:
         pass
     return ""
