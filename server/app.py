@@ -14,6 +14,7 @@ import logging
 import math
 import os
 import re
+import socket
 import struct
 import time
 import uuid
@@ -31,21 +32,45 @@ log = logging.getLogger("stackchan")
 
 # ---- 設定 -------------------------------------------------------------
 PORT = int(os.environ.get("PORT", "8000"))
+def _default_gateway() -> str:
+    """既定経路のゲートウェイを経路表から読む（Linux）。
+
+    ここを特定のルーターに決め打ちすると別のサブネットで動かなくなる。
+    読めなければ空文字を返して呼び出し側の次の手に任せる。
+    """
+    try:
+        with open("/proc/net/route", encoding="ascii") as f:
+            next(f)                       # 見出し行
+            for line in f:
+                cols = line.split()
+                # 宛先が 0.0.0.0 の行が既定経路。3 列目がゲートウェイ（little endian の hex）
+                if len(cols) > 2 and cols[1] == "00000000":
+                    return socket.inet_ntoa(struct.pack("<L", int(cols[2], 16)))
+    except Exception:
+        pass
+    return ""
+
+
 def _primary_ipv4() -> str:
     """本体から見えるこの機体の LAN アドレスを調べる。
 
     PUBLIC_HOST を明示しない運用のための保険。外に出る経路のソースアドレスを取るだけで、
     実際の通信は行わない（UDP connect はパケットを出さない）。
+    既定経路のゲートウェイを先に試すのは、VPN 等が入っていても本体と同じ網の
+    アドレスを選びたいため。
     """
-    import socket
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("192.168.10.1", 1))
-        return s.getsockname()[0]
-    except Exception:
-        return "127.0.0.1"
-    finally:
-        s.close()
+    for target in (_default_gateway(), "8.8.8.8"):
+        if not target:
+            continue
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((target, 1))
+            return s.getsockname()[0]
+        except Exception:
+            continue
+        finally:
+            s.close()
+    return "127.0.0.1"
 
 
 PUBLIC_HOST = os.environ.get("PUBLIC_HOST") or _primary_ipv4()

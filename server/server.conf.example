@@ -4,7 +4,7 @@
 
 PORT=8000
 # 本体に返す接続先。省略すると起動時に LAN アドレスを自動検出する
-PUBLIC_HOST=192.168.10.111
+PUBLIC_HOST=192.168.0.10
 
 # 音声認識: sherpa / vosk / whisper / sakura / dry
 STT_BACKEND=sherpa
