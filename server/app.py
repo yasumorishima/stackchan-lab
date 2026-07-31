@@ -90,6 +90,22 @@ PUBLIC_HOST = os.environ.get("PUBLIC_HOST") or _primary_ipv4()
 WS_TOKEN = os.environ.get("WS_TOKEN", "stackchan-local")
 # 本体の hello をこの秒数待って来なければ、こちらから先に server hello を送る
 HELLO_GRACE = float(os.environ.get("HELLO_GRACE", "3"))
+# 本体が mode:auto で来ると発話の終わりを送ってこないので、無音を見て自分で切る
+VAD_RMS = float(os.environ.get("VAD_RMS", "500"))
+VAD_SILENCE_MS = float(os.environ.get("VAD_SILENCE_MS", "800"))
+VAD_MIN_SPEECH_MS = float(os.environ.get("VAD_MIN_SPEECH_MS", "300"))
+VAD_MAX_MS = float(os.environ.get("VAD_MAX_MS", "15000"))
+# 読み上げが本体で鳴り終わるまでの余裕。短いと自分の声を拾って再認識する
+SPEAK_TAIL_SEC = float(os.environ.get("SPEAK_TAIL_SEC", "0.8"))
+
+
+def frame_rms(pcm: bytes) -> float:
+    """16bit モノラルの実効値。無音かどうかの判定だけに使う。"""
+    n = len(pcm) // 2
+    if n == 0:
+        return 0.0
+    vals = struct.unpack("<%dh" % n, pcm[:n * 2])
+    return math.sqrt(sum(v * v for v in vals) / n)
 
 SAKURA_BASE = os.environ.get("SAKURA_BASE", "https://api.ai.sakura.ad.jp")
 SAKURA_TOKEN = os.environ.get("SAKURA_TOKEN", "")
@@ -613,7 +629,8 @@ async def ws_handler(request: web.Request):
         log.info("restored %d messages of history for %s", len(history), device_id)
     state = {"listening": False, "hello_done": False, "history": history,
              "stream": None, "mcp": None, "mcp_task": None, "task": None,
-             "hello_task": None}
+             "hello_task": None, "auto": False,
+             "speech_ms": 0.0, "silence_ms": 0.0, "max_rms": 0.0}
 
     async def send_json(obj):
         await ws.send_str(json.dumps(obj, ensure_ascii=False))
@@ -684,6 +701,15 @@ async def ws_handler(request: web.Request):
         log.info("spoke %d frames (%.1fs) in %d sentences, first audio %.2fs: %s",
                  sent, sent * FRAME_MS / 1000, len(sentences), first or -1, text)
 
+        # 送り終えても本体はまだ鳴らしている。ここで待たずに聞き直すと
+        # 自分の声を拾ってそのまま次の発話として認識してしまう
+        # （実測: 「ドライランです」を「トライランです」と認識して往復した）
+        playback = sent * FRAME_MS / 1000.0
+        wait = playback - (time.monotonic() - t0) + SPEAK_TAIL_SEC
+        if wait > 0:
+            log.info("読み上げが鳴り終わるまで %.1f 秒待つ", wait)
+            await asyncio.sleep(wait)
+
     async def call_tool(name, args):
         """LLM の関数呼び出しを、サーバー側ツールと本体の MCP ツールへ振り分ける。
 
@@ -752,6 +778,56 @@ async def ws_handler(request: web.Request):
             await send_json({"type": "tts", "state": "stop"})
             await send_json({"type": "stt", "text": "エラー: %s" % e})
 
+    def start_listening(auto: bool):
+        state["listening"] = True
+        state["auto"] = auto
+        state["speech_ms"] = 0.0
+        state["silence_ms"] = 0.0
+        state["max_rms"] = 0.0
+        pcm_chunks.clear()
+        state["stream"] = (local_stt.VoskStream(UP_RATE)
+                           if STT_BACKEND == "vosk" else None)
+
+    def vad_should_finish(chunk: bytes) -> bool:
+        """無音が続いたら発話の切れ目とみなす。長すぎる時も打ち切る。"""
+        ms = len(chunk) / 2 / UP_RATE * 1000.0
+        rms = frame_rms(chunk)
+        if rms > state["max_rms"]:
+            state["max_rms"] = rms
+        if rms >= VAD_RMS:
+            state["speech_ms"] += ms
+            state["silence_ms"] = 0.0
+        elif state["speech_ms"] > 0.0:
+            state["silence_ms"] += ms
+        if (state["speech_ms"] >= VAD_MIN_SPEECH_MS
+                and state["silence_ms"] >= VAD_SILENCE_MS):
+            return True
+        return state["speech_ms"] + state["silence_ms"] >= VAD_MAX_MS
+
+    def finish_listening():
+        state["listening"] = False
+        # 閾値を実機の音量に合わせるための材料。推測で決めない
+        log.info("この発話の最大音量 rms=%.0f（閾値 %.0f）",
+                 state["max_rms"], VAD_RMS)
+        pcm = b"".join(pcm_chunks)
+        pcm_chunks.clear()
+        stream = state["stream"]
+        state["stream"] = None
+        prev = state["task"]
+        if prev is not None and not prev.done():
+            log.info("前の発話を処理中なので中断する")
+            prev.cancel()
+        # 受信ループの中で待つと、本体からの MCP 応答を読めなくなる
+        task = asyncio.create_task(handle_utterance(pcm, stream))
+        state["task"] = task
+        if state["auto"]:
+            # 話し終わってから聞き直す。読み上げ中に自分の声を拾わないため
+            task.add_done_callback(rearm_listening)
+
+    def rearm_listening(_task):
+        if state["auto"] and not state["listening"]:
+            start_listening(True)
+
     state["hello_task"] = asyncio.create_task(hello_grace())
 
     # 受信ループの途中で例外が出ても libopus の解放とタスクの
@@ -767,6 +843,11 @@ async def ws_handler(request: web.Request):
                             await state["stream"].feed(chunk)
                     except Exception:
                         log.exception("opus decode failed (%d bytes)", len(msg.data))
+                    else:
+                        if state["auto"] and vad_should_finish(chunk):
+                            log.info("発話の終わりを検出（音声 %.0fms / 無音 %.0fms）",
+                                     state["speech_ms"], state["silence_ms"])
+                            finish_listening()
             elif msg.type == aiohttp.WSMsgType.TEXT:
                 try:
                     data = json.loads(msg.data)
@@ -781,24 +862,14 @@ async def ws_handler(request: web.Request):
                 elif mtype == "listen":
                     ls = data.get("state")
                     if ls in ("start", "detect"):
-                        state["listening"] = True
-                        pcm_chunks.clear()
-                        state["stream"] = (local_stt.VoskStream(UP_RATE)
-                                           if STT_BACKEND == "vosk" else None)
+                        start_listening(data.get("mode") == "auto")
                     elif ls == "stop":
-                        state["listening"] = False
-                        pcm = b"".join(pcm_chunks)
-                        pcm_chunks.clear()
-                        stream = state["stream"]
-                        state["stream"] = None
-                        prev = state["task"]
-                        if prev is not None and not prev.done():
-                            log.info("前の発話を処理中なので中断する")
-                            prev.cancel()
-                        # 受信ループの中で待つと、本体からの MCP 応答を読めなくなる
-                        state["task"] = asyncio.create_task(handle_utterance(pcm, stream))
+                        finish_listening()
                 elif mtype == "abort":
                     state["listening"] = False
+                    state["auto"] = False
+                    state["speech_ms"] = 0.0
+                    state["silence_ms"] = 0.0
                     pcm_chunks.clear()
                     state["stream"] = None
                     if state["task"] is not None and not state["task"].done():
