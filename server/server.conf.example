@@ -16,10 +16,12 @@ SHERPA_DIR=~/models/reazonspeech-k2-v2
 # VOSK_MODEL=~/models/vosk-model-small-ja-0.22
 # WHISPER_MODEL=small
 
-# 読み上げ: voicevox / sakura / tone
-TTS_BACKEND=voicevox
-VOICEVOX_URL=http://127.0.0.1:50021
-VOICEVOX_SPEAKER=3
+# 読み上げ: openjtalk / voicevox / sakura / tone
+TTS_BACKEND=openjtalk
+# openjtalk: apt の open-jtalk + naist-jdic + nitech 声で動く軽量 TTS（RPi5 で 1 文 0.3 秒）
+# voicevox に戻す場合は TTS_BACKEND=voicevox と下 2 行を有効にする
+#VOICEVOX_URL=http://127.0.0.1:50021
+#VOICEVOX_SPEAKER=3
 
 # 応答生成: sakura / dry
 LLM_BACKEND=dry

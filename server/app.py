@@ -16,6 +16,7 @@ import os
 import re
 import socket
 import struct
+import tempfile
 import time
 import uuid
 import wave
@@ -369,9 +370,53 @@ async def voicevox_tts(session: aiohttp.ClientSession, text: str, base: str, hea
     return resample_linear(pcm, rate, DOWN_RATE)
 
 
+# Open JTalk（軽量 TTS）。VOICEVOX より桁で速い（RPi5 実測 0.27 秒 / 文、RTF≈0.06）。
+# user 判断（2026-07-31）で速さ優先の既定に採用。声は nitech の男声。
+OPENJTALK_BIN = os.environ.get("OPENJTALK_BIN", "open_jtalk")
+OPENJTALK_DIC = os.environ.get(
+    "OPENJTALK_DIC", "/var/lib/mecab/dic/open-jtalk/naist-jdic")
+OPENJTALK_VOICE = os.environ.get(
+    "OPENJTALK_VOICE",
+    "/usr/share/hts-voice/nitech-jp-atr503-m001/nitech_jp_atr503_m001.htsvoice")
+
+
+async def openjtalk_tts(text: str) -> bytes:
+    """Open JTalk で合成する。stdin からテキストを読み -ow のファイルへ書く。
+
+    パイプ受け（-ow /dev/stdout）は環境依存なので一時ファイルで受ける。
+    """
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        out = f.name
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            OPENJTALK_BIN, "-x", OPENJTALK_DIC, "-m", OPENJTALK_VOICE,
+            "-ow", out,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE)
+        _, err = await asyncio.wait_for(
+            proc.communicate(text.encode("utf-8")), timeout=30)
+        if proc.returncode != 0:
+            raise RuntimeError("open_jtalk exit %d: %s"
+                               % (proc.returncode,
+                                  err.decode("utf-8", "replace")[:200]))
+        wav = open(out, "rb").read()
+    finally:
+        try:
+            os.unlink(out)
+        except OSError:
+            pass
+    pcm, rate, ch, width = wav_to_pcm(wav)
+    if ch != 1 or width != 2:
+        raise RuntimeError("unexpected wav: ch=%d width=%d" % (ch, width))
+    return resample_linear(pcm, rate, DOWN_RATE)
+
+
 async def synthesize(session, text: str) -> bytes:
     if TTS_BACKEND == "voicevox":
         return await voicevox_tts(session, text, VOICEVOX_URL)
+    if TTS_BACKEND == "openjtalk":
+        return await openjtalk_tts(text)
     if TTS_BACKEND == "sakura":
         return await voicevox_tts(session, text, SAKURA_BASE + "/tts/v1",
                                   {"Authorization": "Bearer " + SAKURA_TOKEN})
@@ -397,6 +442,10 @@ def split_sentences(text: str):
 
 # 初音を早く出すため、最初に合成するかたまりはこの字数を目安に短くする
 FIRST_CHUNK_CHARS = int(os.environ.get("FIRST_CHUNK_CHARS", "12"))
+
+# 音になる文字（かな・漢字・英数）を含むか。絵文字や記号だけのかたまりを
+# open_jtalk に渡すと「No phoneme」で合成ごと失敗する（2026-07-31 実測）
+SPEAKABLE_RE = re.compile(r"[ぁ-んァ-ヶー一-龠a-zA-Z0-9０-９]")
 
 
 def quicken_first(sentences):
@@ -715,15 +764,24 @@ async def ws_handler(request: web.Request):
     async def speak(text: str):
         # 文ごとに合成して送る。次の文は今の文を流している裏で作る（初音までを短く）
         sentences = quicken_first(split_sentences(text))
+        # 絵文字・記号だけのかたまりは音にならないので渡さない
+        sentences = [s for s in sentences if SPEAKABLE_RE.search(s)] or sentences[:1]
         t0 = time.monotonic()
         await send_json({"type": "tts", "state": "start"})
         nxt = asyncio.create_task(synthesize(session, sentences[0]))
         sent = 0
         first = None
         for i, s in enumerate(sentences):
-            pcm = await nxt
+            try:
+                pcm = await nxt
+            except Exception:
+                # 1 文の合成失敗で残りの読み上げまで道連れにしない
+                log.exception("合成に失敗したのでこの文を飛ばす: %s", s[:40])
+                pcm = b""
             if i + 1 < len(sentences):
                 nxt = asyncio.create_task(synthesize(session, sentences[i + 1]))
+            if not pcm:
+                continue
             await send_json({"type": "tts", "state": "sentence_start", "text": s})
             for packet in encoder.encode_stream(pcm):
                 await ws.send_bytes(packet)
