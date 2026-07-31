@@ -58,7 +58,14 @@ cp server.conf.example server.conf && chmod 600 server.conf
 ./.venv/bin/python app.py
 ```
 
-読み上げには VOICEVOX エンジンが要ります。
+読み上げの既定は Open JTalk です（Raspberry Pi 5 の CPU でも 1 文 0.3 秒で合成できるため）。
+
+```bash
+sudo apt install open-jtalk open-jtalk-mecab-naist-jdic hts-voice-nitech-jp-atr503-m001
+```
+
+声質を優先するなら VOICEVOX も選べます（`TTS_BACKEND=voicevox`）。
+合成は 1 文 2〜5 秒かかるので、初音までの待ちが数秒延びます。
 
 ```bash
 docker run -d --name voicevox --restart unless-stopped -p 127.0.0.1:50021:50021 \
@@ -207,9 +214,14 @@ SAKURA_MODEL=qwen2.5:3b REPEAT=3 ./.venv/bin/python probe_followup.py
 
 ## ネットが切れても話せるようにする（2026-07-30）
 
-STT（sherpa-onnx）と TTS（VOICEVOX）はもともとローカルなので、LLM だけ用意すれば
-家の中だけで会話が成立します。本番（さくらの AI Engine）が使えない時に、手元の
-小さいモデルへ落ちるようにしました。
+STT（sherpa-onnx）と TTS（Open JTalk / VOICEVOX）はもともとローカルなので、LLM だけ
+用意すれば家の中だけで会話が成立します。本番（さくらの AI Engine）が使えない時に、
+手元の小さいモデルへ落ちるようにしました。
+
+※ 2026-07-31 に方針変更: 手元のモデルは応答に 10 秒前後かかって常用に向かないため
+置くのをやめました（共有機の負荷も返せます）。仕組みは残っているので、モデルを
+置き直せばまた有効になります。ネットが切れた時は出荷時サーバーへ戻す運用です
+（[`tools/switch-backend.ps1`](../tools/switch-backend.ps1)）。
 
 - 落ちる条件は「向こう側の都合」だけです。401/403/429/5xx・接続不能・timeout では
   落ちますが、**400/404/422 では落ちません**（こちらの組み立てが悪いので、投げ直しても
