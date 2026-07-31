@@ -28,6 +28,7 @@ import server_tools  # noqa: E402
 
 BASE = os.environ.get("SAKURA_BASE", "http://127.0.0.1:11434")
 MODEL = os.environ.get("SAKURA_MODEL", "qwen2.5:3b")
+TOKEN = os.environ.get("SAKURA_TOKEN", "dummy")
 REPEAT = int(os.environ.get("REPEAT", "3"))
 
 DEVICE_TOOL = {
@@ -75,11 +76,11 @@ LENGTH_CASES = [
 
 async def ask(session, messages):
     payload = {"model": MODEL, "messages": messages, "temperature": 0.7,
-               "max_tokens": 200, "stream": False,
+               "max_tokens": 400, "stream": False,
                "tools": TOOLS, "tool_choice": "auto"}
     t0 = time.monotonic()
     async with session.post(BASE + "/v1/chat/completions", json=payload,
-                            headers={"Authorization": "Bearer dummy"},
+                            headers={"Authorization": "Bearer " + TOKEN + ""},
                             timeout=aiohttp.ClientTimeout(total=300)) as r:
         body = await r.json()
         if r.status != 200:

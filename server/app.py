@@ -279,7 +279,10 @@ async def chat_once(session: aiohttp.ClientSession, history, tools,
         "model": model,
         "messages": [{"role": "system", "content": system_prompt()}] + history,
         "temperature": 0.7,
-        "max_tokens": 200,
+        # gpt-oss 系は tools 付きだと思考（analysis チャネル）にもトークンを使い、
+        # 200 だと本文が空のまま length で切れることがある（probe_followup で実測）。
+        # さくらはリクエスト数課金なので上げてもコストは変わらない。
+        "max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "400")),
         "stream": False,
     }
     if tools:
@@ -410,7 +413,9 @@ STAMP_ECHO_RE = re.compile(
     r"[（(]\s*(?:\d{4}\s*年\s*)?\d{1,2}\s*月\s*\d{1,2}\s*日\s*"
     r"(?:[（(][^（()）]{1,4}[）)]\s*)?"
     r"(?:\d{1,2}\s*時\s*\d{1,2}\s*分?\s*)?[）)]"
-    r"|[（(]\s*\d{1,2}\s*時\s*\d{1,2}\s*分\s*[）)]")
+    r"|[（(]\s*\d{1,2}\s*時\s*\d{1,2}\s*分\s*[）)]"
+    # gpt-oss-120b は「(20:23)」のようなコロン形式で書き写す（2026-07-31 実測）
+    r"|[（(]\s*\d{1,2}:\d{2}(?::\d{2})?\s*[）)]")
 FALLBACK_REPLY = "うまく答えられませんでした。もう一度お願いします。"
 NEWLINES = chr(10) + chr(13)
 # 行頭の箇条書き・見出し記号（読み上げると邪魔になる）
