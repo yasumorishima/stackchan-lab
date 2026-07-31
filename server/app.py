@@ -379,15 +379,40 @@ async def synthesize(session, text: str) -> bytes:
 
 
 def split_sentences(text: str):
-    """読み上げ用に文へ割る。短い断片は前の文にくっつける。"""
+    """読み上げ用に文へ割る。短い断片は前の文にくっつける。
+
+    ただし先頭の文だけは短くてもくっつけない。合成時間は文の長さに
+    ほぼ比例するので、「了解です！」を後ろの長文と合体させると
+    初音がその分（実測で 6 秒）遅れる。先頭が短いのはむしろ好都合。
+    """
     parts = [s.strip() for s in re.split("(?<=[。．！？!?])", text) if s.strip()]
     out = []
     for s in parts:
-        if out and len(out[-1]) < 8:
+        if len(out) > 1 and len(out[-1]) < 8:
             out[-1] = out[-1] + s
         else:
             out.append(s)
     return out or [text.strip() or "..."]
+
+
+# 初音を早く出すため、最初に合成するかたまりはこの字数を目安に短くする
+FIRST_CHUNK_CHARS = int(os.environ.get("FIRST_CHUNK_CHARS", "12"))
+
+
+def quicken_first(sentences):
+    """最初のかたまりだけ読点で割って短くする（初音を早く鳴らすため）。
+
+    VOICEVOX の合成時間は文の長さにほぼ比例する（RPi5 実測 RTF≈1.3〜1.6）。
+    第一文が 20 字あると初音まで 5 秒かかる（2026-07-31 実機で実測）。
+    後続のかたまりは再生中に裏で合成が進むので長いままでよい。
+    """
+    if not sentences or len(sentences[0]) <= FIRST_CHUNK_CHARS:
+        return sentences
+    first = sentences[0]
+    cut = first.find("、", 2, FIRST_CHUNK_CHARS + 4)
+    if cut < 0:
+        return sentences
+    return [first[:cut + 1], first[cut + 1:]] + list(sentences[1:])
 
 
 async def transcribe(session, pcm: bytes) -> str:
@@ -689,7 +714,7 @@ async def ws_handler(request: web.Request):
 
     async def speak(text: str):
         # 文ごとに合成して送る。次の文は今の文を流している裏で作る（初音までを短く）
-        sentences = split_sentences(text)
+        sentences = quicken_first(split_sentences(text))
         t0 = time.monotonic()
         await send_json({"type": "tts", "state": "start"})
         nxt = asyncio.create_task(synthesize(session, sentences[0]))
