@@ -375,6 +375,7 @@ async def sakura_chat(session: aiohttp.ClientSession, history, tools=None) -> di
         msg = await chat_once(session, history, tools,
                               SAKURA_BASE, SAKURA_MODEL, SAKURA_TOKEN,
                               PRIMARY_LLM_TIMEOUT if usable else LLM_TIMEOUT)
+        server_tools.count_llm_request()
         if _primary_down_until:
             log.info("本番 LLM (%s) が戻りました", SAKURA_MODEL)
             _primary_down_until = 0.0

@@ -10,6 +10,7 @@ LLM には本体のツールとこちらのツールを 1 つの配列にまと�
 """
 import asyncio
 import datetime
+import json
 import logging
 import os
 import time
@@ -476,6 +477,54 @@ async def get_stock_index(session, args, ctx=None) -> str:
     return "。".join(good) if good else lines[0]
 
 
+# ---- さくら無料枠の使用回数 -------------------------------------------------
+# 利用量を返す API は無い（2026-08-01 実測: /v1/usage・quota・stats 等は全部 404、
+# 応答ヘッダにもレート制限情報なし。コンパネの「利用量」はコンパネのセッション
+# 認証で、API トークンからは見えない）。そこで、このサーバーから送った分を
+# 自前で数える。検証などサーバーの外からの消費は数えられない＝読み上げでも断る。
+SAKURA_QUOTA = int(os.environ.get("SAKURA_QUOTA", "3000"))
+USAGE_PATH = os.environ.get(
+    "LLM_USAGE_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_usage.json"))
+
+
+def _this_month() -> str:
+    return datetime.datetime.now(JST).strftime("%Y-%m")
+
+
+def _load_usage() -> dict:
+    try:
+        with open(USAGE_PATH) as f:
+            d = json.load(f)
+        if d.get("month") == _this_month() and isinstance(d.get("count"), int):
+            return d
+    except (OSError, ValueError):
+        pass
+    return {"month": _this_month(), "count": 0}
+
+
+def count_llm_request() -> None:
+    """さくらへの chat リクエストが 1 回成功するたびに app.py から呼ばれる。"""
+    d = _load_usage()
+    d["count"] += 1
+    try:
+        tmp = USAGE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, USAGE_PATH)
+    except OSError as e:
+        log.warning("llm usage not saved: %s", e)
+
+
+async def get_llm_quota(session, args, ctx=None) -> str:
+    d = _load_usage()
+    used = d["count"]
+    left = max(0, SAKURA_QUOTA - used)
+    return ("今月このサーバーから使った LLM リクエストは%d回で、無料枠%d回の残りは"
+            "およそ%d回です。サーバーの外で使った分（検証など）は数えられないので、"
+            "正確な値はコントロールパネルの利用量が正です。" % (used, SAKURA_QUOTA, left))
+
+
 SPECS = [{
     "type": "function",
     "function": {
@@ -518,10 +567,20 @@ SPECS = [{
             },
         },
     },
+}, {
+    "type": "function",
+    "function": {
+        "name": "get_llm_quota",
+        "description": "さくらのAI Engine の無料枠（月3000リクエスト）をどれだけ使ったか・"
+                       "残りが何回かを答える。「無料枠あとどれくらい？」「さくらの残りは？」"
+                       "「API あと何回使える？」など利用量の質問に使う。",
+        "parameters": {"type": "object", "properties": {}},
+    },
 }]
 
 HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy,
-            "get_stock_index": get_stock_index}
+            "get_stock_index": get_stock_index,
+            "get_llm_quota": get_llm_quota}
 
 
 def specs():

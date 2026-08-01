@@ -50,6 +50,7 @@ CASES = [
     ("日経平均いくら？", "get_stock_index", {"index": "nikkei"}),
     ("アメリカの株はどうなってる？", "get_stock_index", {}),
     ("今日の株価を教えて。", "get_stock_index", {}),
+    ("無料枠あとどれくらい残ってる？", "get_llm_quota", {}),
     ("ありがとう、またね。", None, {}),
 ]
 

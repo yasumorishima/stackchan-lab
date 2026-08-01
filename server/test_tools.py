@@ -178,6 +178,36 @@ async def main():
         server_tools._stock_cache.clear()
         server_tools.STOCK_HOSTS = real_hosts
 
+        # ---- さくら無料枠カウンタ ----
+        import json as _json
+        import tempfile as _tempfile
+        real_usage = server_tools.USAGE_PATH
+        with _tempfile.TemporaryDirectory() as td:
+            server_tools.USAGE_PATH = td + "/llm_usage.json"
+            server_tools.count_llm_request()
+            server_tools.count_llm_request()
+            text = await server_tools.call(s, "get_llm_quota", {})
+            print("%-28s %s" % ("2回数えて残りを聞く", text))
+            if "2回" not in text or "%d回" % (server_tools.SAKURA_QUOTA - 2) not in text:
+                ok = False
+            # 月が替わっていたら数え直す
+            with open(server_tools.USAGE_PATH, "w") as f:
+                _json.dump({"month": "1999-01", "count": 500}, f)
+            text = await server_tools.call(s, "get_llm_quota", {})
+            print("%-28s %s" % ("先月の数字は持ち越さない", text))
+            if "0回" not in text.split("無料枠")[0]:
+                ok = False
+            # 壊れたファイルでも落ちない
+            with open(server_tools.USAGE_PATH, "w") as f:
+                f.write("not json")
+            server_tools.count_llm_request()
+            text = await server_tools.call(s, "get_llm_quota", {})
+            print("%-28s %s" % ("壊れた記録から回復", text))
+            if "1回" not in text:
+                ok = False
+        server_tools.USAGE_PATH = real_usage
+
+
         # 読み上げ書式（通信なし）。.5 は使わない（round は偶数丸め）
         POINTS = [((64362.02, "円"), "64362円"), ((6300.35, "ポイント"), "6300ポイント"),
                   ((44901.92, "ドル"), "44902ドル")]
