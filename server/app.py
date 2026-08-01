@@ -821,6 +821,39 @@ def _drop_tool_json(text: str) -> str:
     return "".join(out)
 
 
+# 生成側は数字や英語の周りに空白を入れてくる（実測「3 000 回」「1 か月」
+# 「さくらの AI Engine の」）。合成器はそこで切って読むため
+# 「さん ゼロゼロゼロ かい」「いち かげつ」になる。読み上げる前に詰める。
+_SP = "[ 　 \t]"
+_JA = "ぁ-ゖァ-ヺー一-鿕々〆"
+NUM_SPACE_RE = re.compile(r"(?<=\d)" + _SP + r"+(?=\d)")
+# 詰めるのは数字・英字の「直後」だけ。日本語の直後の空白は箇条書きや
+# 見出しの区切りとして意味があり（「晴れです 32度です」）、消すと繋がる
+JA_SPACE_RE = re.compile("(?<=[0-9A-Za-z])" + _SP + "+(?=[" + _JA + "])")
+# 綴りのままでは 1 文字ずつ読まれて聞き取れない語だけ読みを指定する
+# （実測 Engine -> イーエヌジーアイエヌイー）
+READ_AS = [
+    ("AI Engine", "エーアイエンジン"),
+    ("Open JTalk", "オープンジェイトーク"),
+    ("Raspberry Pi", "ラズベリーパイ"),
+    ("Wi-Fi", "ワイファイ"),
+]
+
+
+def fix_reading(text: str) -> str:
+    """読みが崩れる書き方を直す。空白を詰め、綴りでは読めない語を仮名にする。"""
+    for word, kana in READ_AS:
+        body = r"\s+".join(re.escape(w) for w in word.split())
+        # 前後が日本語なら空白ごと置き換える。そこを残すと合成器が
+        # 間を空けて読む（ニュース見出しの区切りの空白は残したいので
+        # 日本語どうしの空白を一律に詰めることはしない）
+        pat = ("(?:(?<=[" + _JA + r"])\s+)?" + body
+               + r"(?:\s+(?=[" + _JA + "]))?")
+        text = re.sub(pat, kana, text, flags=re.IGNORECASE)
+    text = NUM_SPACE_RE.sub("", text)
+    return JA_SPACE_RE.sub("", text)
+
+
 def clean_reply(text) -> str:
     """ツール呼び出しの断片を読み上げさせない。
 
@@ -837,6 +870,7 @@ def clean_reply(text) -> str:
     text = _drop_tool_json(text)
     # 壊れた JSON の落ち穂（対応の取れない括弧）は読み上げても無意味
     text = re.sub(r"[{}\[\]]", "", text)
+    text = fix_reading(text)
     return re.sub(r"[ 	]+", " ", text).strip()
 
 
