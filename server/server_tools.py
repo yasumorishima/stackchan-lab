@@ -285,6 +285,99 @@ async def get_weather(session, args, ctx=None) -> str:
     return line + stale
 
 
+# ---- ドル円レート ----------------------------------------------------------
+# 主は Yahoo Finance の相場データ（キー不要・市場の実勢。週末は金曜終値で止まる）。
+# 予備1 は Coinbase の公開レート。暗号資産の板から導いた値なので、市場が閉じて
+# いる週末などに実勢から % 単位でずれることがある（2026-08-01 の三点照合では
+# 一致していたが、構造的にずれ得るので主にしない）。予備2 は open.er-api.com
+# （1日1回更新）。すべて無料・キー不要。
+RATE_URL_YAHOO = "https://query1.finance.yahoo.com/v8/finance/chart/USDJPY=X"
+RATE_URL_COINBASE = "https://api.coinbase.com/v2/exchange-rates"
+RATE_URL_DAILY = "https://open.er-api.com/v6/latest/USD"
+RATE_CACHE_TTL = float(os.environ.get("RATE_CACHE_TTL", "300"))
+RATE_STALE_MAX = float(os.environ.get("RATE_STALE_MAX", "21600"))
+
+_rate_cache = []   # [(取得時刻 monotonic, レート, 取得元)] を 1 件だけ
+
+
+def _sane_rate(v):
+    """レートとして信じられる値か。取得先の障害で 0 や桁違いが来ても読まない。"""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return v if 50.0 <= v <= 500.0 else None
+
+
+async def _rate_yahoo(session):
+    # UA 無しだと 429 を返すことがある
+    async with session.get(RATE_URL_YAHOO, params={"interval": "1d", "range": "1d"},
+                           headers={"User-Agent": "Mozilla/5.0"},
+                           timeout=aiohttp.ClientTimeout(total=6)) as r:
+        body = await r.json()
+    meta = (((body.get("chart") or {}).get("result") or [{}])[0] or {}).get("meta") or {}
+    return _sane_rate(meta.get("regularMarketPrice")), "リアルタイム"
+
+
+async def _rate_coinbase(session):
+    async with session.get(RATE_URL_COINBASE, params={"currency": "USD"},
+                           timeout=aiohttp.ClientTimeout(total=6)) as r:
+        body = await r.json()
+    return _sane_rate(((body.get("data") or {}).get("rates") or {}).get("JPY")), "リアルタイム"
+
+
+async def _rate_daily(session):
+    async with session.get(RATE_URL_DAILY,
+                           timeout=aiohttp.ClientTimeout(total=10)) as r:
+        body = await r.json()
+    return _sane_rate((body.get("rates") or {}).get("JPY")), "1日1回更新の参考値"
+
+
+async def _fetch_usdjpy(session):
+    """USD/JPY を主→予備の順で取る。返り値は (レート, 取得元の説明)。"""
+    last = ""
+    for name, fetch in (("yahoo", _rate_yahoo), ("coinbase", _rate_coinbase),
+                        ("daily", _rate_daily)):
+        try:
+            rate, src = await fetch(session)
+            if rate is not None:
+                return rate, src
+            last = "%s gave unusable value" % name
+        except Exception as e:
+            last = "%s: %s: %s" % (name, type(e).__name__, e)
+        log.warning("usdjpy %s", last)
+    raise RuntimeError(last or "usdjpy unreachable")
+
+
+def _yen_sen(rate: float) -> str:
+    """147.238 -> 「147円24銭」。小数で返すと読み上げが不自然になる。"""
+    yen = int(rate)
+    sen = int(round((rate - yen) * 100))
+    if sen >= 100:
+        yen, sen = yen + 1, sen - 100
+    return "%d円%d銭" % (yen, sen) if sen else "%d円ちょうど" % yen
+
+
+async def get_usdjpy(session, args, ctx=None) -> str:
+    now = time.monotonic()
+    if _rate_cache and now - _rate_cache[0][0] < RATE_CACHE_TTL:
+        ts, rate, src = _rate_cache[0]
+    else:
+        try:
+            rate, src = await _fetch_usdjpy(session)
+            ts = now
+            _rate_cache[:] = [(ts, rate, src)]
+        except Exception as e:
+            log.warning("usdjpy unavailable: %s: %s", type(e).__name__, e)
+            if _rate_cache and now - _rate_cache[0][0] < RATE_STALE_MAX:
+                ts, rate, src = _rate_cache[0]
+            else:
+                return "error: いまドル円レートを調べられませんでした（取得先が応答しません）"
+    age = now - ts
+    stale = " ※%d分前の情報" % int(age / 60) if age > 900 else ""
+    return "ドル円レート: 1ドル %s（%s）%s" % (_yen_sen(rate), src, stale)
+
+
 SPECS = [{
     "type": "function",
     "function": {
@@ -302,9 +395,17 @@ SPECS = [{
             },
         },
     },
+}, {
+    "type": "function",
+    "function": {
+        "name": "get_usdjpy",
+        "description": "いまのドル円（USD/JPY）の為替レートを調べる。"
+                       "「ドル円いくら？」「円安どうなってる？」など為替の質問に使う。",
+        "parameters": {"type": "object", "properties": {}},
+    },
 }]
 
-HANDLERS = {"get_weather": get_weather}
+HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy}
 
 
 def specs():

@@ -90,6 +90,65 @@ async def main():
 
         server_tools.FORECAST_URL = real
 
+        # ---- ドル円 ----
+        # 実際に取りに行く（主か予備のどちらかが生きていれば通る）
+        text = await server_tools.call(s, "get_usdjpy", {})
+        print("%-28s %s" % ("ドル円を実取得", text))
+        if text.startswith("error:") or "円" not in text:
+            ok = False
+
+        # 取得先が全部死んでいる: 新しいキャッシュがあればそのまま読む
+        real_urls = (server_tools.RATE_URL_YAHOO, server_tools.RATE_URL_COINBASE,
+                     server_tools.RATE_URL_DAILY)
+        server_tools.RATE_URL_YAHOO = "http://127.0.0.1:9/chart"
+        server_tools.RATE_URL_COINBASE = "http://127.0.0.1:9/rates"
+        server_tools.RATE_URL_DAILY = "http://127.0.0.1:9/latest"
+        text = await server_tools.call(s, "get_usdjpy", {})
+        print("%-28s %s" % ("死んでいるが直前の値あり", text))
+        if text.startswith("error:"):
+            ok = False
+
+        # 古い（15分超）キャッシュへ退避したら古さを言う
+        server_tools._rate_cache[:] = [(
+            server_tools.time.monotonic() - 1800,
+            server_tools._rate_cache[0][1], server_tools._rate_cache[0][2])]
+        text = await server_tools.call(s, "get_usdjpy", {})
+        print("%-28s %s" % ("死んでいるが古い値あり", text))
+        if "分前の情報" not in text:
+            ok = False
+
+        # 古すぎる値は使わない
+        server_tools._rate_cache[:] = [(
+            server_tools.time.monotonic() - server_tools.RATE_STALE_MAX - 60,
+            150.0, "リアルタイム")]
+        text = await server_tools.call(s, "get_usdjpy", {})
+        print("%-28s %s" % ("古すぎる値は使わない", text))
+        if "調べられませんでした" not in text:
+            ok = False
+
+        server_tools._rate_cache.clear()
+        (server_tools.RATE_URL_YAHOO, server_tools.RATE_URL_COINBASE,
+         server_tools.RATE_URL_DAILY) = real_urls
+
+    # 値の門番と読み上げ書式（通信なし）
+    SANE = [(147.25, 147.25), (0, None), ("abc", None), (None, None),
+            (1e9, None), (49.9, None), (50.0, 50.0)]
+    for v, want in SANE:
+        got = server_tools._sane_rate(v)
+        mark = "OK" if got == want else "NG"
+        if got != want:
+            ok = False
+        print("%-4s _sane_rate(%r) -> %s (期待 %s)" % (mark, v, got, want))
+
+    YENSEN = [(147.0, "147円ちょうど"), (147.238, "147円24銭"),
+              (146.999, "147円ちょうど"), (147.05, "147円5銭")]
+    for v, want in YENSEN:
+        got = server_tools._yen_sen(v)
+        mark = "OK" if got == want else "NG"
+        if got != want:
+            ok = False
+        print("%-4s _yen_sen(%s) -> %s (期待 %s)" % (mark, v, got, want))
+
     # ---- モデルが when を落とした時の補い方（通信なし） ----
     import app  # noqa: E402  ここでしか使わない
 

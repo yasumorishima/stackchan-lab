@@ -12,7 +12,7 @@ NVS の `wifi/ota_url` を書き換えるだけで接続先が変わります（
 | `opus_codec.py` | libopus の ctypes 束縛（上り 16kHz / 下り 24kHz / 60ms） |
 | `local_stt.py` | ローカル音声認識（sherpa-onnx / Vosk / faster-whisper） |
 | `mcp_client.py` | 本体の MCP サーバーに対するクライアント（initialize / tools/list / tools/call） |
-| `server_tools.py` | サーバー側のツール（天気）。本体のツールと 1 つにまとめて LLM へ渡す |
+| `server_tools.py` | サーバー側のツール（天気・ドル円）。本体のツールと 1 つにまとめて LLM へ渡す |
 | `places.py` | 地名 → 座標の表（`gen_places.py` が Open-Meteo geocoding から生成） |
 | `gen_places.py` | `places.py` の生成器（座標を手書きしないための道具） |
 | `test_client.py` | 本体を模した試験クライアント（MCP デバイス役も兼ねる） |
@@ -34,9 +34,10 @@ LLM には本体のツールとサーバー側のツールを 1 つの配列に�
 呼ばれた名前で振り分けます（`app.py` の `call_tool`）。
 
 - 本体側（MCP 経由）: 機体の操作。ファーム 1.4.4 では `self.audio_speaker.set_volume`
-- サーバー側: `get_weather`（場所・今 / 今日 / 明日 / 明後日）
+- サーバー側: `get_weather`（場所・今 / 今日 / 明日 / 明後日）/ `get_usdjpy`（ドル円レート）
 
 天気の取得先は Open-Meteo です（API キー不要）。地名は同梱の表で引きます。
+ドル円は Yahoo Finance → Coinbase → open.er-api.com の順で引きます（すべてキー不要・無料）。
 Open-Meteo の geocoding は日本語名を引けない（「札幌」は 0 件、"Sapporo" なら当たる）ため、
 ローマ字で引いて返ってきた日本語名と座標を `gen_places.py` で表に落としてあります。
 

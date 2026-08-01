@@ -45,6 +45,8 @@ CASES = [
     ("鳥取の天気を教えて。", "get_weather", {"place": "鳥取"}),
     ("音量を五十にして。", "self_audio_speaker_set_volume", {"volume": 50}),
     ("ボリュームを下げて、二十くらいに。", "self_audio_speaker_set_volume", {"volume": 20}),
+    ("いまドル円いくら？", "get_usdjpy", {}),
+    ("円安どうなってるか教えて。", "get_usdjpy", {}),
     ("ありがとう、またね。", None, {}),
 ]
 
