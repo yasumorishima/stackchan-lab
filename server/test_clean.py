@@ -81,7 +81,48 @@ for text, want, memo in SHORTEN:
         print("   期待: %r" % want[:80])
         print("   実際: %r" % got[:80])
 
-total = len(CLEAN) + len(SHORTEN)
+print("== split_long_runs ==")
+SPLIT = [
+    # 短文はそのまま 1 片
+    ("今のドル円は1ドル＝157円40銭です。",
+     ["今のドル円は1ドル＝157円40銭です。"], "短文は分けない"),
+    # 実機で 23.6 秒スローモーションになった応答。「教えてもらえる」の語中の
+    # 「も」では切らず、「必要か」の後（直後が漢字）で切る
+    ("またはドルや他の通貨への換算が必要か教えてもらえるとお手伝いしやすいです",
+     ["またはドルや他の通貨への換算が必要か", "教えてもらえるとお手伝いしやすいです"],
+     "語境界で切る（語中の「も」は避ける）"),
+    # 平仮名だけの長い連続は二文字助詞「ので」の後で切る
+    ("きょうはとてもよいてんきなのでこうえんまでゆっくりさんぽをしてきました",
+     ["きょうはとてもよいてんきなので", "こうえんまでゆっくりさんぽをしてきました"],
+     "平仮名連続は「ので」の後"),
+]
+n_split = 0
+for text, want, memo in SPLIT:
+    n_split += 1
+    got = app.split_long_runs(text)
+    mark = "OK" if got == want else "NG"
+    ng += got != want
+    print("%s %s: %s" % (mark, memo, " | ".join(got)))
+    if got != want:
+        print("   期待: %s" % " | ".join(want))
+# 不変条件: 連結すると元に戻る／どの片の呼気段落も上限以下
+INVARIANT = [t for t, _w, _m in SPLIT] + [
+    "970円のことですね！何に関する金額か、またはドルや他の通貨への換算が必要か教えてもらえるとお手伝いしやすいです♪",
+    "",
+    "こんにちは！",
+]
+import re as _re
+for text in INVARIANT:
+    n_split += 1
+    segs = app.split_long_runs(text)
+    joined = "".join(segs)
+    runs_ok = all(len(r) <= app.OJT_MAX_RUN
+                  for s in segs for r in _re.split("[" + app.OJT_PAUSES + "]", s))
+    good = joined == text and runs_ok and all(segs)
+    ng += not good
+    print("%s 不変条件: %r" % ("OK" if good else "NG", text[:24]))
+
+total = len(CLEAN) + len(SHORTEN) + n_split
 print("")
 print("%d/%d 正解" % (total - ng, total))
 sys.exit(1 if ng else 0)

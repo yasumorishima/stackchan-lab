@@ -427,6 +427,58 @@ async def voicevox_tts(session: aiohttp.ClientSession, text: str, base: str, hea
     return resample_linear(pcm, rate, DOWN_RATE)
 
 
+# Open JTalk は読点・句点の無い長い連続（呼気段落）が約 30 字を超えると、
+# 時間長モデルが壊れて音素が引き伸ばされ「スローモーション」になる
+# （2026-08-01 実測: 28字 0.19s/字 -> 30字 0.35 -> 36字 0.52。無音でなく有音が
+# 伸びる。実機で user が体感した「たまに遅い」の正体）。読点を機械的に足しても
+# 位置が語境界でないと直らない（「教えても、らえると」で実測 17.6s のまま）ので、
+# テキストごと分けて別々に合成する。分ければ切り方が多少悪くても各片は正常な速さ。
+OJT_MAX_RUN = int(os.environ.get("OJT_MAX_RUN", "24"))
+OJT_PAUSES = "、。！？!?"
+OJT_PARTICLES_2 = ("ので", "から", "けど")
+OJT_PARTICLES_1 = "はがをにでともへかや"
+
+
+def _is_hira(ch: str) -> bool:
+    return "ぁ" <= ch <= "ん"
+
+
+def split_long_runs(text: str):
+    """呼気段落が OJT_MAX_RUN を超えないよう、語境界らしい所でテキストを分ける。
+
+    一文字助詞は直後が平仮名だと語中の可能性が高い（「教えてもらえる」の「も」）
+    ので、直後が漢字・カタカナ等のときだけ切る。
+    """
+    sep = chr(0)
+    out = []
+    for run in re.split("([" + OJT_PAUSES + "])", text):
+        if len(run) <= OJT_MAX_RUN or run in OJT_PAUSES:
+            out.append(run)
+            continue
+        s = run
+        while len(s) > OJT_MAX_RUN:
+            window = s[:OJT_MAX_RUN]
+            cut = -1
+            for p in OJT_PARTICLES_2:
+                i = window.rfind(p)
+                if i > 3:
+                    cut = max(cut, i + len(p))
+            for p in OJT_PARTICLES_1:
+                i = window.rfind(p)
+                while i > 3:
+                    nxt = s[i + 1:i + 2]
+                    if nxt and not _is_hira(nxt):
+                        cut = max(cut, i + 1)
+                        break
+                    i = window.rfind(p, 0, i)
+            if cut < 0:
+                cut = OJT_MAX_RUN
+            out.append(s[:cut] + sep)
+            s = s[cut:]
+        out.append(s)
+    return [seg for seg in "".join(out).split(sep) if seg]
+
+
 # Open JTalk（軽量 TTS）。VOICEVOX より桁で速い（RPi5 実測 0.27 秒 / 文、RTF≈0.06）。
 # user 判断（2026-07-31）で速さ優先の既定に採用。声は nitech の男声。
 OPENJTALK_BIN = os.environ.get("OPENJTALK_BIN", "open_jtalk")
@@ -438,6 +490,18 @@ OPENJTALK_VOICE = os.environ.get(
 
 
 async def openjtalk_tts(text: str) -> bytes:
+    """長い呼気段落を分けて合成し、間に短い無音を挟んで繋ぐ（スローモーション対策）。"""
+    segs = split_long_runs(text)
+    if len(segs) <= 1:
+        return await _openjtalk_once(text)
+    parts = []
+    for seg in segs:
+        parts.append(await _openjtalk_once(seg))
+    gap = bytes(2 * int(DOWN_RATE * 0.12))
+    return gap.join(parts)
+
+
+async def _openjtalk_once(text: str) -> bytes:
     """Open JTalk で合成する。stdin からテキストを読み -ow のファイルへ書く。
 
     パイプ受け（-ow /dev/stdout）は環境依存なので一時ファイルで受ける。
