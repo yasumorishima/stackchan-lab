@@ -6,9 +6,10 @@ ollama も本体も要らない（RPi5 に負荷をかけないため実推論�
   ./.venv/bin/python test_fallback.py
 """
 import asyncio
+import os
 import sys
 
-sys.path.insert(0, "/home/yasu/stackchan-server")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import aiohttp
 from aiohttp import web

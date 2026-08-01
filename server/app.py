@@ -7,6 +7,7 @@
 本体側のファームウェアは公式バイナリのまま。NVS の wifi/ota_url をこのサーバーに
 向けるだけで接続先が変わる（アバター・MCP ツール・アプリ連携は維持される）。
 """
+import array
 import asyncio
 import io
 import json
@@ -435,13 +436,48 @@ async def voicevox_tts(session: aiohttp.ClientSession, text: str, base: str, hea
 # 位置が語境界でないと直らない（「教えても、らえると」で実測 17.6s のまま）ので、
 # テキストごと分けて別々に合成する。分ければ切り方が多少悪くても各片は正常な速さ。
 OJT_MAX_RUN = int(os.environ.get("OJT_MAX_RUN", "24"))
+# Open JTalk は合成のたびに前 0.41 秒・後 0.58 秒ほどの無音を必ず付ける。
+# 文ごとに合成するので短い返事ほど無音の比率が上がり（実測で 27〜56%）、
+# 特に最後の文が間延びして聞こえる。切り詰めてから短い間だけ足し直す。
+# パディングは真の無音ではなく微小ノイズを含む（振幅 20〜50）ので、
+# しきい値は 50 より上に置く。弱い子音（「ふ」の頭・「した」の尻）は
+# 振幅 50〜100 で出るため、これより下げると語を削る。
+OJT_TRIM_LEVEL = int(os.environ.get("OJT_TRIM_LEVEL", "60"))
+OJT_KEEP_HEAD = float(os.environ.get("OJT_KEEP_HEAD", "0.02"))
+OJT_KEEP_TAIL = float(os.environ.get("OJT_KEEP_TAIL", "0.08"))
+OJT_END_PAUSE = float(os.environ.get("OJT_END_PAUSE", "0.12"))
+# 読みが遅くないかを毎回ログに出す（診断用。既定は出さない）。
+OJT_LOG_PACE = os.environ.get("OJT_LOG_PACE", "") not in ("", "0")
+OJT_SMALL_KANA = "ぁぃぅぇぉゃゅょゎヵヶァィゥェォャュョヮっッ"
 OJT_PAUSES = "、。！？!?"
 OJT_PARTICLES_2 = ("ので", "から", "けど")
 OJT_PARTICLES_1 = "はがをにでともへかや"
 
 
+def _avoid_mid_token(s: str, cut: int) -> int:
+    """語境界が見つからず字数で切る時、数字や英字の途中で切らないよう戻す。
+
+    「29」を「2」「9」に割ると読みそのものが壊れる（実際に踏んだ）。
+    """
+    def same_token(a, b):
+        if not a or not b:
+            return False
+        return ((a.isdigit() or a == ".") and (b.isdigit() or b == ".")) or                (a.isalpha() and a.isascii() and b.isalpha() and b.isascii())
+
+    i = cut
+    while i > 1 and same_token(s[i - 1:i], s[i:i + 1]):
+        i -= 1
+    # i まで戻って境界が語の途中でなくなったならそこが正解。
+    # 全部が数字などで最後まで途中のままなら None（＝切らない）。
+    # 「29」を「2」「9」に割ると読みそのものが壊れるので、
+    # 間延びより読みの正しさを優先する。
+    return i if not same_token(s[i - 1:i], s[i:i + 1]) else None
+
+
+
 def _is_hira(ch: str) -> bool:
     return "ぁ" <= ch <= "ん"
+
 
 
 def split_long_runs(text: str):
@@ -453,7 +489,7 @@ def split_long_runs(text: str):
     sep = chr(0)
     out = []
     for run in re.split("([" + OJT_PAUSES + "])", text):
-        if len(run) <= OJT_MAX_RUN or run in OJT_PAUSES:
+        if run in OJT_PAUSES or len(run) <= OJT_MAX_RUN:
             out.append(run)
             continue
         s = run
@@ -473,7 +509,9 @@ def split_long_runs(text: str):
                         break
                     i = window.rfind(p, 0, i)
             if cut < 0:
-                cut = OJT_MAX_RUN
+                cut = _avoid_mid_token(s, OJT_MAX_RUN)
+            if cut is None:
+                break       # 切り所が無い。読みを壊すより長いまま出す
             out.append(s[:cut] + sep)
             s = s[cut:]
         out.append(s)
@@ -491,28 +529,49 @@ OPENJTALK_VOICE = os.environ.get(
 
 
 async def openjtalk_tts(text: str) -> bytes:
-    """長い呼気段落を分けて合成し、間に短い無音を挟んで繋ぐ（スローモーション対策）。"""
+    """長い呼気段落を分けて合成し、間に短い無音を挟んで繋ぐ（スローモーション対策）。
+
+    あわせて、合成器が毎回付ける前後の無音（前 0.41 秒・後 0.58 秒ほど）を
+    落とす。文ごとに合成するので、短い返事ほど無音の比率が上がり
+    （実測で全体の 27〜56%）、特に最後の文が間延びして聞こえるため。
+    """
     segs = split_long_runs(text)
-    if len(segs) <= 1:
-        return await _openjtalk_once(text)
-    parts = []
-    for seg in segs:
-        parts.append(await _openjtalk_once(seg))
+    parts = [await _openjtalk_once(seg) for seg in segs]
     gap = bytes(2 * int(DOWN_RATE * 0.12))
-    return gap.join(parts)
+    joined = gap.join(_trim_silence(p) for p in parts)
+    return joined + bytes(2 * int(DOWN_RATE * OJT_END_PAUSE))
 
 
-async def _openjtalk_once(text: str) -> bytes:
+def _trim_silence(pcm: bytes) -> bytes:
+    """前後の無音を落とす。合成器が足す固定の間を消すのが狙い。"""
+    if len(pcm) % 2:
+        return pcm          # 16bit として読めない列は触らない
+    a = array.array("h")
+    a.frombytes(pcm)
+    lvl = OJT_TRIM_LEVEL
+    head = next((i for i, v in enumerate(a) if abs(v) > lvl), None)
+    if head is None:
+        return pcm          # 全部無音なら触らない
+    tail = len(a) - next(i for i, v in enumerate(reversed(a)) if abs(v) > lvl)
+    head = max(0, head - int(DOWN_RATE * OJT_KEEP_HEAD))
+    tail = min(len(a), tail + int(DOWN_RATE * OJT_KEEP_TAIL))
+    return a[head:tail].tobytes()
+
+
+async def _openjtalk_once(text: str, want_rate: bool = None):
     """Open JTalk で合成する。stdin からテキストを読み -ow のファイルへ書く。
 
     パイプ受け（-ow /dev/stdout）は環境依存なので一時ファイルで受ける。
     """
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         out = f.name
+    trace = out + ".trace"
+    want_rate = OJT_LOG_PACE if want_rate is None else want_rate
+    extra = ["-ot", trace] if want_rate else []
     try:
         proc = await asyncio.create_subprocess_exec(
             OPENJTALK_BIN, "-x", OPENJTALK_DIC, "-m", OPENJTALK_VOICE,
-            "-ow", out,
+            "-ow", out, *extra,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE)
@@ -523,15 +582,44 @@ async def _openjtalk_once(text: str) -> bytes:
                                % (proc.returncode,
                                   err.decode("utf-8", "replace")[:200]))
         wav = open(out, "rb").read()
+        pace = _trace_pace(trace) if want_rate else None
     finally:
-        try:
-            os.unlink(out)
-        except OSError:
-            pass
+        for path in (out, trace):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
     pcm, rate, ch, width = wav_to_pcm(wav)
     if ch != 1 or width != 2:
         raise RuntimeError("unexpected wav: ch=%d width=%d" % (ch, width))
-    return resample_linear(pcm, rate, DOWN_RATE)
+    down = resample_linear(pcm, rate, DOWN_RATE)
+    if want_rate and pace is not None:
+        log.info("読み %.3f 秒/モーラ: %s", pace, text[:24])
+    return down
+
+
+_VOWELS = set("aiueoAIUEON")
+
+
+def _trace_pace(path: str):
+    """音素の時刻から「1 モーラあたり何秒か」を出す。読めなければ None。"""
+    try:
+        raw = open(path, encoding="utf-8", errors="replace").read()
+        body = raw.split("[Output label]")[1].split("[Global parameter]")[0]
+    except (OSError, IndexError):
+        return None
+    total, mora = 0.0, 0
+    for line in body.strip().splitlines():
+        m = re.match(r"^(\d+) (\d+) \S+?\-([^\+]+)\+", line)
+        if not m:
+            continue
+        phone = m.group(3)
+        if phone in ("sil", "pau"):
+            continue
+        total += (int(m.group(2)) - int(m.group(1))) / 1e7
+        if phone in _VOWELS:
+            mora += 1
+    return (total / mora) if mora >= 4 else None
 
 
 async def synthesize(session, text: str) -> bytes:

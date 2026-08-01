@@ -2,9 +2,10 @@
 
   ./.venv/bin/python test_clean.py
 """
+import os
 import sys
 
-sys.path.insert(0, "/home/yasu/stackchan-server")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import app
 
 CLEAN = [
@@ -121,6 +122,54 @@ for text in INVARIANT:
     good = joined == text and runs_ok and all(segs)
     ng += not good
     print("%s 不変条件: %r" % ("OK" if good else "NG", text[:24]))
+
+# 合成の前後に付く固定の無音を落とす処理（末尾の間延び対策）
+import array as _arr
+_rate = app.DOWN_RATE
+_noise = [30, -30] * int(_rate * 0.2)          # パディングは真の無音でなく微小ノイズ
+_TRIM = [
+    (_arr.array("h", _noise + [4000, -4000] * int(_rate * 0.25)
+                + [30, -30] * int(_rate * 0.3)).tobytes(),
+     0.5 + app.OJT_KEEP_HEAD + app.OJT_KEEP_TAIL, "前後の無音を落とす"),
+    (_arr.array("h", _noise + [80, -80] * int(_rate * 0.1)
+                + [30, -30] * int(_rate * 0.3)).tobytes(),
+     0.2 + app.OJT_KEEP_HEAD + app.OJT_KEEP_TAIL, "弱い音（振幅80）は削らない"),
+]
+for _pcm, _want, _memo in _TRIM:
+    n_split += 1
+    _got = len(app._trim_silence(_pcm)) / 2.0 / _rate
+    _good = abs(_got - _want) < 0.02
+    ng += not _good
+    print("%s %s: %.3fs (期待 %.3fs)"
+          % ("OK" if _good else "NG", _memo, _got, _want))
+
+n_split += 1
+_quiet = _arr.array("h", [5, -5] * int(_rate * 0.2)).tobytes()
+_good = app._trim_silence(_quiet) == _quiet
+ng += not _good
+print("%s 全部無音なら触らない（0 バイトにしない）" % ("OK" if _good else "NG"))
+
+n_split += 1
+_odd = _arr.array("h", [0] * 10).tobytes() + b""
+_good = app._trim_silence(_odd) == _odd
+ng += not _good
+print("%s 16bit として読めない列は触らない（例外にしない）" % ("OK" if _good else "NG"))
+
+# 数字の途中で切らない（「29」を「2」「9」に割ると読みが壊れる）
+_DIGIT = [
+    ("は" + "0123456789" * 3 + "です", "先頭近くから始まる数字"),
+    ("0123456789" * 4, "全部が数字（切り所が無い）"),
+]
+for _t, _memo in _DIGIT:
+    n_split += 1
+    _segs = app.split_long_runs(_t)
+    _joined = "".join(_segs)
+    _mid = any(_s[-1].isdigit() and _n[0].isdigit()
+               for _s, _n in zip(_segs, _segs[1:]))
+    _good = _joined == _t and not _mid   # どちらの場合も数字は割らない
+    ng += not _good
+    print("%s %s: %s" % ("OK" if _good else "NG", _memo,
+                         " | ".join(s[:14] for s in _segs)))
 
 total = len(CLEAN) + len(SHORTEN) + n_split
 print("")

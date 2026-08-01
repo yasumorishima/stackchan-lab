@@ -12,7 +12,7 @@ import time
 
 import aiohttp
 
-sys.path.insert(0, "/home/yasu/stackchan-server")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import server_tools  # noqa: E402
 
 BASE = os.environ.get("SAKURA_BASE", "http://127.0.0.1:11434")
