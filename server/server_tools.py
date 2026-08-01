@@ -12,6 +12,7 @@ import asyncio
 import datetime
 import json
 import logging
+import math
 import os
 import time
 import urllib.parse
@@ -804,6 +805,633 @@ async def get_warning(session, args, ctx=None) -> str:
     return "%sに%sが出ています" % (WARNING_AREA_NAME, "、".join(names)) + stale
 
 
+# ---- 台風情報（気象庁） ------------------------------------------------------
+# targetTc.json に発生中の台風一覧、各 TC の specifications.json に詳細。
+# part が "title" の要素に番号と名前、part.jp が「実況」の要素に現況が入る。
+# typhoonNumber が空の要素は台風未満（熱帯低気圧）なので飛ばす。
+TYPHOON_LIST_URL = os.environ.get(
+    "TYPHOON_LIST_URL",
+    "https://www.jma.go.jp/bosai/typhoon/data/targetTc.json")
+TYPHOON_SPEC_URL = os.environ.get(
+    "TYPHOON_SPEC_URL",
+    "https://www.jma.go.jp/bosai/typhoon/data/%s/specifications.json")
+TYPHOON_CACHE_TTL = float(os.environ.get("TYPHOON_CACHE_TTL", "600"))
+TYPHOON_STALE_MAX = float(os.environ.get("TYPHOON_STALE_MAX", "21600"))
+TYPHOON_MAX = int(os.environ.get("TYPHOON_MAX", "2"))
+
+_typhoon_cache = []   # [(取得時刻 monotonic, line)] を 1 件だけ
+
+
+def _typhoon_one(spec) -> str:
+    title = next((x for x in spec if x.get("part") == "title"), {})
+    ana = next((x for x in spec
+                if isinstance(x.get("part"), dict)
+                and x["part"].get("jp") == "実況"), {})
+    num = str(title.get("typhoonNumber") or "")
+    name = (title.get("name") or {}).get("jp") or ""
+    n = int(num[-2:]) if num[-2:].isdigit() else 0
+    head = "台風%d号%s" % (n, name) if n else "台風%s" % name
+    bits = [head + "が発生しています。"]
+    loc = str(ana.get("location") or "")
+    if loc:
+        s = "現在%sにあって" % loc
+        inten = str(ana.get("intensity") or "")
+        if inten and inten != "-":
+            s += "、%s勢力です" % inten
+        else:
+            s += "います"
+        bits.append(s + "。")
+    course = str(ana.get("course") or "")
+    speed = str((ana.get("speed") or {}).get("km/h") or "")
+    if course and speed.isdigit():
+        bits.append("%sへ時速%dキロで進んでいます。" % (course, int(speed)))
+    elif course:
+        bits.append("%sへゆっくり進んでいます。" % course)
+    pres = str(ana.get("pressure") or "")
+    if pres.isdigit():
+        bits.append("中心気圧は%dヘクトパスカルです。" % int(pres))
+    return "".join(bits)
+
+
+async def _typhoon_fetch(session):
+    tmo = aiohttp.ClientTimeout(total=10)
+    async with session.get(TYPHOON_LIST_URL, timeout=tmo) as r:
+        tcs = json.loads(await r.read())
+    tcs = [t for t in tcs
+           if t.get("tropicalCyclone") and str(t.get("typhoonNumber") or "")]
+    if not tcs:
+        return "いま発生している台風はありません。"
+    lines = []
+    for tc in tcs[:TYPHOON_MAX]:
+        async with session.get(TYPHOON_SPEC_URL % tc["tropicalCyclone"],
+                               timeout=tmo) as r:
+            spec = json.loads(await r.read())
+        lines.append(_typhoon_one(spec))
+    if len(tcs) > TYPHOON_MAX:
+        lines.append("ほかにも台風が%d個あります。" % (len(tcs) - TYPHOON_MAX))
+    return "".join(lines)
+
+
+async def get_typhoon(session, args, ctx=None) -> str:
+    now = time.monotonic()
+    if _typhoon_cache and now - _typhoon_cache[0][0] < TYPHOON_CACHE_TTL:
+        ts, line = _typhoon_cache[0]
+    else:
+        try:
+            line = await _typhoon_fetch(session)
+            ts = now
+            _typhoon_cache[:] = [(ts, line)]
+        except Exception as e:
+            log.warning("typhoon unavailable: %s: %s", type(e).__name__, e)
+            if _typhoon_cache and now - _typhoon_cache[0][0] < TYPHOON_STALE_MAX:
+                ts, line = _typhoon_cache[0]
+            else:
+                return "error: いま台風情報を取れませんでした（取得先が応答しません）"
+    age = now - ts
+    stale = " ※%d分前の情報" % int(age / 60) if age > 900 else ""
+    return line + stale
+
+
+# ---- 熱中症（環境省 暑さ指数 WBGT） ------------------------------------------
+# 予測値 CSV: 1 行目が YYYYMMDDHH のヘッダ、2 行目が地点の値（WBGT×10）。
+# 警戒アラート CSV: 都道府県ごとの行に当日/翌日のフラグ（0=無し, 1=警戒,
+# 2/3=特別警戒, 9=発表時間外）。地点番号は既定で横浜（46106）。
+HEAT_FCST_URL = os.environ.get(
+    "HEAT_FCST_URL", "https://www.wbgt.env.go.jp/prev15WG/dl/yohou_%s.csv")
+HEAT_ALERT_URL = os.environ.get(
+    "HEAT_ALERT_URL", "https://www.wbgt.env.go.jp/alert/dl/%s/alert_%s_%s.csv")
+HEAT_POINT = os.environ.get("HEAT_POINT", "46106")
+HEAT_PREF = os.environ.get("HEAT_PREF", "神奈川県")
+# 環境省の予測値提供は夏期だけ（令和8年度は 4月22日〜10月21日）。
+# 期間外は取得先が落ちているのではないので、言い方を分ける。
+HEAT_SEASON_FROM = os.environ.get("HEAT_SEASON_FROM", "04-22")
+HEAT_SEASON_TO = os.environ.get("HEAT_SEASON_TO", "10-21")
+HEAT_CACHE_TTL = float(os.environ.get("HEAT_CACHE_TTL", "1800"))
+HEAT_STALE_MAX = float(os.environ.get("HEAT_STALE_MAX", "21600"))
+
+_heat_cache = []   # [(取得時刻 monotonic, line)] を 1 件だけ
+_ALERT_FLAG = {"1": "熱中症警戒アラート", "2": "熱中症特別警戒アラート",
+               "3": "熱中症特別警戒アラート"}
+
+
+def _wbgt_level(w: float) -> str:
+    if w >= 31:
+        return "危険"
+    if w >= 28:
+        return "厳重警戒"
+    if w >= 25:
+        return "警戒"
+    if w >= 21:
+        return "注意"
+    return "ほぼ安全"
+
+
+def _wbgt_advice(level: str) -> str:
+    return {
+        "危険": "外に出るのは避けて、涼しいところにいてください。",
+        "厳重警戒": "外での運動は控えて、こまめに水分をとってください。",
+        "警戒": "運動するときは休憩をこまめに入れてください。",
+        "注意": "激しい運動のときは水分補給を忘れずに。",
+    }.get(level, "")
+
+
+def _heat_pick_now(rows, now):
+    """予測 CSV から今の時刻に一番近い（過去寄りの）値を返す。"""
+    stamp = now.strftime("%Y%m%d%H")
+    best = None
+    for key, val in rows:
+        if key <= stamp or best is None:
+            best = (key, val)
+        if key > stamp:
+            break
+    return best
+
+
+def _heat_parse_fcst(text, now):
+    lines = [x for x in text.splitlines() if x.strip()]
+    if len(lines) < 2:
+        raise RuntimeError("wbgt csv too short")
+    head = [x.strip() for x in lines[0].split(",")]
+    vals = [x.strip() for x in lines[1].split(",")]
+    rows = [(head[i], vals[i]) for i in range(2, min(len(head), len(vals)))
+            if head[i].isdigit() and vals[i].lstrip("-").isdigit()]
+    if not rows:
+        raise RuntimeError("wbgt csv has no values")
+    now_row = _heat_pick_now(rows, now)
+    today = now.strftime("%Y%m%d")
+    todays = [int(v) for k, v in rows if k.startswith(today)]
+    peak = max(todays) / 10.0 if todays else int(now_row[1]) / 10.0
+    return int(now_row[1]) / 10.0, peak
+
+
+def _heat_parse_alert(text, pref):
+    for line in text.splitlines():
+        cells = [x.strip() for x in line.split(",")]
+        if cells and cells[0] == pref and len(cells) > 8:
+            return cells[6], cells[7]
+    return None, None
+
+
+def _heat_alert_versions(now):
+    """見るべき（日付, 版）の候補。17時版は翌日の発表を含み、5時版は当日分。
+    未明は当日の5時版がまだ無いので前日の17時版に落ちる。"""
+    d = now.date()
+    prev = d - datetime.timedelta(days=1)
+    if now.hour >= 17:
+        return [(d, "17"), (d, "05")]
+    if now.hour >= 5:
+        return [(d, "05"), (prev, "17")]
+    return [(prev, "17"), (d, "05")]
+
+
+async def _heat_fetch(session, now):
+    tmo = aiohttp.ClientTimeout(total=10)
+    async with session.get(HEAT_FCST_URL % HEAT_POINT, timeout=tmo) as r:
+        cur, peak = _heat_parse_fcst((await r.read()).decode("utf-8", "replace"), now)
+    bits = ["いまの%sの暑さ指数はおよそ%.0fで、%sレベルです。"
+            % (HEAT_PREF, cur, _wbgt_level(cur))]
+    if peak > cur + 0.5:
+        bits.append("きょうはこのあと%.0fまで上がる予想です。" % peak)
+    lv = _wbgt_level(max(cur, peak))
+    today_f = tomo_f = None
+    for day, ver in _heat_alert_versions(now):
+        url = HEAT_ALERT_URL % (day.strftime("%Y"), day.strftime("%Y%m%d"), ver)
+        try:
+            async with session.get(url, timeout=tmo) as r:
+                if r.status != 200:
+                    continue
+                today_f, tomo_f = _heat_parse_alert(
+                    (await r.read()).decode("utf-8", "replace"), HEAT_PREF)
+        except Exception as e:
+            log.warning("heat alert unavailable: %s: %s", type(e).__name__, e)
+            continue
+        if today_f is not None:
+            break
+    if today_f in _ALERT_FLAG:
+        bits.append("きょうは%sに%sが出ています。" % (HEAT_PREF, _ALERT_FLAG[today_f]))
+    elif tomo_f in _ALERT_FLAG:
+        bits.append("あすは%sが出ています。" % _ALERT_FLAG[tomo_f])
+    adv = _wbgt_advice(lv)
+    if adv:
+        bits.append(adv)
+    return "".join(bits)
+
+
+def _heat_in_season(d) -> bool:
+    return HEAT_SEASON_FROM <= d.strftime("%m-%d") <= HEAT_SEASON_TO
+
+
+async def get_heat(session, args, ctx=None) -> str:
+    if not _heat_in_season(now_jst()):
+        return ("いまの時期は暑さ指数の情報が出ていません。"
+                "環境省の提供は毎年4月下旬から10月下旬までです。")
+    now = time.monotonic()
+    if _heat_cache and now - _heat_cache[0][0] < HEAT_CACHE_TTL:
+        ts, line = _heat_cache[0]
+    else:
+        try:
+            line = await _heat_fetch(session, now_jst())
+            ts = now
+            _heat_cache[:] = [(ts, line)]
+        except Exception as e:
+            log.warning("heat unavailable: %s: %s", type(e).__name__, e)
+            if _heat_cache and now - _heat_cache[0][0] < HEAT_STALE_MAX:
+                ts, line = _heat_cache[0]
+            else:
+                return "error: いま暑さ指数を取れませんでした（取得先が応答しません）"
+    age = now - ts
+    stale = " ※%d分前の情報" % int(age / 60) if age > 1800 else ""
+    return line + stale
+
+
+# ---- 今日は何の日（Wikipedia） ----------------------------------------------
+# 「Wikipedia:今日は何の日 N月」の wikitext を取り、"== [[N月D日]] ==" 節の
+# 箇条書きを拾う。UA を付けないと 403 になる。読み上げ用にリンク記法
+# [[表示|実体]] や注記の括弧を落として、年号だけ残す。
+ONTHISDAY_URL = os.environ.get(
+    "ONTHISDAY_URL",
+    "https://ja.wikipedia.org/w/api.php?action=parse&page="
+    "Wikipedia:%E4%BB%8A%E6%97%A5%E3%81%AF%E4%BD%95%E3%81%AE%E6%97%A5%20"
+    "{month}%E6%9C%88&prop=wikitext&format=json&formatversion=2")
+ONTHISDAY_COUNT = int(os.environ.get("ONTHISDAY_COUNT", "3"))
+ONTHISDAY_MAX_CHARS = int(os.environ.get("ONTHISDAY_MAX_CHARS", "110"))
+ONTHISDAY_CACHE_TTL = float(os.environ.get("ONTHISDAY_CACHE_TTL", "21600"))
+
+_onthisday_cache = {}   # {"MM-DD": (取得時刻 monotonic, [出来事])}
+
+
+def _wiki_plain(s: str) -> str:
+    """wikitext の 1 行を読み上げ向けの素の文にする。"""
+    out = []
+    i = 0
+    while i < len(s):
+        if s.startswith("[[", i):
+            j = s.find("]]", i)
+            if j < 0:
+                break
+            inner = s[i + 2:j]
+            # [[実体|表示]] は表示側を読む
+            out.append(inner.split("|")[-1] if "|" in inner else inner)
+            i = j + 2
+            continue
+        if s.startswith("{{", i):
+            depth, i = 1, i + 2
+            while i < len(s) and depth:
+                if s.startswith("{{", i):
+                    depth, i = depth + 1, i + 2
+                elif s.startswith("}}", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+            continue
+        if s[i] == "<":
+            j = s.find(">", i)
+            i = (j + 1) if j >= 0 else len(s)
+            continue
+        if s[i] == "'" and s.startswith("''", i):
+            i += 2
+            continue
+        out.append(s[i])
+        i += 1
+    t = "".join(out).replace(" (旧暦)", "").strip()
+    return " ".join(t.split())
+
+
+def _onthisday_year(item: str) -> str:
+    """末尾の（1936年）などから年だけ拾う。無ければ空。"""
+    a = item.rfind("（")
+    if a < 0:
+        return ""
+    tail = item[a + 1:].rstrip("）")
+    head = tail.split(" - ")[0].strip()
+    return head if head.endswith("年") else ""
+
+
+def _onthisday_parse(wikitext: str, month: int, day: int) -> list:
+    head = "== [[%d月%d日]] ==" % (month, day)
+    i = wikitext.find(head)
+    if i < 0:
+        raise RuntimeError("no section for %d/%d" % (month, day))
+    body = wikitext[i + len(head):]
+    j = body.find(chr(10) + "== ")
+    if j >= 0:
+        body = body[:j]
+    events = []
+    for line in body.splitlines():
+        line = line.strip()
+        if not line.startswith("* "):
+            continue
+        plain = _wiki_plain(line[2:])
+        if not plain:
+            continue
+        year = _onthisday_year(plain)
+        a = plain.rfind("（")
+        text = (plain[:a] if a > 0 else plain).strip("：: ")
+        if not text:
+            continue
+        events.append(("%sに%s" % (year, text)) if year else text)
+    if not events:
+        raise RuntimeError("no events for %d/%d" % (month, day))
+    return events
+
+
+async def _onthisday_fetch(session, month: int, day: int) -> list:
+    url = ONTHISDAY_URL.replace("{month}", str(month))
+    async with session.get(url, headers={"User-Agent": "stackchan-server/1.0"},
+                           timeout=aiohttp.ClientTimeout(total=10)) as r:
+        data = json.loads(await r.read())
+    if "parse" not in data:
+        raise RuntimeError("wikipedia: %s" % str(data.get("error"))[:80])
+    return _onthisday_parse(data["parse"]["wikitext"], month, day)
+
+
+async def get_onthisday(session, args, ctx=None) -> str:
+    d = now_jst()
+    key = "%02d-%02d" % (d.month, d.day)
+    now = time.monotonic()
+    hit = _onthisday_cache.get(key)
+    if hit and now - hit[0] < ONTHISDAY_CACHE_TTL:
+        events = hit[1]
+    else:
+        try:
+            events = await _onthisday_fetch(session, d.month, d.day)
+            _onthisday_cache[key] = (now, events)
+            _trim(_onthisday_cache)
+        except Exception as e:
+            log.warning("onthisday unavailable: %s: %s", type(e).__name__, e)
+            if hit:
+                events = hit[1]
+            else:
+                return "error: いま今日は何の日を調べられませんでした（取得先が応答しません）"
+    picks = events[-ONTHISDAY_COUNT:] if len(events) > ONTHISDAY_COUNT else events
+    head = "%d月%d日にあった出来事は、" % (d.month, d.day)
+    # 長い日は件数を減らす（応答整形が 160 字で切るため、途中で尻切れにしない）
+    while len(picks) > 1 and len(head + "、".join(picks)) + 5 > ONTHISDAY_MAX_CHARS:
+        picks = picks[1:]
+    return head + "、".join(picks) + "、などです。"
+
+
+# ---- 月齢・日の出日の入り（計算のみ・外部通信なし） --------------------------
+# 日の出入りは NOAA の簡易式、月齢は既知の新月（2000-01-06 18:14 UTC）からの
+# 朔望月周期で求める。どちらも数分の誤差があるが読み上げには十分。
+SKY_LAT = float(os.environ.get("SKY_LAT", "35.4437"))    # 横浜
+SKY_LON = float(os.environ.get("SKY_LON", "139.6380"))
+SKY_PLACE = os.environ.get("SKY_PLACE", "横浜")
+SYNODIC = 29.530588853
+NEW_MOON_EPOCH = datetime.datetime(2000, 1, 6, 18, 14,
+                                   tzinfo=datetime.timezone.utc)
+
+
+def _moon_age(d: datetime.datetime) -> float:
+    """月齢（日）。太陽との離角から出す（平均朔望月だけだと最大 0.5 日ずれる）。
+    Meeus の短縮級数で、実測の朔望とは 0.1 日ほどの差に収まる。"""
+    ts = d.astimezone(datetime.timezone.utc).timestamp()
+    jd = ts / 86400.0 + 2440587.5
+    t = (jd - 2451545.0) / 36525.0
+    dd = 297.8501921 + 445267.1114034 * t - 0.0018819 * t * t
+    ms = 357.5291092 + 35999.0502909 * t - 0.0001536 * t * t
+    mm = 134.9633964 + 477198.8675055 * t + 0.0087414 * t * t
+    r = math.radians
+    elong = (dd
+             + 6.289 * math.sin(r(mm))
+             - 2.100 * math.sin(r(ms))
+             - 1.274 * math.sin(r(2 * dd - mm))
+             - 0.658 * math.sin(r(2 * dd))
+             - 0.214 * math.sin(r(2 * mm))
+             - 0.110 * math.sin(r(dd)))
+    return (elong % 360.0) / 360.0 * SYNODIC
+
+
+def _moon_name(age: float) -> str:
+    if age < 1.5 or age >= 28.5:
+        return "新月ごろ"
+    if age < 5.5:
+        return "細い三日月"
+    if age < 9.5:
+        return "上弦の半月ごろ"
+    if age < 13.5:
+        return "満月に向かって満ちていく月"
+    if age < 16.5:
+        return "満月ごろ"
+    if age < 20.5:
+        return "満月をすぎて欠けはじめた月"
+    if age < 24.5:
+        return "下弦の半月ごろ"
+    return "明け方に見える細い月"
+
+
+def _sun_events(d: datetime.datetime):
+    """その日の日の出・日の入り（JST の datetime）。極夜等は None。"""
+    day = d.astimezone(JST).date()
+    base = datetime.date(2000, 1, 1)
+    n = (day - base).days + 0.0008 - SKY_LON / 360.0
+    out = []
+    for rising in (True, False):
+        m = 357.5291 + 0.98560028 * n
+        c = (1.9148 * math.sin(math.radians(m))
+             + 0.02 * math.sin(math.radians(2 * m))
+             + 0.0003 * math.sin(math.radians(3 * m)))
+        lam = math.radians((m + c + 180 + 102.9372) % 360)
+        j_transit = (2451545.0 + n
+                     + 0.0053 * math.sin(math.radians(m))
+                     - 0.0069 * math.sin(2 * lam))
+        dec = math.asin(math.sin(lam) * math.sin(math.radians(23.44)))
+        lat = math.radians(SKY_LAT)
+        cos_w = ((math.sin(math.radians(-0.833)) - math.sin(lat) * math.sin(dec))
+                 / (math.cos(lat) * math.cos(dec)))
+        if abs(cos_w) > 1:
+            out.append(None)
+            continue
+        w = math.degrees(math.acos(cos_w)) / 360.0
+        j = j_transit + (-w if rising else w)
+        secs = (j - 2440587.5) * 86400.0
+        out.append(datetime.datetime.fromtimestamp(secs, datetime.timezone.utc)
+                   .astimezone(JST))
+    return out[0], out[1]
+
+
+async def get_sky(session, args, ctx=None) -> str:
+    d = now_jst()
+    age = _moon_age(d)
+    bits = ["きょうの月齢はおよそ%.1fで、%sです。" % (age, _moon_name(age))]
+    try:
+        rise, setting = _sun_events(d)
+    except Exception as e:
+        log.warning("sun calc failed: %s: %s", type(e).__name__, e)
+        rise = setting = None
+    if rise and setting:
+        bits.append("%sの日の出は%d時%d分、日の入りは%d時%d分です。"
+                    % (SKY_PLACE, rise.hour, rise.minute,
+                       setting.hour, setting.minute))
+        if d < rise:
+            left = (rise - d).total_seconds() / 60.0
+            bits.append("日の出まであと%d分です。" % int(left))
+        elif d < setting:
+            left = (setting - d).total_seconds() / 60.0
+            if left < 90:
+                bits.append("日の入りまであと%d分です。" % int(left))
+            else:
+                bits.append("日の入りまであと%.1f時間です。" % (left / 60.0))
+    return "".join(bits)
+
+
+# ---- 電車の遅延（公共交通オープンデータセンター ODPT） -----------------------
+# キー不要の api-public は都営地下鉄のみ。無料の consumer key（odpt.org で登録）を
+# ODPT_TOKEN に入れると JR東日本・京急・東急・相鉄・東京メトロも読める。
+# 平常時は odpt:trainInformationStatus が無く、異常時だけ入る。
+ODPT_TOKEN = os.environ.get("ODPT_TOKEN", "").strip()
+
+
+def _hide_token(s: str) -> str:
+    """例外文字列には URL がそのまま入る（aiohttp）。トークンを伏せてから記録する。"""
+    return s.replace(ODPT_TOKEN, "***") if ODPT_TOKEN else s
+ODPT_PUBLIC_URL = os.environ.get(
+    "ODPT_PUBLIC_URL",
+    "https://api-public.odpt.org/api/v4/odpt:TrainInformation")
+ODPT_KEYED_URL = os.environ.get(
+    "ODPT_KEYED_URL", "https://api.odpt.org/api/v4/odpt:TrainInformation")
+TRAIN_OPERATORS = os.environ.get(
+    "TRAIN_OPERATORS", "JR-East,Keikyu,Tokyu,Sotetsu,TokyoMetro,Toei")
+TRAIN_CACHE_TTL = float(os.environ.get("TRAIN_CACHE_TTL", "180"))
+TRAIN_STALE_MAX = float(os.environ.get("TRAIN_STALE_MAX", "3600"))
+TRAIN_MAX_LINES = int(os.environ.get("TRAIN_MAX_LINES", "3"))
+
+_train_cache = []   # [(取得時刻 monotonic, line)] を 1 件だけ
+
+# 横浜まわりで名前が出うる路線だけ読み方を持つ。未知の路線は英語 ID の
+# 末尾をそのまま読ませず「一部の路線」に丸める。
+TRAIN_LINE_NAMES = {
+    "JR-East.Tokaido": "JRの東海道線",
+    "JR-East.KeihinTohokuNegishi": "JRの京浜東北・根岸線",
+    "JR-East.Yokosuka": "JRの横須賀線",
+    "JR-East.ShonanShinjuku": "湘南新宿ライン",
+    "JR-East.UenoTokyo": "上野東京ライン",
+    "JR-East.Yokohama": "JRの横浜線",
+    "JR-East.Nambu": "JRの南武線",
+    "JR-East.Tsurumi": "JRの鶴見線",
+    "JR-East.Sagami": "JRの相模線",
+    "JR-East.Yamanote": "JRの山手線",
+    "JR-East.ChuoRapid": "JRの中央線",
+    "JR-East.Sobu": "JRの総武線",
+    "JR-East.Saikyo": "JRの埼京線",
+    "JR-East.Takasaki": "JRの高崎線",
+    "JR-East.Utsunomiya": "JRの宇都宮線",
+    "JR-East.Joban": "JRの常磐線",
+    "JR-East.Musashino": "JRの武蔵野線",
+    "JR-East.Keiyo": "JRの京葉線",
+    "Keikyu.Main": "京急本線",
+    "Keikyu.Airport": "京急空港線",
+    "Keikyu.Kurihama": "京急久里浜線",
+    "Keikyu.Zushi": "京急逗子線",
+    "Keikyu.Daishi": "京急大師線",
+    "Tokyu.Toyoko": "東急東横線",
+    "Tokyu.Meguro": "東急目黒線",
+    "Tokyu.DenEnToshi": "東急田園都市線",
+    "Tokyu.Oimachi": "東急大井町線",
+    "Tokyu.Ikegami": "東急池上線",
+    "Tokyu.TokyuTamagawa": "東急多摩川線",
+    "Tokyu.Kodomonokuni": "こどもの国線",
+    "Tokyu.ShinYokohama": "東急新横浜線",
+    "Sotetsu.Main": "相鉄本線",
+    "Sotetsu.Izumino": "相鉄いずみ野線",
+    "Sotetsu.SotetsuShinYokohama": "相鉄新横浜線",
+    "TokyoMetro.Ginza": "地下鉄銀座線",
+    "TokyoMetro.Marunouchi": "地下鉄丸ノ内線",
+    "TokyoMetro.Hibiya": "地下鉄日比谷線",
+    "TokyoMetro.Tozai": "地下鉄東西線",
+    "TokyoMetro.Chiyoda": "地下鉄千代田線",
+    "TokyoMetro.Yurakucho": "地下鉄有楽町線",
+    "TokyoMetro.Hanzomon": "地下鉄半蔵門線",
+    "TokyoMetro.Namboku": "地下鉄南北線",
+    "TokyoMetro.Fukutoshin": "地下鉄副都心線",
+    "Toei.Asakusa": "都営浅草線",
+    "Toei.Mita": "都営三田線",
+    "Toei.Shinjuku": "都営新宿線",
+    "Toei.Oedo": "都営大江戸線",
+    "Toei.Arakawa": "都電荒川線",
+    "Toei.NipporiToneri": "日暮里・舎人ライナー",
+}
+
+
+def _train_line_name(rid: str) -> str:
+    key = str(rid or "").replace("odpt.Railway:", "")
+    return TRAIN_LINE_NAMES.get(key, "")
+
+
+def _train_line(items, keyed: bool) -> str:
+    scope = "横浜まわりの主な路線" if keyed else "都営地下鉄"
+    bad = []
+    for e in items:
+        st = (e.get("odpt:trainInformationStatus") or {})
+        st = st.get("ja") if isinstance(st, dict) else st
+        if not st:
+            continue
+        name = _train_line_name(e.get("odpt:railway"))
+        cause = (e.get("odpt:trainInformationCause") or {})
+        cause = cause.get("ja") if isinstance(cause, dict) else cause
+        bad.append((name, str(st), str(cause or "")))
+    if not bad:
+        line = "いま%sに大きな遅れは出ていません。" % scope
+        if not keyed:
+            line += "いまは都営地下鉄しか調べられません。"
+        return line
+    named = [b for b in bad if b[0]]
+    shown = named[:TRAIN_MAX_LINES] if named else bad[:TRAIN_MAX_LINES]
+    parts = ["%s%s" % (n or "一部の路線", "は" + s) for n, s, _ in shown]
+    head = "いま、" + "、".join(parts) + "です。"
+    rest = len(bad) - len(shown)
+    if rest > 0:
+        head += "ほかにも%d路線で乱れが出ています。" % rest
+    cause = next((c for _, _, c in shown if c), "")
+    if cause:
+        head += "原因は%sです。" % cause
+    return head
+
+
+async def _train_fetch(session):
+    tmo = aiohttp.ClientTimeout(total=10)
+    if ODPT_TOKEN:
+        ops = ",".join("odpt.Operator:" + o.strip()
+                       for o in TRAIN_OPERATORS.split(",") if o.strip())
+        url = "%s?odpt:operator=%s&acl:consumerKey=%s" % (
+            ODPT_KEYED_URL, urllib.parse.quote(ops, safe=":,"),
+            urllib.parse.quote(ODPT_TOKEN, safe=""))
+        try:
+            async with session.get(url, timeout=tmo) as r:
+                items = json.loads(await r.read())
+            if isinstance(items, list) and items:
+                return _train_line(items, True)
+            log.warning("odpt keyed returned nothing; falling back to public")
+        except Exception as e:
+            # 鍵切れ等でキー付きが死んでも、都営だけは公開分で答える
+            log.warning("odpt keyed failed: %s: %s", type(e).__name__,
+                        _hide_token(str(e))[:120])
+    async with session.get(ODPT_PUBLIC_URL, timeout=tmo) as r:
+        items = json.loads(await r.read())
+    return _train_line(items, False)
+
+
+async def get_train(session, args, ctx=None) -> str:
+    now = time.monotonic()
+    if _train_cache and now - _train_cache[0][0] < TRAIN_CACHE_TTL:
+        ts, line = _train_cache[0]
+    else:
+        try:
+            line = await _train_fetch(session)
+            ts = now
+            _train_cache[:] = [(ts, line)]
+        except Exception as e:
+            log.warning("train unavailable: %s: %s", type(e).__name__,
+                        _hide_token(str(e))[:120])
+            if _train_cache and now - _train_cache[0][0] < TRAIN_STALE_MAX:
+                ts, line = _train_cache[0]
+            else:
+                return "error: いま運行情報を取れませんでした（取得先が応答しません）"
+    age = now - ts
+    stale = " ※%d分前の情報" % int(age / 60) if age > 600 else ""
+    return line + stale
+
+
 SPECS = [{
     "type": "function",
     "function": {
@@ -896,6 +1524,51 @@ SPECS = [{
                        "「警報出てる？」「大雨警報は？」「注意報ある？」などに使う。",
         "parameters": {"type": "object", "properties": {}},
     },
+}, {
+    "type": "function",
+    "function": {
+        "name": "get_typhoon",
+        "description": "台風が発生しているか・いまどこにいるか・勢力を調べる。"
+                       "「台風来てる？」「台風どこにいる？」「台風大丈夫？」"
+                       "などに使う。",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}, {
+    "type": "function",
+    "function": {
+        "name": "get_heat",
+        "description": "熱中症の危険度（暑さ指数 WBGT）と熱中症警戒アラートを調べる。"
+                       "「今日暑い？」「熱中症大丈夫？」「外出ていい？」"
+                       "「熱中症アラート出てる？」などに使う。",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}, {
+    "type": "function",
+    "function": {
+        "name": "get_onthisday",
+        "description": "きょうが何の日か・過去のきょう何があったかを調べる。"
+                       "「今日は何の日？」「きょう何かあった日？」"
+                       "「歴史で今日は？」などに使う。",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}, {
+    "type": "function",
+    "function": {
+        "name": "get_sky",
+        "description": "月齢（今夜の月の形）と、日の出・日の入りの時刻を調べる。"
+                       "「今日の月は？」「満月いつ？」「日の入り何時？」"
+                       "「あと何時間明るい？」などに使う。",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}, {
+    "type": "function",
+    "function": {
+        "name": "get_train",
+        "description": "電車が遅れているか・止まっていないかを調べる。"
+                       "「電車遅れてる？」「京急動いてる？」「電車大丈夫？」"
+                       "などに使う。",
+        "parameters": {"type": "object", "properties": {}},
+    },
 }]
 
 HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy,
@@ -904,7 +1577,12 @@ HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy,
             "get_crypto": get_crypto,
             "get_news": get_news,
             "get_quake": get_quake,
-            "get_warning": get_warning}
+            "get_warning": get_warning,
+            "get_typhoon": get_typhoon,
+            "get_heat": get_heat,
+            "get_onthisday": get_onthisday,
+            "get_sky": get_sky,
+            "get_train": get_train}
 
 
 def specs():

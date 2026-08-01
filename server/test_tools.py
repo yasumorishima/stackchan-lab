@@ -26,6 +26,10 @@ CASES = [
 ]
 
 
+import datetime as _dt
+NL = chr(10)
+
+
 async def main():
     ok = True
     async with aiohttp.ClientSession() as s:
@@ -252,6 +256,194 @@ async def main():
         server_tools.CRYPTO_URL_GECKO = real_gecko
         server_tools.STOCK_HOSTS = real_hosts2
 
+        # ---- 台風・熱中症 ----
+        text = await server_tools.call(s, "get_typhoon", {})
+        print("%-28s %s" % ("台風情報を実取得", text[:80]))
+        if text.startswith("error:") or "台風" not in text:
+            ok = False
+
+        real = server_tools.TYPHOON_LIST_URL
+        server_tools.TYPHOON_LIST_URL = "http://127.0.0.1:9/tc"
+        text = await server_tools.call(s, "get_typhoon", {})
+        print("%-28s %s" % ("台風: 直前の値で答える", text[:50]))
+        if text.startswith("error:"):
+            ok = False
+        server_tools._typhoon_cache[:] = [(
+            server_tools.time.monotonic() - server_tools.TYPHOON_STALE_MAX - 60,
+            "古い台風")]
+        text = await server_tools.call(s, "get_typhoon", {})
+        print("%-28s %s" % ("台風: 古すぎる値は使わない", text))
+        if "取れませんでした" not in text:
+            ok = False
+        server_tools._typhoon_cache.clear()
+        server_tools.TYPHOON_LIST_URL = real
+
+        SPEC = [{"part": "title", "typhoonNumber": "2613",
+                 "name": {"jp": "ドルフィン"}},
+                {"part": {"jp": "実況"}, "location": "南鳥島近海",
+                 "intensity": "非常に強い", "course": "北西",
+                 "speed": {"km/h": "20"}, "pressure": "935"}]
+        line = server_tools._typhoon_one(SPEC)
+        good = ("台風13号ドルフィン" in line and "南鳥島近海" in line
+                and "時速20キロ" in line and "935ヘクトパスカル" in line)
+        ok = ok and good
+        print("%-4s _typhoon_one: %s" % ("OK" if good else "NG", line[:60]))
+
+        text = await server_tools.call(s, "get_heat", {})
+        print("%-28s %s" % ("暑さ指数を実取得", text[:80]))
+        if text.startswith("error:") or "暑さ指数" not in text:
+            ok = False
+
+        WB = [(33.0, "危険"), (29.0, "厳重警戒"), (26.0, "警戒"),
+              (22.0, "注意"), (18.0, "ほぼ安全")]
+        for v, want in WB:
+            got = server_tools._wbgt_level(v)
+            mark = "OK" if got == want else "NG"
+            if got != want:
+                ok = False
+            print("%-4s _wbgt_level(%s) -> %s (期待 %s)" % (mark, v, got, want))
+        CSV = (",," + ",".join(["2026080115", "2026080118", "2026080203"]) + NL
+               + "46106,2026/08/01 15:25, 290, 310, 240")
+        cur, peak = server_tools._heat_parse_fcst(
+            CSV, _dt.datetime(2026, 8, 1, 16, 0, tzinfo=server_tools.JST))
+        good = abs(cur - 29.0) < 0.01 and abs(peak - 31.0) < 0.01
+        ok = ok and good
+        print("%-4s _heat_parse_fcst -> いま %.1f / 最高 %.1f"
+              % ("OK" if good else "NG", cur, peak))
+        AL = ("Title,熱中症警戒情報" + NL
+              + "神奈川県,46,0,140000,神奈川,14,1,0,他" + NL
+              + "東京都,44,0,130000,東京,13,0,0,他")
+        t1, t2 = server_tools._heat_parse_alert(AL, "神奈川県")
+        good = (t1, t2) == ("1", "0")
+        ok = ok and good
+        print("%-4s _heat_parse_alert -> きょう %s / あす %s"
+              % ("OK" if good else "NG", t1, t2))
+
+        # ---- 今日は何の日・月と日の出入り・電車 ----
+        text = await server_tools.call(s, "get_onthisday", {})
+        print("%-28s %s" % ("今日は何の日を実取得", text[:80]))
+        if text.startswith("error:") or "出来事" not in text:
+            ok = False
+
+        WIKI = ("== [[8月1日]] ==" + NL
+                + "* [[ジョゼフ・プリーストリー]]が[[酸素]]を発見（[[1774年]]）" + NL
+                + "* [[ベナン]]独立（[[1960年]]）" + NL + NL
+                + "== [[8月2日]] ==" + NL + "* 別の日の話")
+        ev = server_tools._onthisday_parse(WIKI, 8, 1)
+        good = (len(ev) == 2 and ev[0] == "1774年にジョゼフ・プリーストリーが酸素を発見"
+                and ev[1] == "1960年にベナン独立")
+        ok = ok and good
+        print("%-4s _onthisday_parse -> %s" % ("OK" if good else "NG", ev))
+        good = (server_tools._wiki_plain("[[8月1日|きょう]]は''強調''{{注}}")
+                == "きょうは強調"
+                and server_tools._wiki_plain("[[a|b]]は{{x|{{y}}}}だ<ref>注</ref>")
+                == "bはだ注")
+        ok = ok and good
+        print("%-4s _wiki_plain: リンクと装飾を落とす" % ("OK" if good else "NG"))
+
+        text = await server_tools.call(s, "get_sky", {})
+        print("%-28s %s" % ("月齢と日の出入り", text[:80]))
+        if "月齢" not in text or "日の出" not in text:
+            ok = False
+        SUN = [("2026-06-21", 4, 27, 19, 0), ("2026-12-22", 6, 48, 16, 33)]
+        for ds, rh, rm, sh, sm in SUN:
+            d = _dt.datetime.fromisoformat(ds + "T12:00:00+09:00")
+            r, st = server_tools._sun_events(d)
+            good = (abs((r.hour * 60 + r.minute) - (rh * 60 + rm)) <= 3
+                    and abs((st.hour * 60 + st.minute) - (sh * 60 + sm)) <= 3)
+            ok = ok and good
+            print("%-4s _sun_events(%s) -> %02d:%02d / %02d:%02d (公表 %02d:%02d / %02d:%02d)"
+                  % ("OK" if good else "NG", ds, r.hour, r.minute,
+                     st.hour, st.minute, rh, rm, sh, sm))
+        # 国立天文台の朔弦望（2026-07-14 18:44 新月 / 2026-07-29 23:36 満月）で照合
+        AGE = [(_dt.datetime(2026, 7, 14, 18, 44, tzinfo=server_tools.JST),
+                0.0, "新月"),
+               (_dt.datetime(2026, 7, 29, 23, 36, tzinfo=server_tools.JST),
+                server_tools.SYNODIC / 2, "満月"),
+               (_dt.datetime(2026, 8, 13, 2, 37, tzinfo=server_tools.JST),
+                0.0, "次の新月"),
+               (_dt.datetime(2026, 8, 28, 13, 19, tzinfo=server_tools.JST),
+                server_tools.SYNODIC / 2, "次の満月")]
+        for d, want, memo in AGE:
+            got = server_tools._moon_age(d)
+            diff = min(abs(got - want), abs(got - want - server_tools.SYNODIC),
+                       abs(got - want + server_tools.SYNODIC))
+            good = diff <= 0.35
+            ok = ok and good
+            print("%-4s _moon_age(%s %s) -> %.2f (公表の%s・ずれ %.2f日)"
+                  % ("OK" if good else "NG", d.date(), d.strftime("%H:%M"),
+                     got, memo, diff))
+
+        # 査読で出た穴（夏期以外・アラートの版・トークン秘匿・鍵切れ退避）
+        real_season = server_tools.HEAT_SEASON_FROM
+        _sv = server_tools._heat_in_season
+        good = (_sv(_dt.datetime(2026, 8, 1, tzinfo=server_tools.JST))
+                and not _sv(_dt.datetime(2026, 1, 15, tzinfo=server_tools.JST))
+                and not _sv(_dt.datetime(2026, 10, 25, tzinfo=server_tools.JST)))
+        ok = ok and good
+        print("%-4s 暑さ指数は夏期だけ提供と分かっている" % ("OK" if good else "NG"))
+        server_tools.HEAT_SEASON_FROM = "12-31"
+        text = await server_tools.call(s, "get_heat", {})
+        good = "取れませんでした" not in text and "出ていません" in text
+        ok = ok and good
+        print("%-4s 期間外は落ちてると言わない: %s" % ("OK" if good else "NG", text[:40]))
+        server_tools.HEAT_SEASON_FROM = real_season
+
+        _d = _dt.datetime(2026, 8, 1, 18, 0, tzinfo=server_tools.JST)
+        vers = server_tools._heat_alert_versions(_d)
+        good = vers[0][1] == "17" and vers[0][0].day == 1
+        ok = ok and good
+        print("%-4s 夕方は17時版を先に見る" % ("OK" if good else "NG"))
+        vers = server_tools._heat_alert_versions(_d.replace(hour=2))
+        good = vers[0][1] == "17" and vers[0][0].day == 31
+        ok = ok and good
+        print("%-4s 未明は前日17時版に落ちる" % ("OK" if good else "NG"))
+
+        real_tok = server_tools.ODPT_TOKEN
+        server_tools.ODPT_TOKEN = "SECRET123"
+        masked = server_tools._hide_token("url=https://x?acl:consumerKey=SECRET123")
+        good = "SECRET123" not in masked and "***" in masked
+        ok = ok and good
+        print("%-4s トークンはログに出さない: %s" % ("OK" if good else "NG", masked))
+        server_tools.ODPT_KEYED_URL = "http://127.0.0.1:9/keyed"
+        server_tools._train_cache.clear()
+        text = await server_tools.call(s, "get_train", {})
+        good = not text.startswith("error:") and "都営" in text
+        ok = ok and good
+        print("%-4s 鍵付きが死んでも公開分で答える: %s" % ("OK" if good else "NG", text[:40]))
+        server_tools.ODPT_TOKEN = real_tok
+        server_tools._train_cache.clear()
+
+        long_ev = ["あ" * 60, "い" * 60, "う" * 60]
+        server_tools._onthisday_cache[
+            "%02d-%02d" % (server_tools.now_jst().month, server_tools.now_jst().day)
+        ] = (server_tools.time.monotonic(), long_ev)
+        text = await server_tools.call(s, "get_onthisday", {})
+        good = len(text) <= server_tools.ONTHISDAY_MAX_CHARS + 10
+        ok = ok and good
+        print("%-4s 長い日は件数を減らす -> %d字" % ("OK" if good else "NG", len(text)))
+        server_tools._onthisday_cache.clear()
+
+        text = await server_tools.call(s, "get_train", {})
+        print("%-28s %s" % ("運行情報を実取得", text[:80]))
+        if text.startswith("error:") or "遅れ" not in text and "いま、" not in text:
+            ok = False
+        TR = [{"odpt:railway": "odpt.Railway:Keikyu.Main",
+               "odpt:trainInformationStatus": {"ja": "遅延"},
+               "odpt:trainInformationCause": {"ja": "人身事故"}},
+              {"odpt:railway": "odpt.Railway:JR-East.Yokohama",
+               "odpt:trainInformationStatus": {"ja": "運転見合わせ"}},
+              {"odpt:railway": "odpt.Railway:Toei.Mita"}]
+        line = server_tools._train_line(TR, True)
+        good = ("京急本線は遅延" in line and "JRの横浜線は運転見合わせ" in line
+                and "人身事故" in line)
+        ok = ok and good
+        print("%-4s _train_line(異常あり): %s" % ("OK" if good else "NG", line))
+        line = server_tools._train_line([TR[2]], False)
+        good = "大きな遅れは出ていません" in line and "都営地下鉄しか" in line
+        ok = ok and good
+        print("%-4s _train_line(平常/キー無し): %s" % ("OK" if good else "NG", line))
+
         # ---- ニュース・地震・警報 ----
         text = await server_tools.call(s, "get_news", {})
         print("%-28s %s" % ("ニュースを実取得", text[:80]))
@@ -287,7 +479,6 @@ async def main():
             ok = False
 
         # 通信なしの単体（時刻の読み・震度表記・警報の有効判定）
-        import datetime as _dt
         _now = _dt.datetime(2026, 8, 1, 15, 0, tzinfo=server_tools.JST)
         FQT = [("2026-08-01T13:00:00+09:00", "きょう13時0分ごろ"),
                ("2026-07-31T23:59:00+09:00", "きのう23時59分ごろ"),
