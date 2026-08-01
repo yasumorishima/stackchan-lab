@@ -435,7 +435,7 @@ async def voicevox_tts(session: aiohttp.ClientSession, text: str, base: str, hea
 # 伸びる。実機で user が体感した「たまに遅い」の正体）。読点を機械的に足しても
 # 位置が語境界でないと直らない（「教えても、らえると」で実測 17.6s のまま）ので、
 # テキストごと分けて別々に合成する。分ければ切り方が多少悪くても各片は正常な速さ。
-OJT_MAX_RUN = int(os.environ.get("OJT_MAX_RUN", "24"))
+OJT_MAX_MORA = int(os.environ.get("OJT_MAX_MORA", "30"))
 # Open JTalk は合成のたびに前 0.41 秒・後 0.58 秒ほどの無音を必ず付ける。
 # 文ごとに合成するので短い返事ほど無音の比率が上がり（実測で 27〜56%）、
 # 特に最後の文が間延びして聞こえる。切り詰めてから短い間だけ足し直す。
@@ -480,8 +480,78 @@ def _is_hira(ch: str) -> bool:
 
 
 
+_DIGIT_MORA = {"0": 2, "1": 2, "2": 1, "3": 2, "4": 2,
+               "5": 1, "6": 2, "7": 3, "8": 3, "9": 2}
+_UNIT_MORA = (0, 2, 2, 2)      # 一 / 十 / 百 / 千（ジュウ・ヒャク・センとも 2）
+_ZEN2HAN = str.maketrans("０１２３４５６７８９．", "0123456789.")
+
+
+def _num_mora(s: str) -> int:
+    """数字の読みが何モーラかを数える。3000 は 4（さんぜん）、
+    2996 は 13（にせんきゅうひゃくきゅうじゅうろく）。"""
+    if "." in s:
+        head, _, tail = s.partition(".")
+        return (_num_mora(head) + 2
+                + sum(_DIGIT_MORA.get(c, 2) for c in tail))
+    digits = s.lstrip("0")
+    if not digits:
+        return 2                       # ゼロ
+    total = 0
+    while digits:
+        group, digits = digits[-4:], digits[:-4]
+        for i, c in enumerate(reversed(group)):
+            if c == "0":
+                continue
+            head = 0 if (c == "1" and i) else _DIGIT_MORA.get(c, 2)
+            total += head + _UNIT_MORA[i]
+        if digits:
+            total += 2                 # 万・億（マン / オク）
+    return total
+
+
+def _mora_est(text: str) -> int:
+    """読み上げが何モーラになるかの見積り。合成せずに長さを測るため。
+
+    伸びるかどうかを決めるのは句読点で切れた 1 かたまりのモーラ数で、
+    字数ではない（実測: 33 モーラまで 0.12〜0.15 秒/モーラ、
+    35 モーラ以上は 0.24〜0.48 に落ちる）。"""
+    text = text.translate(_ZEN2HAN)   # 全角の数字も同じに読む
+    total, i = 0, 0
+    while i < len(text):
+        c = text[i]
+        if c.isdigit():
+            j = i
+            while j < len(text) and (text[j].isdigit() or (
+                    text[j] == "." and j + 1 < len(text)
+                    and text[j + 1].isdigit())):
+                j += 1
+            total += _num_mora(text[i:j])
+            i = j
+            continue
+        if c in OJT_SMALL_KANA:
+            pass                       # 拗音・促音は数えない（音素に母音が無い）
+        elif c == "%":
+            total += 5                 # パーセント
+        elif "ぁ" <= c <= "ん" or "ァ" <= c <= "ヶ" or c == "ー":
+            total += 1
+        elif c.isascii() and c.isalpha():
+            total += 2                 # エー・ビー…は 2 モーラ前後
+        elif "一" <= c <= "鿕" or c in "々〆":
+            total += 2                 # 漢字は音読み 2 モーラを目安
+        i += 1
+    return total
+
+
+def _mora_prefix(s: str, limit: int) -> int:
+    """先頭から limit モーラに収まる文字数。"""
+    for i in range(1, len(s) + 1):
+        if _mora_est(s[:i]) > limit:
+            return i - 1
+    return len(s)
+
+
 def split_long_runs(text: str):
-    """呼気段落が OJT_MAX_RUN を超えないよう、語境界らしい所でテキストを分ける。
+    """呼気段落が OJT_MAX_MORA を超えないよう、語境界らしい所でテキストを分ける。
 
     一文字助詞は直後が平仮名だと語中の可能性が高い（「教えてもらえる」の「も」）
     ので、直後が漢字・カタカナ等のときだけ切る。
@@ -489,12 +559,13 @@ def split_long_runs(text: str):
     sep = chr(0)
     out = []
     for run in re.split("([" + OJT_PAUSES + "])", text):
-        if run in OJT_PAUSES or len(run) <= OJT_MAX_RUN:
+        if run in OJT_PAUSES or _mora_est(run) <= OJT_MAX_MORA:
             out.append(run)
             continue
         s = run
-        while len(s) > OJT_MAX_RUN:
-            window = s[:OJT_MAX_RUN]
+        while _mora_est(s) > OJT_MAX_MORA:
+            n = _mora_prefix(s, OJT_MAX_MORA)
+            window = s[:n]
             cut = -1
             for p in OJT_PARTICLES_2:
                 i = window.rfind(p)
@@ -509,8 +580,8 @@ def split_long_runs(text: str):
                         break
                     i = window.rfind(p, 0, i)
             if cut < 0:
-                cut = _avoid_mid_token(s, OJT_MAX_RUN)
-            if cut is None:
+                cut = _avoid_mid_token(s, n)
+            if not cut:
                 break       # 切り所が無い。読みを壊すより長いまま出す
             out.append(s[:cut] + sep)
             s = s[cut:]

@@ -117,11 +117,41 @@ for text in INVARIANT:
     n_split += 1
     segs = app.split_long_runs(text)
     joined = "".join(segs)
-    runs_ok = all(len(r) <= app.OJT_MAX_RUN
+    runs_ok = all(app._mora_est(r) <= app.OJT_MAX_MORA
                   for s in segs for r in _re.split("[" + app.OJT_PAUSES + "]", s))
     good = joined == text and runs_ok and all(segs)
     ng += not good
     print("%s 不変条件: %r" % ("OK" if good else "NG", text[:24]))
+
+# モーラの見積り（分割の物差し）。伸びるかどうかは句読点で切れた
+# 1 かたまりのモーラ数で決まり、字数では決まらない（実測 33 まで健全 / 35 で破綻）
+MORA = [
+    ("3000", 4, "さんぜん"),
+    ("2996", 13, "にせんきゅうひゃくきゅうじゅうろく"),
+    ("64362", 17, "ろくまんよんせんさんびゃくろくじゅうに"),
+    ("0", 2, "ゼロ"),
+]
+for _s, _want, _memo in MORA:
+    n_split += 1
+    _got = app._num_mora(_s)
+    ng += _got != _want
+    print("%s 数字の読み %s=%d モーラ（%s）"
+          % ("OK" if _got == _want else "NG", _s, _got, _memo))
+
+# 全角の数字で落ちない（震度５弱 で KeyError を出した）
+n_split += 1
+_zen, _han = app._mora_est("震度５弱"), app._mora_est("震度5弱")
+ng += _zen != _han or _zen == 0
+print("%s 全角数字も半角と同じ %d モーラ"
+      % ("OK" if _zen == _han and _zen else "NG", _zen))
+
+# 語の途中でしか切れないものは切らない（読みを壊すより長いまま出す）
+n_split += 1
+_long = "2996996996996996996"
+_got = app.split_long_runs(_long)
+ng += _got != [_long]
+print("%s 切り所が無い数字は分けない: %s"
+      % ("OK" if _got == [_long] else "NG", _got))
 
 # 合成の前後に付く固定の無音を落とす処理（末尾の間延び対策）
 import array as _arr
