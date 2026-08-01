@@ -9,6 +9,7 @@
 """
 import array
 import asyncio
+import difflib
 import io
 import json
 import logging
@@ -826,7 +827,7 @@ def _drop_tool_json(text: str) -> str:
 # 「さん ゼロゼロゼロ かい」「いち かげつ」になる。読み上げる前に詰める。
 _SP = "[ 　 \t]"
 _JA = "ぁ-ゖァ-ヺー一-鿕々〆"
-NUM_SPACE_RE = re.compile(r"(?<=\d)" + _SP + r"+(?=\d)")
+NUM_SPACE_RE = re.compile(r"(?<=\d)" + _SP + r"+(?=[\dA-Za-z])")
 # 詰めるのは数字・英字の「直後」だけ。日本語の直後の空白は箇条書きや
 # 見出しの区切りとして意味があり（「晴れです 32度です」）、消すと繋がる
 JA_SPACE_RE = re.compile("(?<=[0-9A-Za-z])" + _SP + "+(?=[" + _JA + "])")
@@ -839,6 +840,14 @@ CLOSERS = ("ご利用ありがとうございます", "ご利用ありがとう�
            "またのご利用をお待ちしております", "お役に立てれば幸いです",
            "お役に立てて嬉しいです")
 CLOSER_RE = re.compile("(?:" + "|".join(CLOSERS) + r")[。．！？!?]?")
+# 綴りだけの括弧書きは落とす。合成器は NASDAQ を「ナスダック」と読むので
+# 「ナスダック（NASDAQ）」が 2 回になり、単位も「0.8 m/s」が「エム エス」
+# になる（実測）。日本語を含む括弧書き（7月31日の終値 など）は残す
+PAREN_RE = re.compile(r"[（(][^（()）]*[）)]")
+JA_CHAR_RE = re.compile("[" + "ぁ-ゖァ-ヺ一-鿕" + "]")
+# 記号の読み。℃ は「ど シー」と読まれてしまう（実測 28℃ -> にじゅうはちどシー）
+SYMBOL_READ = (("℃", "度"), ("°C", "度"), ("㎡", "平方メートル"))
+EMPHASIS_RE = re.compile(r"\*{1,2}|__")
 READ_AS = [
     ("AI Engine", "エーアイエンジン"),
     ("Open JTalk", "オープンジェイトーク"),
@@ -857,6 +866,12 @@ def fix_reading(text: str) -> str:
         pat = ("(?:(?<=[" + _JA + r"])\s+)?" + body
                + r"(?:\s+(?=[" + _JA + "]))?")
         text = re.sub(pat, kana, text, flags=re.IGNORECASE)
+    text = EMPHASIS_RE.sub("", text)
+    for sym, kana in SYMBOL_READ:
+        text = text.replace(sym, kana)
+    text = PAREN_RE.sub(
+        lambda m: m.group(0) if JA_CHAR_RE.search(m.group(0)) else "",
+        text)
     text = CLOSER_RE.sub("", text)
     text = NUM_SPACE_RE.sub("", text)
     return JA_SPACE_RE.sub("", text)
@@ -891,6 +906,23 @@ def plain_sentences(text: str):
     return [s for s in re.split("(?<=[。．！？!?])", text or "") if s.strip()]
 
 
+def dedupe_sentences(parts):
+    """同じ内容の言い直しは 1 回だけ読む。
+
+    実機 2026-08-02 で「S&P 500は現在、約 7,490 ポイントです。
+    S&P 500は今、約 7,490 ポイントです！」と 2 回続けて読み上げた。"""
+    out = []
+    for s in parts:
+        body = s.strip()
+        if not body:
+            continue
+        if any(difflib.SequenceMatcher(None, body, o).ratio() > 0.7
+               for o in out):
+            continue
+        out.append(body)
+    return out
+
+
 def shorten_reply(text: str) -> str:
     """読み上げる長さを code 側で切る。
 
@@ -898,9 +930,8 @@ def shorten_reply(text: str) -> str:
     （qwen2.5:3b 実測: 指示なし 呼び出し 7/9、指示ありの長いシステム文 1/9）。
     形は code で守る方が確実で、プロンプトも短く保てる。
     """
-    parts = plain_sentences(text)
-    if len(parts) > MAX_SENTENCES:
-        text = "".join(parts[:MAX_SENTENCES])
+    parts = dedupe_sentences(plain_sentences(text))
+    text = "".join(parts[:MAX_SENTENCES])
     if len(text) > MAX_REPLY_CHARS:
         head = text[:MAX_REPLY_CHARS]
         cut = max(head.rfind("、"), head.rfind("。"))

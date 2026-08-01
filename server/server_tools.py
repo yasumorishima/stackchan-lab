@@ -390,6 +390,7 @@ STOCK_INDEXES = {
     "nikkei": ("^N225", "日経平均株価", "円"),
     "dow": ("^DJI", "ダウ平均株価", "ドル"),
     "sp500": ("^GSPC", "エスアンドピー500", "ポイント"),
+    "nasdaq": ("^IXIC", "ナスダック総合指数", "ポイント"),
 }
 STOCK_HOSTS = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
 STOCK_CACHE_TTL = float(os.environ.get("STOCK_CACHE_TTL", "300"))
@@ -1468,8 +1469,8 @@ SPECS = [{
             "type": "object",
             "properties": {
                 "index": {"type": "string",
-                          "enum": ["nikkei", "dow", "sp500"],
-                          "description": "nikkei=日経平均、dow=ダウ平均、sp500=S&P500。"
+                          "enum": ["nikkei", "dow", "sp500", "nasdaq"],
+                          "description": "nikkei=日経平均、dow=ダウ平均、sp500=S&P500、nasdaq=ナスダック総合指数。"
                                          "省略すると全部"},
             },
         },
