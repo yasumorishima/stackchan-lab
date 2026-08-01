@@ -378,6 +378,104 @@ async def get_usdjpy(session, args, ctx=None) -> str:
     return "ドル円レート: 1ドル %s（%s）%s" % (_yen_sen(rate), src, stale)
 
 
+# ---- 株価指数 --------------------------------------------------------------
+# ドル円と同じ Yahoo Finance の chart API（キー不要・無料）。指数を返す無料の
+# 予備 API が見つからなかったので、多重化はホスト冗長（query1 -> query2）と
+# 6 時間の stale cache で担う。市場が閉まっている間は regularMarketPrice が
+# 直近の終値のまま止まるので、取引時間外なら「終値」と断って読み上げる。
+STOCK_INDEXES = {
+    "nikkei": ("^N225", "日経平均株価", "円"),
+    "dow": ("^DJI", "ダウ平均株価", "ドル"),
+    "sp500": ("^GSPC", "エスアンドピー500", "ポイント"),
+}
+STOCK_HOSTS = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
+STOCK_CACHE_TTL = float(os.environ.get("STOCK_CACHE_TTL", "300"))
+STOCK_STALE_MAX = float(os.environ.get("STOCK_STALE_MAX", "21600"))
+
+_stock_cache = {}   # index キー -> (取得時刻 monotonic, 読み上げ文)
+
+
+def _fmt_points(value, unit):
+    """64362.02, "円" -> 「64362円」。読み上げ用に整数へ丸める（銭・小数は言わない）。"""
+    return "%d%s" % (int(round(float(value))), unit)
+
+
+async def _stock_yahoo(session, symbol):
+    """chart API の meta を返す。query1 が死んでいたら query2 を試す。"""
+    err = ""
+    for host in STOCK_HOSTS:
+        url = "https://%s/v8/finance/chart/%s" % (host, urllib.parse.quote(symbol, safe=""))
+        try:
+            async with session.get(url, params={"interval": "1d", "range": "1d"},
+                                   headers={"User-Agent": "Mozilla/5.0"},
+                                   timeout=aiohttp.ClientTimeout(total=6)) as r:
+                body = await r.json()
+            meta = (((body.get("chart") or {}).get("result") or [{}])[0] or {}).get("meta") or {}
+            price = meta.get("regularMarketPrice")
+            if price is not None and float(price) > 0:
+                return meta
+            err = "%s gave no price" % host
+        except Exception as e:
+            err = "%s: %s: %s" % (host, type(e).__name__, e)
+        log.warning("stock %s %s", symbol, err)
+    raise RuntimeError(err or "stock unreachable")
+
+
+def _stock_line(key, meta):
+    _symbol, name, unit = STOCK_INDEXES[key]
+    price = float(meta["regularMarketPrice"])
+    reg = (meta.get("currentTradingPeriod") or {}).get("regular") or {}
+    closed = not (reg.get("start") and reg.get("end")
+                  and reg["start"] <= time.time() <= reg["end"])
+    when = "取引時間中"
+    if closed:
+        when = "終値"
+        mt = meta.get("regularMarketTime")
+        if mt:
+            t = time.gmtime(mt + (meta.get("gmtoffset") or 0))
+            when = "%d月%d日の終値" % (t.tm_mon, t.tm_mday)
+    move = ""
+    prev = meta.get("chartPreviousClose")
+    if prev is not None:
+        d = price - float(prev)
+        if abs(d) < 0.5:
+            move = "、前日とほぼ同じ"
+        else:
+            move = "、前日より%s%s" % (_fmt_points(abs(d), unit),
+                                      "高い" if d > 0 else "安い")
+    return "%s: %s（%s）%s" % (name, _fmt_points(price, unit), when, move)
+
+
+async def _stock_one(session, key):
+    now = time.monotonic()
+    hit = _stock_cache.get(key)
+    if hit and now - hit[0] < STOCK_CACHE_TTL:
+        ts, line = hit
+    else:
+        try:
+            meta = await _stock_yahoo(session, STOCK_INDEXES[key][0])
+            ts, line = now, _stock_line(key, meta)
+            _stock_cache[key] = (ts, line)
+        except Exception as e:
+            log.warning("stock %s unavailable: %s: %s", key, type(e).__name__, e)
+            if hit and now - hit[0] < STOCK_STALE_MAX:
+                ts, line = hit
+            else:
+                return "error: いま%sを調べられませんでした（取得先が応答しません）" % (
+                    STOCK_INDEXES[key][1])
+    age = now - ts
+    stale = " ※%d分前の情報" % int(age / 60) if age > 900 else ""
+    return line + stale
+
+
+async def get_stock_index(session, args, ctx=None) -> str:
+    key = (args or {}).get("index")
+    keys = [key] if key in STOCK_INDEXES else list(STOCK_INDEXES)
+    lines = [await _stock_one(session, k) for k in keys]
+    good = [x for x in lines if not x.startswith("error:")]
+    return "。".join(good) if good else lines[0]
+
+
 SPECS = [{
     "type": "function",
     "function": {
@@ -403,9 +501,27 @@ SPECS = [{
                        "「ドル円いくら？」「円安どうなってる？」など為替の質問に使う。",
         "parameters": {"type": "object", "properties": {}},
     },
+}, {
+    "type": "function",
+    "function": {
+        "name": "get_stock_index",
+        "description": "株価指数を調べる。日経平均（日本株）・ダウ平均・S&P500（米国株）。"
+                       "「日経平均いくら？」「アメリカの株どう？」「株価教えて」など"
+                       "株の質問に使う。指定が無ければ 3 指数まとめて答える。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "index": {"type": "string",
+                          "enum": ["nikkei", "dow", "sp500"],
+                          "description": "nikkei=日経平均、dow=ダウ平均、sp500=S&P500。"
+                                         "省略すると全部"},
+            },
+        },
+    },
 }]
 
-HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy}
+HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy,
+            "get_stock_index": get_stock_index}
 
 
 def specs():

@@ -47,6 +47,9 @@ CASES = [
     ("ボリュームを下げて、二十くらいに。", "self_audio_speaker_set_volume", {"volume": 20}),
     ("いまドル円いくら？", "get_usdjpy", {}),
     ("円安どうなってるか教えて。", "get_usdjpy", {}),
+    ("日経平均いくら？", "get_stock_index", {"index": "nikkei"}),
+    ("アメリカの株はどうなってる？", "get_stock_index", {}),
+    ("今日の株価を教えて。", "get_stock_index", {}),
     ("ありがとう、またね。", None, {}),
 ]
 

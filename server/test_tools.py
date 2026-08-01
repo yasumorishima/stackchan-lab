@@ -130,6 +130,64 @@ async def main():
         (server_tools.RATE_URL_YAHOO, server_tools.RATE_URL_COINBASE,
          server_tools.RATE_URL_DAILY) = real_urls
 
+        # ---- 株価指数 ----
+        # 実際に取りに行く（index 指定なし＝3 指数まとめて）
+        text = await server_tools.call(s, "get_stock_index", {})
+        print("%-28s %s" % ("株価指数を実取得", text))
+        if (text.startswith("error:") or "日経平均株価" not in text
+                or "エスアンドピー500" not in text):
+            ok = False
+
+        # index 指定なら 1 つだけ
+        text = await server_tools.call(s, "get_stock_index", {"index": "nikkei"})
+        print("%-28s %s" % ("日経平均だけ", text))
+        if text.startswith("error:") or "ダウ" in text:
+            ok = False
+
+        # 知らない index は素通しにせず全指数で答える
+        text = await server_tools.call(s, "get_stock_index", {"index": "ぬるぽ"})
+        print("%-28s %s" % ("知らない index は全部", text))
+        if "日経平均株価" not in text:
+            ok = False
+
+        # 取得先が全部死んでいる: 新しいキャッシュがあればそのまま読む
+        real_hosts = server_tools.STOCK_HOSTS
+        server_tools.STOCK_HOSTS = ("127.0.0.1:9",)
+        text = await server_tools.call(s, "get_stock_index", {"index": "nikkei"})
+        print("%-28s %s" % ("死んでいるが直前の値あり", text))
+        if text.startswith("error:") or "分前の情報" in text:
+            ok = False
+
+        # 古い（15分超）キャッシュへ退避したら古さを言う
+        _ts, _line = server_tools._stock_cache["nikkei"]
+        server_tools._stock_cache["nikkei"] = (
+            server_tools.time.monotonic() - 1800, _line)
+        text = await server_tools.call(s, "get_stock_index", {"index": "nikkei"})
+        print("%-28s %s" % ("死んでいるが古い値あり", text))
+        if "分前の情報" not in text:
+            ok = False
+
+        # 古すぎる値は使わない
+        server_tools._stock_cache["nikkei"] = (
+            server_tools.time.monotonic() - server_tools.STOCK_STALE_MAX - 60, _line)
+        text = await server_tools.call(s, "get_stock_index", {"index": "nikkei"})
+        print("%-28s %s" % ("古すぎる値は使わない", text))
+        if "調べられませんでした" not in text:
+            ok = False
+
+        server_tools._stock_cache.clear()
+        server_tools.STOCK_HOSTS = real_hosts
+
+        # 読み上げ書式（通信なし）。.5 は使わない（round は偶数丸め）
+        POINTS = [((64362.02, "円"), "64362円"), ((6300.35, "ポイント"), "6300ポイント"),
+                  ((44901.92, "ドル"), "44902ドル")]
+        for (v, u), want in POINTS:
+            got = server_tools._fmt_points(v, u)
+            mark = "OK" if got == want else "NG"
+            if got != want:
+                ok = False
+            print("%-4s _fmt_points(%s) -> %s (期待 %s)" % (mark, v, got, want))
+
     # 値の門番と読み上げ書式（通信なし）
     SANE = [(147.25, 147.25), (0, None), ("abc", None), (None, None),
             (1e9, None), (49.9, None), (50.0, 50.0)]
