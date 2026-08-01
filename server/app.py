@@ -483,7 +483,13 @@ def _is_hira(ch: str) -> bool:
 _DIGIT_MORA = {"0": 2, "1": 2, "2": 1, "3": 2, "4": 2,
                "5": 1, "6": 2, "7": 3, "8": 3, "9": 2}
 _UNIT_MORA = (0, 2, 2, 2)      # 一 / 十 / 百 / 千（ジュウ・ヒャク・センとも 2）
-_ZEN2HAN = str.maketrans("０１２３４５６７８９．", "0123456789.")
+_ZEN2HAN = str.maketrans(
+    "０１２３４５６７８９．％" + "".join(chr(c) for c in range(0xFF21, 0xFF3B))
+    + "".join(chr(c) for c in range(0xFF41, 0xFF5B)),
+    "0123456789.%" + "".join(chr(c) for c in range(65, 91))
+    + "".join(chr(c) for c in range(97, 123)))
+# 英字 1 文字の読み。既定は 2 モーラ（エー・ビー…）、長いものだけ明記
+_LETTER_MORA = {"h": 3, "r": 3, "w": 4, "x": 3, "z": 3}
 
 
 def _num_mora(s: str) -> int:
@@ -493,6 +499,8 @@ def _num_mora(s: str) -> int:
         head, _, tail = s.partition(".")
         return (_num_mora(head) + 2
                 + sum(_DIGIT_MORA.get(c, 2) for c in tail))
+    if s.startswith("0") and len(s) > 1:
+        return sum(_DIGIT_MORA.get(x, 2) for x in s)   # ゼロゼロナナ
     digits = s.lstrip("0")
     if not digits:
         return 2                       # ゼロ
@@ -535,7 +543,7 @@ def _mora_est(text: str) -> int:
         elif "ぁ" <= c <= "ん" or "ァ" <= c <= "ヶ" or c == "ー":
             total += 1
         elif c.isascii() and c.isalpha():
-            total += 2                 # エー・ビー…は 2 モーラ前後
+            total += _LETTER_MORA.get(c.lower(), 2)
         elif "一" <= c <= "鿕" or c in "々〆":
             total += 2                 # 漢字は音読み 2 モーラを目安
         i += 1

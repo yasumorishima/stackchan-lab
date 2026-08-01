@@ -138,6 +138,21 @@ for _s, _want, _memo in MORA:
     print("%s 数字の読み %s=%d モーラ（%s）"
           % ("OK" if _got == _want else "NG", _s, _got, _memo))
 
+# 見積りが実際より小さいと分割し損ねる。全角と先頭ゼロは実測で読みを確認済み
+# （５０％=13 モーラ / ＬＬＭリクエストは4回です=18 / 007号室です=12）
+SAFE = [
+    ("湿度は５０％です", 13, "全角の％もパーセントと読まれる"),
+    ("ＬＬＭリクエストは4回です", 18, "全角の英字も半角と同じ"),
+    ("007号室です", 12, "先頭ゼロはゼロゼロナナと1桁ずつ"),
+    ("WHOの発表です", 15, "Wはダブリューで4モーラ"),
+]
+for _t, _act, _memo in SAFE:
+    n_split += 1
+    _est = app._mora_est(_t)
+    ng += _est < _act
+    print("%s 見積り %d >= 実際 %d: %s"
+          % ("OK" if _est >= _act else "NG", _est, _act, _memo))
+
 # 全角の数字で落ちない（震度５弱 で KeyError を出した）
 n_split += 1
 _zen, _han = app._mora_est("震度５弱"), app._mora_est("震度5弱")
