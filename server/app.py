@@ -96,6 +96,8 @@ VAD_RMS = float(os.environ.get("VAD_RMS", "500"))
 VAD_SILENCE_MS = float(os.environ.get("VAD_SILENCE_MS", "800"))
 VAD_MIN_SPEECH_MS = float(os.environ.get("VAD_MIN_SPEECH_MS", "300"))
 VAD_MAX_MS = float(os.environ.get("VAD_MAX_MS", "15000"))
+# 受信バッファの絶対上限（フレーム数）。VAD が効かない手動モードの保険
+MAX_BUFFER_FRAMES = int(float(os.environ.get("MAX_BUFFER_MS", "120000")) / 60.0)
 # 読み上げが本体で鳴り終わるまでの余裕。短いと自分の声を拾って再認識する
 SPEAK_TAIL_SEC = float(os.environ.get("SPEAK_TAIL_SEC", "0.8"))
 
@@ -107,6 +109,33 @@ def frame_rms(pcm: bytes) -> float:
         return 0.0
     vals = struct.unpack("<%dh" % n, pcm[:n * 2])
     return math.sqrt(sum(v * v for v in vals) / n)
+
+
+def vad_step(state, ms: float, rms: float) -> bool:
+    """1 フレームぶん VAD を進め、発話（または掃き出し）の切れ目なら True。
+
+    無音しか来ていなくても buffered_ms は必ず進めて上限で切る。以前は
+    speech_ms が 0 の間はどのカウンタも進まず、mode:auto の実機が環境音を
+    流し続けると受信バッファが際限なく育った（2026-08-01 に RAM 7GB 超で
+    OOM kill ×2 の実測。溜まった数十分の音声が次の発話で一括 STT に回り、
+    リサンプルの int 列展開で数十倍に膨れる）。
+    """
+    state["buffered_ms"] += ms
+    if rms > state["max_rms"]:
+        state["max_rms"] = rms
+    if rms >= VAD_RMS:
+        state["speech_ms"] += ms
+        state["silence_ms"] = 0.0
+    elif state["speech_ms"] > 0.0:
+        state["silence_ms"] += ms
+    if (state["speech_ms"] >= VAD_MIN_SPEECH_MS
+            and state["silence_ms"] >= VAD_SILENCE_MS):
+        return True
+    if state["speech_ms"] <= 0.0:
+        # 声がまだ無い。上限に達したら掃き出す（呼び出し側が捨てて聞き直す）。
+        # 上限の直前に話し始めた場合はこの枝に入らず、発話として続きを録る
+        return state["buffered_ms"] >= VAD_MAX_MS
+    return state["speech_ms"] + state["silence_ms"] >= VAD_MAX_MS
 
 SAKURA_BASE = os.environ.get("SAKURA_BASE", "https://api.ai.sakura.ad.jp")
 SAKURA_TOKEN = os.environ.get("SAKURA_TOKEN", "")
@@ -690,13 +719,16 @@ async def ota_handler(request: web.Request):
 
 # ---- WebSocket ---------------------------------------------------------
 async def ws_handler(request: web.Request):
-    ws = web.WebSocketResponse(heartbeat=30, max_msg_size=0)
+    # compress=False: 組込みの WebSocket クライアントと permessage-deflate の
+    # 折衝が食い違うと受信フレームを取り落とすため、圧縮は使わない
+    ws = web.WebSocketResponse(heartbeat=30, max_msg_size=0, compress=False)
     await ws.prepare(request)
     session: aiohttp.ClientSession = request.app["http"]
 
     device_id = request.headers.get("Device-Id", "?")
     session_id = uuid.uuid4().hex[:16]
-    log.info("WS connected device=%s session=%s", device_id, session_id)
+    peer = request.transport.get_extra_info("peername") if request.transport else None
+    log.info("WS connected device=%s session=%s peer=%s", device_id, session_id, peer)
 
     decoder = opus_codec.Decoder(UP_RATE, 1)
     encoder = opus_codec.Encoder(DOWN_RATE, 1, FRAME_MS)
@@ -875,6 +907,7 @@ async def ws_handler(request: web.Request):
         state["auto"] = auto
         state["speech_ms"] = 0.0
         state["silence_ms"] = 0.0
+        state["buffered_ms"] = 0.0
         state["max_rms"] = 0.0
         pcm_chunks.clear()
         state["stream"] = (local_stt.VoskStream(UP_RATE)
@@ -882,19 +915,8 @@ async def ws_handler(request: web.Request):
 
     def vad_should_finish(chunk: bytes) -> bool:
         """無音が続いたら発話の切れ目とみなす。長すぎる時も打ち切る。"""
-        ms = len(chunk) / 2 / UP_RATE * 1000.0
-        rms = frame_rms(chunk)
-        if rms > state["max_rms"]:
-            state["max_rms"] = rms
-        if rms >= VAD_RMS:
-            state["speech_ms"] += ms
-            state["silence_ms"] = 0.0
-        elif state["speech_ms"] > 0.0:
-            state["silence_ms"] += ms
-        if (state["speech_ms"] >= VAD_MIN_SPEECH_MS
-                and state["silence_ms"] >= VAD_SILENCE_MS):
-            return True
-        return state["speech_ms"] + state["silence_ms"] >= VAD_MAX_MS
+        return vad_step(state, len(chunk) / 2 / UP_RATE * 1000.0,
+                        frame_rms(chunk))
 
     def finish_listening():
         state["listening"] = False
@@ -905,6 +927,12 @@ async def ws_handler(request: web.Request):
         pcm_chunks.clear()
         stream = state["stream"]
         state["stream"] = None
+        if state["auto"] and state["speech_ms"] < VAD_MIN_SPEECH_MS:
+            # 声が無い（か短すぎる）まま上限で掃き出しただけ。STT に回さず
+            # そのまま聞き直す。abort と同じくストリームは捨てるだけでよい
+            log.info("無音バッファ %.1f 秒を捨てて聞き直す", len(pcm) / 2 / UP_RATE)
+            start_listening(True)
+            return
         prev = state["task"]
         if prev is not None and not prev.done():
             log.info("前の発話を処理中なので中断する")
@@ -931,6 +959,10 @@ async def ws_handler(request: web.Request):
                     try:
                         chunk = decoder.decode(msg.data)
                         pcm_chunks.append(chunk)
+                        if len(pcm_chunks) > MAX_BUFFER_FRAMES:
+                            # 手動モードで stop が来ない異常系の保険。VAD 経路は
+                            # ここに届く前に掃き出すので、通常は発動しない
+                            del pcm_chunks[0]
                         if state["stream"] is not None:
                             await state["stream"].feed(chunk)
                     except Exception:
