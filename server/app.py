@@ -100,6 +100,34 @@ VAD_MAX_MS = float(os.environ.get("VAD_MAX_MS", "15000"))
 MAX_BUFFER_FRAMES = int(float(os.environ.get("MAX_BUFFER_MS", "120000")) / 60.0)
 # 読み上げが本体で鳴り終わるまでの余裕。短いと自分の声を拾って再認識する
 SPEAK_TAIL_SEC = float(os.environ.get("SPEAK_TAIL_SEC", "0.8"))
+# こちらが話した直後なら相槌にも返事をする猶予 [s]
+FILLER_FOLLOWUP_SEC = float(os.environ.get("FILLER_FOLLOWUP_SEC", "15"))
+
+# 環境音や独り言を sherpa が書き起こしがちな相槌。単体では話しかけと見なさない
+FILLER_WORDS = frozenset((
+    "うん", "ううん", "うーん", "んー", "はい", "はあ", "はぁ", "ええ", "えー",
+    "ええと", "えっと", "あー", "ああ", "あっ", "えっ", "おっ", "おお", "ふう",
+    "ふぅ", "ふん", "へえ", "へー", "ほう", "そう", "よし", "よいしょ",
+    "どっこいしょ", "あれ", "おっと",
+))
+_FILLER_PUNCT = re.compile(r"[、。！？!?.,・…〜\s]+")
+
+
+def worth_answering(text: str, last_spoke_age: float) -> bool:
+    """認識結果に返事をすべきか。
+
+    実機のマイクは常時開いていて、環境音や独り言が「うん」「はあ」のような
+    相槌として書き起こされる。それに毎回返答すると、話しかけていないのに
+    勝手に喋り出してうるさい（2026-08-01 user 指摘。実ログでは rms 627〜3083 の
+    生活音が「うん」「あっ」になり、その都度おしゃべりな返事をしていた）。
+    こちらが話した直後の相槌は会話の返事なので通す。
+    """
+    t = _FILLER_PUNCT.sub("", text or "")
+    if not t:
+        return False
+    if last_spoke_age <= FILLER_FOLLOWUP_SEC:
+        return True
+    return t not in FILLER_WORDS and len(t) > 1
 
 
 def frame_rms(pcm: bytes) -> float:
@@ -744,7 +772,7 @@ async def ws_handler(request: web.Request):
         log.info("restored %d messages of history for %s", len(history), device_id)
     state = {"listening": False, "hello_done": False, "history": history,
              "stream": None, "mcp": None, "mcp_task": None, "task": None,
-             "hello_task": None, "auto": False,
+             "hello_task": None, "auto": False, "last_spoke": 0.0,
              "speech_ms": 0.0, "silence_ms": 0.0, "max_rms": 0.0}
 
     async def send_json(obj):
@@ -864,6 +892,11 @@ async def ws_handler(request: web.Request):
             else:
                 text = await transcribe(session, pcm)
             log.info("STT: %s", text)
+            age = time.monotonic() - state["last_spoke"]
+            if not worth_answering(text, age):
+                log.info("相槌・空認識には返答しない（前回の発話から %.0f 秒）: %r",
+                         age, text)
+                return
             await send_json({"type": "stt", "text": text})
             state["history"] = trim_history(state["history"] + [stamped_user(text)])
             mcp = state["mcp"]
@@ -895,6 +928,7 @@ async def ws_handler(request: web.Request):
             log.info("LLM: %s", reply)
             await send_json({"type": "llm", "emotion": "happy", "text": "😀"})
             await speak(reply)
+            state["last_spoke"] = time.monotonic()
         except asyncio.CancelledError:
             raise
         except Exception as e:
