@@ -13,6 +13,7 @@ import time
 import aiohttp
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import app  # noqa: E402
 import server_tools  # noqa: E402
 
 BASE = os.environ.get("SAKURA_BASE", "http://127.0.0.1:11434")
@@ -34,8 +35,8 @@ DEVICE_TOOL = {
 
 TOOLS = list(server_tools.specs()) + [DEVICE_TOOL]
 
-SYSTEM = ("あなたはスタックちゃんという小さな卓上ロボットです。短く親しみやすく話します。"
-          "現在時刻は %s です。" % time.strftime("%Y-%m-%d %H:%M"))
+# 本番と同じシステム文で測る（別の文で測ると、プロンプトを変えた影響が出ない）
+SYSTEM = app.system_prompt()
 
 # (発話, 期待するツール名 or None, 期待する引数の部分一致)
 CASES = [

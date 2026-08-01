@@ -832,6 +832,13 @@ NUM_SPACE_RE = re.compile(r"(?<=\d)" + _SP + r"+(?=\d)")
 JA_SPACE_RE = re.compile("(?<=[0-9A-Za-z])" + _SP + "+(?=[" + _JA + "])")
 # 綴りのままでは 1 文字ずつ読まれて聞き取れない語だけ読みを指定する
 # （実測 Engine -> イーエヌジーアイエヌイー）
+# 接客の決まり文句は卓上ロボットの喋り方として不自然（実機 2026-08-02 の
+# 「残りは約2989回です！ご利用ありがとうございます」）。システム文で禁じると
+# ツール選択が落ちるため（実測 25〜26/27 → 23/27 が 2 回）code 側で落とす
+CLOSERS = ("ご利用ありがとうございます", "ご利用ありがとうございました",
+           "またのご利用をお待ちしております", "お役に立てれば幸いです",
+           "お役に立てて嬉しいです")
+CLOSER_RE = re.compile("(?:" + "|".join(CLOSERS) + r")[。．！？!?]?")
 READ_AS = [
     ("AI Engine", "エーアイエンジン"),
     ("Open JTalk", "オープンジェイトーク"),
@@ -850,6 +857,7 @@ def fix_reading(text: str) -> str:
         pat = ("(?:(?<=[" + _JA + r"])\s+)?" + body
                + r"(?:\s+(?=[" + _JA + "]))?")
         text = re.sub(pat, kana, text, flags=re.IGNORECASE)
+    text = CLOSER_RE.sub("", text)
     text = NUM_SPACE_RE.sub("", text)
     return JA_SPACE_RE.sub("", text)
 
