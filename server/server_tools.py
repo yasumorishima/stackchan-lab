@@ -525,6 +525,109 @@ async def get_llm_quota(session, args, ctx=None) -> str:
             "正確な値はコントロールパネルの利用量が正です。" % (used, SAKURA_QUOTA, left))
 
 
+# ---- 暗号資産（ビットコイン/イーサリアム） ---------------------------------
+# 主は CoinGecko（キー不要・1 回で両方 + 24時間変動率）。予備は Yahoo Finance の
+# BTC-JPY / ETH-JPY（_stock_yahoo を再利用。2026-08-01 の三点照合で CoinGecko と
+# 一致）。Coinbase の spot は使わない（同日の照合で BTC-JPY が実勢の 3.6 倍の
+# 異常値。為替でも板由来のずれを観測済みで、円建て暗号資産はさらに信用できない）。
+CRYPTO_COINS = {
+    "btc": ("bitcoin", "BTC-JPY", "ビットコイン"),
+    "eth": ("ethereum", "ETH-JPY", "イーサリアム"),
+}
+CRYPTO_URL_GECKO = "https://api.coingecko.com/api/v3/simple/price"
+# 取得先の障害で桁違いが来ても読まないための門番（円）
+CRYPTO_SANE = {"btc": (1e5, 1e10), "eth": (1e3, 1e9)}
+CRYPTO_CACHE_TTL = float(os.environ.get("CRYPTO_CACHE_TTL", "300"))
+CRYPTO_STALE_MAX = float(os.environ.get("CRYPTO_STALE_MAX", "21600"))
+
+_crypto_cache = {}   # coin キー -> (取得時刻 monotonic, 読み上げ文)
+
+
+def _fmt_jpy_about(v) -> str:
+    """9911652 -> 「991万円」。読み上げ用の丸め（1 円単位まで読まない）。"""
+    v = float(v)
+    if v >= 1e8:
+        return "%.1f億円" % (v / 1e8)
+    if v >= 1e4:
+        return "%d万円" % round(v / 1e4)
+    return "%d円" % round(v)
+
+
+def _crypto_line(key, price, change_pct) -> str:
+    name = CRYPTO_COINS[key][2]
+    lo, hi = CRYPTO_SANE[key]
+    price = float(price)
+    if not lo <= price <= hi:
+        raise RuntimeError("insane %s price: %r" % (key, price))
+    move = ""
+    if change_pct is not None:
+        pct = round(float(change_pct))
+        if abs(float(change_pct)) < 0.5:
+            move = "、前日からほぼ横ばい"
+        else:
+            move = "、前日から%d%%%s" % (abs(pct), "高い" if pct > 0 else "安い")
+    return "%s: およそ%s%s" % (name, _fmt_jpy_about(price), move)
+
+
+async def _crypto_gecko(session) -> dict:
+    """両コインぶんの読み上げ文を一度に作る。"""
+    ids = ",".join(v[0] for v in CRYPTO_COINS.values())
+    async with session.get(CRYPTO_URL_GECKO,
+                           params={"ids": ids, "vs_currencies": "jpy",
+                                   "include_24hr_change": "true"},
+                           timeout=aiohttp.ClientTimeout(total=8)) as r:
+        body = await r.json()
+    out = {}
+    for key, (gid, _sym, _name) in CRYPTO_COINS.items():
+        d = body.get(gid) or {}
+        if d.get("jpy") is not None:
+            out[key] = _crypto_line(key, d["jpy"], d.get("jpy_24h_change"))
+    if not out:
+        raise RuntimeError("coingecko gave no price")
+    return out
+
+
+async def _crypto_one(session, key) -> str:
+    now = time.monotonic()
+    hit = _crypto_cache.get(key)
+    if hit and now - hit[0] < CRYPTO_CACHE_TTL:
+        ts, line = hit
+    else:
+        line = None
+        try:
+            for k, ln in (await _crypto_gecko(session)).items():
+                _crypto_cache[k] = (now, ln)
+            ts, line = _crypto_cache[key]
+        except Exception as e:
+            log.warning("crypto gecko failed: %s: %s", type(e).__name__, e)
+        if line is None:
+            try:
+                meta = await _stock_yahoo(session, CRYPTO_COINS[key][1])
+                price = float(meta["regularMarketPrice"])
+                prev = meta.get("chartPreviousClose")
+                pct = (price / float(prev) - 1) * 100 if prev else None
+                ts, line = now, _crypto_line(key, price, pct)
+                _crypto_cache[key] = (ts, line)
+            except Exception as e:
+                log.warning("crypto %s unavailable: %s: %s", key, type(e).__name__, e)
+                if hit and now - hit[0] < CRYPTO_STALE_MAX:
+                    ts, line = hit
+                else:
+                    return "error: いま%sの価格を調べられませんでした（取得先が応答しません）" % (
+                        CRYPTO_COINS[key][2])
+    age = now - ts
+    stale = " ※%d分前の情報" % int(age / 60) if age > 900 else ""
+    return line + stale
+
+
+async def get_crypto(session, args, ctx=None) -> str:
+    key = (args or {}).get("coin")
+    keys = [key] if key in CRYPTO_COINS else list(CRYPTO_COINS)
+    lines = [await _crypto_one(session, k) for k in keys]
+    good = [x for x in lines if not x.startswith("error:")]
+    return "。".join(good) if good else lines[0]
+
+
 SPECS = [{
     "type": "function",
     "function": {
@@ -576,11 +679,28 @@ SPECS = [{
                        "「API あと何回使える？」など利用量の質問に使う。",
         "parameters": {"type": "object", "properties": {}},
     },
+}, {
+    "type": "function",
+    "function": {
+        "name": "get_crypto",
+        "description": "ビットコイン（BTC）とイーサリアム（ETH）のいまの価格を日本円で調べる。"
+                       "「ビットコインいくら？」「イーサリアムの値段は？」「仮想通貨どう？」"
+                       "など暗号資産の質問に使う。指定が無ければ両方まとめて答える。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "coin": {"type": "string",
+                         "enum": ["btc", "eth"],
+                         "description": "btc=ビットコイン、eth=イーサリアム。省略すると両方"},
+            },
+        },
+    },
 }]
 
 HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy,
             "get_stock_index": get_stock_index,
-            "get_llm_quota": get_llm_quota}
+            "get_llm_quota": get_llm_quota,
+            "get_crypto": get_crypto}
 
 
 def specs():

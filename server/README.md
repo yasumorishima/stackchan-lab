@@ -34,12 +34,13 @@ LLM には本体のツールとサーバー側のツールを 1 つの配列に�
 呼ばれた名前で振り分けます（`app.py` の `call_tool`）。
 
 - 本体側（MCP 経由）: 機体の操作。ファーム 1.4.4 では `self.audio_speaker.set_volume`
-- サーバー側: `get_weather`（場所・今 / 今日 / 明日 / 明後日）/ `get_usdjpy`（ドル円レート）/ `get_stock_index`（日経平均・ダウ・S&P500）/ `get_llm_quota`（さくら無料枠の使用回数と残り）
+- サーバー側: `get_weather`（場所・今 / 今日 / 明日 / 明後日）/ `get_usdjpy`（ドル円レート）/ `get_stock_index`（日経平均・ダウ・S&P500）/ `get_llm_quota`（さくら無料枠の使用回数と残り）/ `get_crypto`（ビットコイン・イーサリアムの円建て価格）
 
 天気の取得先は Open-Meteo です（API キー不要）。地名は同梱の表で引きます。
 ドル円は Yahoo Finance → Coinbase → open.er-api.com の順で引きます（すべてキー不要・無料）。
 株価指数は同じ Yahoo Finance の chart API で引きます（query1 → query2 のホスト冗長 + 6 時間の stale cache）。取引時間外は「◯月◯日の終値」と断って読み上げます。
 無料枠の残りは、利用量 API が無い（/v1/usage 等は 404・応答ヘッダにも情報なし）ため、このサーバーから送った成功リクエストを月次で自前カウントして答えます（サーバー外の消費は数えられない旨も読み上げます）。
+暗号資産は CoinGecko（1 回で両方 + 24時間変動率）→ Yahoo Finance の順で引きます。Coinbase の spot は BTC-JPY が実勢の 3.6 倍の異常値を返した実測があるため使いません。
 Open-Meteo の geocoding は日本語名を引けない（「札幌」は 0 件、"Sapporo" なら当たる）ため、
 ローマ字で引いて返ってきた日本語名と座標を `gen_places.py` で表に落としてあります。
 

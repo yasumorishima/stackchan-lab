@@ -207,6 +207,68 @@ async def main():
                 ok = False
         server_tools.USAGE_PATH = real_usage
 
+        # ---- 暗号資産 ----
+        # 実際に取りに行く（指定なし＝BTC/ETH 両方）
+        text = await server_tools.call(s, "get_crypto", {})
+        print("%-28s %s" % ("暗号資産を実取得", text))
+        if (text.startswith("error:") or "ビットコイン" not in text
+                or "イーサリアム" not in text):
+            ok = False
+
+        # coin 指定なら 1 つだけ
+        text = await server_tools.call(s, "get_crypto", {"coin": "btc"})
+        print("%-28s %s" % ("ビットコインだけ", text))
+        if text.startswith("error:") or "イーサリアム" in text:
+            ok = False
+
+        # 取得先が全部死んでいる: 新しいキャッシュがあればそのまま読む
+        real_gecko = server_tools.CRYPTO_URL_GECKO
+        real_hosts2 = server_tools.STOCK_HOSTS
+        server_tools.CRYPTO_URL_GECKO = "http://127.0.0.1:9/price"
+        server_tools.STOCK_HOSTS = ("127.0.0.1:9",)
+        text = await server_tools.call(s, "get_crypto", {"coin": "btc"})
+        print("%-28s %s" % ("死んでいるが直前の値あり", text))
+        if text.startswith("error:") or "分前の情報" in text:
+            ok = False
+
+        # 古い（15分超）キャッシュへ退避したら古さを言う
+        _ts, _line = server_tools._crypto_cache["btc"]
+        server_tools._crypto_cache["btc"] = (
+            server_tools.time.monotonic() - 1800, _line)
+        text = await server_tools.call(s, "get_crypto", {"coin": "btc"})
+        print("%-28s %s" % ("死んでいるが古い値あり", text))
+        if "分前の情報" not in text:
+            ok = False
+
+        # 古すぎる値は使わない
+        server_tools._crypto_cache["btc"] = (
+            server_tools.time.monotonic() - server_tools.CRYPTO_STALE_MAX - 60, _line)
+        text = await server_tools.call(s, "get_crypto", {"coin": "btc"})
+        print("%-28s %s" % ("古すぎる値は使わない", text))
+        if "調べられませんでした" not in text:
+            ok = False
+
+        server_tools._crypto_cache.clear()
+        server_tools.CRYPTO_URL_GECKO = real_gecko
+        server_tools.STOCK_HOSTS = real_hosts2
+
+        # 読み上げ書式と門番（通信なし）
+        JPY = [(9911652, "991万円"), (294099, "29万円"), (123456789, "1.2億円"),
+               (9800, "9800円")]
+        for v, want in JPY:
+            got = server_tools._fmt_jpy_about(v)
+            mark = "OK" if got == want else "NG"
+            if got != want:
+                ok = False
+            print("%-4s _fmt_jpy_about(%s) -> %s (期待 %s)" % (mark, v, got, want))
+        try:
+            server_tools._crypto_line("btc", 35600000 * 1000, None)
+            print("NG   桁違いの値を読んでしまう")
+            ok = False
+        except RuntimeError:
+            print("OK   桁違いの値は読まない")
+
+
 
         # 読み上げ書式（通信なし）。.5 は使わない（round は偶数丸め）
         POINTS = [((64362.02, "円"), "64362円"), ((6300.35, "ポイント"), "6300ポイント"),
