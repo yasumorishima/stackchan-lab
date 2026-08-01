@@ -34,7 +34,7 @@ LLM には本体のツールとサーバー側のツールを 1 つの配列に�
 呼ばれた名前で振り分けます（`app.py` の `call_tool`）。
 
 - 本体側（MCP 経由）: 機体の操作。ファーム 1.4.4 では `self.audio_speaker.set_volume`
-- サーバー側: `get_weather`（場所・今 / 今日 / 明日 / 明後日）/ `get_usdjpy`（ドル円レート）/ `get_stock_index`（日経平均・ダウ・S&P500）/ `get_llm_quota`（さくら無料枠の使用回数と残り）/ `get_crypto`（ビットコイン・イーサリアムの円建て価格）
+- サーバー側: `get_weather`（場所・今 / 今日 / 明日 / 明後日）/ `get_usdjpy`（ドル円レート）/ `get_stock_index`（日経平均・ダウ・S&P500）/ `get_llm_quota`（さくら無料枠の使用回数と残り）/ `get_crypto`（ビットコイン・イーサリアムの円建て価格）/ `get_news`（NHK RSS の主要見出し）/ `get_quake`（気象庁の地震情報）/ `get_warning`（気象庁の警報・注意報、既定は神奈川県）
 
 天気の取得先は Open-Meteo です（API キー不要）。地名は同梱の表で引きます。
 ドル円は Yahoo Finance → Coinbase → open.er-api.com の順で引きます（すべてキー不要・無料）。

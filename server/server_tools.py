@@ -15,6 +15,7 @@ import logging
 import os
 import time
 import urllib.parse
+import xml.etree.ElementTree as ET
 
 import aiohttp
 
@@ -628,6 +629,181 @@ async def get_crypto(session, args, ctx=None) -> str:
     return "。".join(good) if good else lines[0]
 
 
+# ---- ニュース（NHK RSS） ----------------------------------------------------
+# NHK の公開 RSS（cat0 = 主要ニュース）。リダイレクトされるので追従が必要
+# （aiohttp は既定で追従）。応答整形が 2 文で切るため、見出しは読点で繋いだ
+# 一文にして返す。
+NEWS_URL = os.environ.get("NEWS_URL", "https://www.nhk.or.jp/rss/news/cat0.xml")
+NEWS_COUNT = int(os.environ.get("NEWS_COUNT", "3"))
+NEWS_CACHE_TTL = float(os.environ.get("NEWS_CACHE_TTL", "600"))
+NEWS_STALE_MAX = float(os.environ.get("NEWS_STALE_MAX", "21600"))
+
+_news_cache = []   # [(取得時刻 monotonic, [見出し])] を 1 件だけ
+
+
+async def _news_fetch(session):
+    async with session.get(NEWS_URL, headers={"User-Agent": "Mozilla/5.0"},
+                           timeout=aiohttp.ClientTimeout(total=10)) as r:
+        raw = await r.read()
+    root = ET.fromstring(raw)
+    titles = [t.text.strip() for t in root.iter("title") if t.text and t.text.strip()]
+    titles = titles[1:]   # 先頭はチャンネル名
+    if not titles:
+        raise RuntimeError("no news items")
+    return titles
+
+
+async def get_news(session, args, ctx=None) -> str:
+    now = time.monotonic()
+    if _news_cache and now - _news_cache[0][0] < NEWS_CACHE_TTL:
+        ts, titles = _news_cache[0]
+    else:
+        try:
+            titles = await _news_fetch(session)
+            ts = now
+            _news_cache[:] = [(ts, titles)]
+        except Exception as e:
+            log.warning("news unavailable: %s: %s", type(e).__name__, e)
+            if _news_cache and now - _news_cache[0][0] < NEWS_STALE_MAX:
+                ts, titles = _news_cache[0]
+            else:
+                return "error: いまニュースを取れませんでした（取得先が応答しません）"
+    age = now - ts
+    stale = " ※%d分前の情報" % int(age / 60) if age > 900 else ""
+    return "主なニュースは、" + "、".join(titles[:NEWS_COUNT]) + "、以上です。" + stale
+
+
+# ---- 地震情報（気象庁） ------------------------------------------------------
+# 気象庁の公開 JSON（bosai/quake）。新しい順に並んでいる。maxi が空の報は
+# 震源情報のみ（震度なし）なので飛ばす。
+QUAKE_URL = os.environ.get(
+    "QUAKE_URL", "https://www.jma.go.jp/bosai/quake/data/list.json")
+QUAKE_CACHE_TTL = float(os.environ.get("QUAKE_CACHE_TTL", "300"))
+QUAKE_STALE_MAX = float(os.environ.get("QUAKE_STALE_MAX", "21600"))
+
+_quake_cache = []   # [(取得時刻 monotonic, body)] を 1 件だけ
+_INT_LABEL = {"5-": "5弱", "5+": "5強", "6-": "6弱", "6+": "6強"}
+
+
+def _fmt_quake_time(at_iso: str, now=None) -> str:
+    d = datetime.datetime.fromisoformat(at_iso).astimezone(JST)
+    now = now or datetime.datetime.now(JST)
+    if d.date() == now.date():
+        day = "きょう"
+    elif d.date() == now.date() - datetime.timedelta(days=1):
+        day = "きのう"
+    else:
+        day = "%d月%d日" % (d.month, d.day)
+    return "%s%d時%d分ごろ" % (day, d.hour, d.minute)
+
+
+def _quake_line(quakes, now=None) -> str:
+    q = quakes[0]
+    shindo = _INT_LABEL.get(q["maxi"], q["maxi"])
+    mag = q.get("mag")
+    mtxt = "マグニチュード%s、" % mag if mag and "不明" not in str(mag) else ""
+    line = "%s、%sで%s最大震度%sの地震がありました" % (
+        _fmt_quake_time(q["at"], now), q.get("anm") or "震源不明", mtxt, shindo)
+    day_ago = (now or datetime.datetime.now(JST)) - datetime.timedelta(days=1)
+    recent = {x["eid"] for x in quakes
+              if datetime.datetime.fromisoformat(x["at"]) >= day_ago}
+    if len(recent) >= 2:
+        line += "。この24時間では震度1以上の地震が%d回起きています" % len(recent)
+    return line
+
+
+async def get_quake(session, args, ctx=None) -> str:
+    now = time.monotonic()
+    if _quake_cache and now - _quake_cache[0][0] < QUAKE_CACHE_TTL:
+        ts, body = _quake_cache[0]
+    else:
+        try:
+            async with session.get(QUAKE_URL,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+                body = await r.json()
+            if not isinstance(body, list):
+                raise RuntimeError("unexpected quake payload")
+            ts = now
+            _quake_cache[:] = [(ts, body)]
+        except Exception as e:
+            log.warning("quake unavailable: %s: %s", type(e).__name__, e)
+            if _quake_cache and now - _quake_cache[0][0] < QUAKE_STALE_MAX:
+                ts, body = _quake_cache[0]
+            else:
+                return "error: いま地震情報を取れませんでした（取得先が応答しません）"
+    age = now - ts
+    stale = " ※%d分前の情報" % int(age / 60) if age > 900 else ""
+    quakes = [q for q in body if q.get("maxi") and q.get("at")]
+    if not quakes:
+        return "最近の震度のついた地震情報は見つかりませんでした" + stale
+    return _quake_line(quakes) + stale
+
+
+# ---- 気象の警報・注意報（気象庁） --------------------------------------------
+# 気象庁の公開 JSON（bosai/warning）。都道府県単位で取り、status が
+# 「発表」「継続」のものだけを有効とみなす。コード表は気象庁 XML の標準表。
+WARNING_URL_BASE = "https://www.jma.go.jp/bosai/warning/data/warning/"
+WARNING_AREA_CODE = os.environ.get("WARNING_AREA_CODE", "140000")
+WARNING_AREA_NAME = os.environ.get("WARNING_AREA_NAME", "神奈川県")
+WARNING_CACHE_TTL = float(os.environ.get("WARNING_CACHE_TTL", "300"))
+WARNING_STALE_MAX = float(os.environ.get("WARNING_STALE_MAX", "21600"))
+
+_warning_cache = []   # [(取得時刻 monotonic, body)] を 1 件だけ
+
+# 重い順（読み上げ順にもなる）
+_WARNING_NAMES = {
+    "33": "大雨特別警報", "35": "暴風特別警報", "32": "暴風雪特別警報",
+    "36": "大雪特別警報", "37": "波浪特別警報", "38": "高潮特別警報",
+    "03": "大雨警報", "04": "洪水警報", "05": "暴風警報", "02": "暴風雪警報",
+    "06": "大雪警報", "07": "波浪警報", "08": "高潮警報",
+    "10": "大雨注意報", "18": "洪水注意報", "15": "強風注意報", "13": "風雪注意報",
+    "14": "雷注意報", "12": "大雪注意報", "16": "波浪注意報", "19": "高潮注意報",
+    "20": "濃霧注意報", "21": "乾燥注意報", "22": "なだれ注意報", "23": "低温注意報",
+    "24": "霜注意報", "17": "融雪注意報", "25": "着氷注意報", "26": "着雪注意報",
+}
+
+
+def _active_warnings(body) -> list:
+    codes = set()
+    for at in body.get("areaTypes") or []:
+        for area in at.get("areas") or []:
+            for w in area.get("warnings") or []:
+                if w.get("status") in ("発表", "継続") and w.get("code"):
+                    codes.add(str(w["code"]))
+    unknown = codes - set(_WARNING_NAMES)
+    if unknown:
+        log.warning("unknown warning codes: %s", sorted(unknown))
+    return [name for code, name in _WARNING_NAMES.items() if code in codes]
+
+
+async def get_warning(session, args, ctx=None) -> str:
+    now = time.monotonic()
+    if _warning_cache and now - _warning_cache[0][0] < WARNING_CACHE_TTL:
+        ts, body = _warning_cache[0]
+    else:
+        try:
+            url = WARNING_URL_BASE + WARNING_AREA_CODE + ".json"
+            async with session.get(url,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+                body = await r.json()
+            if not isinstance(body, dict):
+                raise RuntimeError("unexpected warning payload")
+            ts = now
+            _warning_cache[:] = [(ts, body)]
+        except Exception as e:
+            log.warning("warning unavailable: %s: %s", type(e).__name__, e)
+            if _warning_cache and now - _warning_cache[0][0] < WARNING_STALE_MAX:
+                ts, body = _warning_cache[0]
+            else:
+                return "error: いま警報・注意報の情報を取れませんでした（取得先が応答しません）"
+    age = now - ts
+    stale = " ※%d分前の情報" % int(age / 60) if age > 900 else ""
+    names = _active_warnings(body)
+    if not names:
+        return "いま%sに警報・注意報は出ていません" % WARNING_AREA_NAME + stale
+    return "%sに%sが出ています" % (WARNING_AREA_NAME, "、".join(names)) + stale
+
+
 SPECS = [{
     "type": "function",
     "function": {
@@ -695,12 +871,40 @@ SPECS = [{
             },
         },
     },
+}, {
+    "type": "function",
+    "function": {
+        "name": "get_news",
+        "description": "きょうの主なニュースの見出しを調べる。「ニュース教えて」"
+                       "「何かニュースあった？」などに使う。",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}, {
+    "type": "function",
+    "function": {
+        "name": "get_quake",
+        "description": "最近あった地震（いつ・どこ・マグニチュード・最大震度）を調べる。"
+                       "「さっき地震あった？」「揺れたのどこ？」「地震どうなってる？」"
+                       "などに使う。",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}, {
+    "type": "function",
+    "function": {
+        "name": "get_warning",
+        "description": "気象の警報・注意報が出ているか調べる（対象は神奈川県）。"
+                       "「警報出てる？」「大雨警報は？」「注意報ある？」などに使う。",
+        "parameters": {"type": "object", "properties": {}},
+    },
 }]
 
 HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy,
             "get_stock_index": get_stock_index,
             "get_llm_quota": get_llm_quota,
-            "get_crypto": get_crypto}
+            "get_crypto": get_crypto,
+            "get_news": get_news,
+            "get_quake": get_quake,
+            "get_warning": get_warning}
 
 
 def specs():

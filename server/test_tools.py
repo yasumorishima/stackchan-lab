@@ -252,6 +252,69 @@ async def main():
         server_tools.CRYPTO_URL_GECKO = real_gecko
         server_tools.STOCK_HOSTS = real_hosts2
 
+        # ---- ニュース・地震・警報 ----
+        text = await server_tools.call(s, "get_news", {})
+        print("%-28s %s" % ("ニュースを実取得", text[:80]))
+        if text.startswith("error:") or "主なニュース" not in text:
+            ok = False
+
+        # 取得先が死んでいる: 新しいキャッシュがあればそのまま読む
+        real_news = server_tools.NEWS_URL
+        server_tools.NEWS_URL = "http://127.0.0.1:9/rss"
+        text = await server_tools.call(s, "get_news", {})
+        print("%-28s %s" % ("死んでいるが直前の値あり", text[:60]))
+        if text.startswith("error:"):
+            ok = False
+        # 古すぎる値は使わない
+        server_tools._news_cache[:] = [(
+            server_tools.time.monotonic() - server_tools.NEWS_STALE_MAX - 60,
+            ["古い見出し"])]
+        text = await server_tools.call(s, "get_news", {})
+        print("%-28s %s" % ("古すぎる値は使わない", text))
+        if "取れませんでした" not in text:
+            ok = False
+        server_tools._news_cache.clear()
+        server_tools.NEWS_URL = real_news
+
+        text = await server_tools.call(s, "get_quake", {})
+        print("%-28s %s" % ("地震情報を実取得", text))
+        if text.startswith("error:") or "震" not in text:
+            ok = False
+
+        text = await server_tools.call(s, "get_warning", {})
+        print("%-28s %s" % ("警報・注意報を実取得", text))
+        if text.startswith("error:") or "神奈川県" not in text:
+            ok = False
+
+        # 通信なしの単体（時刻の読み・震度表記・警報の有効判定）
+        import datetime as _dt
+        _now = _dt.datetime(2026, 8, 1, 15, 0, tzinfo=server_tools.JST)
+        FQT = [("2026-08-01T13:00:00+09:00", "きょう13時0分ごろ"),
+               ("2026-07-31T23:59:00+09:00", "きのう23時59分ごろ"),
+               ("2026-07-20T01:05:00+09:00", "7月20日1時5分ごろ")]
+        for iso, want in FQT:
+            got = server_tools._fmt_quake_time(iso, _now)
+            mark = "OK" if got == want else "NG"
+            if got != want:
+                ok = False
+            print("%-4s _fmt_quake_time(%s) -> %s (期待 %s)" % (mark, iso, got, want))
+        QU = [{"at": "2026-08-01T13:00:00+09:00", "anm": "熊本県熊本地方",
+               "mag": "3.0", "maxi": "5-", "eid": "a"},
+              {"at": "2026-08-01T05:00:00+09:00", "anm": "どこか",
+               "mag": "2.5", "maxi": "1", "eid": "b"}]
+        line = server_tools._quake_line(QU, _now)
+        good = "5弱" in line and "マグニチュード3.0" in line and "2回" in line
+        ok = ok and good
+        print("%-4s _quake_line: %s" % ("OK" if good else "NG", line))
+        WB = {"areaTypes": [{"areas": [{"warnings": [
+            {"code": "03", "status": "発表"}, {"code": "15", "status": "継続"},
+            {"code": "04", "status": "解除"}]}]}]}
+        names = server_tools._active_warnings(WB)
+        good = names == ["大雨警報", "強風注意報"]
+        ok = ok and good
+        print("%-4s _active_warnings: %s" % ("OK" if good else "NG", names))
+
+
         # 読み上げ書式と門番（通信なし）
         JPY = [(9911652, "991万円"), (294099, "29万円"), (123456789, "1.2億円"),
                (9800, "9800円")]
