@@ -107,6 +107,8 @@ BARGE_IN = os.environ.get("BARGE_IN", "1") not in ("0", "false", "no")
 BARGE_MIN_SEC = float(os.environ.get("BARGE_MIN_SEC", "6"))
 BARGE_WINDOW = float(os.environ.get("BARGE_WINDOW", "0.4"))
 BARGE_SPEECH_MS = float(os.environ.get("BARGE_SPEECH_MS", "240"))
+BARGE_SEEK_SEC = float(os.environ.get("BARGE_SEEK_SEC", "2.0"))
+BARGE_PAUSE_RMS = float(os.environ.get("BARGE_PAUSE_RMS", "300"))
 SPEAK_TAIL_SEC = float(os.environ.get("SPEAK_TAIL_SEC", "0.8"))
 # こちらが話した直後なら相槌にも返事をする猶予 [s]
 FILLER_FOLLOWUP_SEC = float(os.environ.get("FILLER_FOLLOWUP_SEC", "15"))
@@ -685,6 +687,47 @@ async def openjtalk_tts(text: str) -> bytes:
     return joined + bytes(2 * int(DOWN_RATE * OJT_END_PAUSE))
 
 
+def _quiet_at(pcm: bytes, target: int, seek: int, win: int):
+    """target 標本の近くで、いちばん静かな所の標本位置を返す。無ければ None。
+
+    合成音は読点・句点で振幅がほぼ 0 まで落ちる。そこを選んで切れば、
+    間に割り込み用の窓を挟んでも聞こえ方が変わらない。逆にどこも鳴って
+    いる（None）なら切らない＝語の途中で切って途切れさせない。
+    """
+    lo = max(0, target - seek)
+    hi = min(len(pcm) // 2 - win, target + seek)
+    if hi <= lo:
+        return None
+    best, best_rms = None, None
+    step = max(1, win // 3)
+    for pos in range(lo, hi + 1, step):
+        r = frame_rms(pcm[pos * 2:(pos + win) * 2])
+        if best_rms is None or r < best_rms:
+            best, best_rms = pos, r
+    if best is None or best_rms > BARGE_PAUSE_RMS:
+        return None
+    return best + win // 2
+
+
+def split_for_barge(pcm: bytes):
+    """割り込みを聞く窓を挟めるよう、静かな所で音を切り分ける。"""
+    if not BARGE_IN:
+        return [pcm]
+    win = int(DOWN_RATE * 0.06)
+    seek = int(DOWN_RATE * BARGE_SEEK_SEC)
+    target = int(DOWN_RATE * BARGE_MIN_SEC)
+    out, rest = [], pcm
+    # 端に短い切れ端が残らないよう、1.5 倍以上あるときだけ切る
+    while len(rest) / 2 / DOWN_RATE >= BARGE_MIN_SEC * 1.5:
+        cut = _quiet_at(rest, target, seek, win)
+        if cut is None:
+            break
+        out.append(rest[:cut * 2])
+        rest = rest[cut * 2:]
+    out.append(rest)
+    return out
+
+
 def _trim_silence(pcm: bytes) -> bytes:
     """前後の無音を落とす。合成器が足す固定の間を消すのが狙い。"""
     if len(pcm) % 2:
@@ -1256,6 +1299,7 @@ async def ws_handler(request: web.Request):
         state["phase"] = "speak"
         nxt = asyncio.create_task(synthesize(session, sentences[0]))
         sent = 0
+        gap_at = 0      # 最後に窓を開いた時点の送出フレーム数
         first = None
         for i, s in enumerate(sentences):
             try:
@@ -1268,20 +1312,26 @@ async def ws_handler(request: web.Request):
                 nxt = asyncio.create_task(synthesize(session, sentences[i + 1]))
             if not pcm:
                 continue
-            # 長い返事の途中だけ、割り込みを聞く窓を挟む。短い返事に挟むと
-            # 間延びするだけで、そもそも待てるので挟まない
-            if (BARGE_IN and sent
-                    and sent * FRAME_MS / 1000.0 >= BARGE_MIN_SEC):
-                barged, t0 = await listen_gap(sent, t0)
-                if barged:
-                    return
-            await send_json({"type": "tts", "state": "sentence_start", "text": s})
-            for packet in encoder.encode_stream(pcm):
-                await ws.send_bytes(packet)
-                sent += 1
-                if first is None:
-                    first = time.monotonic() - t0
-                await asyncio.sleep(FRAME_MS / 1000 * 0.85)
+            chunks = split_for_barge(pcm)
+            if len(chunks) > 1:
+                log.info("この文を %d 片に分けて、間で割り込みを聞く", len(chunks))
+            for chunk in chunks:
+                # 長い返事の途中にだけ窓を挟む。短い返事は待てるので挟まない
+                if (BARGE_IN and sent
+                        and (sent - gap_at) * FRAME_MS / 1000.0
+                        >= BARGE_MIN_SEC):
+                    barged, t0 = await listen_gap(sent, t0)
+                    if barged:
+                        return
+                    gap_at = sent
+                await send_json({"type": "tts", "state": "sentence_start",
+                                 "text": s})
+                for packet in encoder.encode_stream(chunk):
+                    await ws.send_bytes(packet)
+                    sent += 1
+                    if first is None:
+                        first = time.monotonic() - t0
+                    await asyncio.sleep(FRAME_MS / 1000 * 0.85)
         await send_json({"type": "tts", "state": "stop"})
         state["phase"] = "tail"
         log.info("spoke %d frames (%.1fs) in %d sentences, first audio %.2fs: %s",
