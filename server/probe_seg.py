@@ -35,9 +35,9 @@ async def main():
         print("=== " + text[:20])
         for seg in app.split_long_runs(text):
             PACES.clear()
-            pcm = await app._openjtalk_once(seg, want_rate=True)
+            pcm, pace = await app._openjtalk_once(seg)
             sec = len(pcm) / 2.0 / app.DOWN_RATE
-            pace = PACES[0] if PACES else 0.0
+            pace = pace or 0.0
             mark = "NG" if pace > 0.16 else "ok"
             print("  [%s] %2d字 %5.2f秒 %.3f秒/モーラ  %s"
                   % (mark, len(seg), sec, pace, seg))

@@ -680,15 +680,16 @@ def _trim_silence(pcm: bytes) -> bytes:
     return a[head:tail].tobytes()
 
 
-async def _openjtalk_once(text: str, want_rate: bool = None):
-    """Open JTalk で合成する。stdin からテキストを読み -ow のファイルへ書く。
+async def _openjtalk_once(text: str, want_rate: bool = True):
+    """Open JTalk で合成し、(音声, 秒/モーラ) を返す。
+
+    stdin からテキストを読み -ow のファイルへ書く。
 
     パイプ受け（-ow /dev/stdout）は環境依存なので一時ファイルで受ける。
     """
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         out = f.name
     trace = out + ".trace"
-    want_rate = OJT_LOG_PACE if want_rate is None else want_rate
     extra = ["-ot", trace] if want_rate else []
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -717,7 +718,8 @@ async def _openjtalk_once(text: str, want_rate: bool = None):
     down = resample_linear(pcm, rate, DOWN_RATE)
     if OJT_LOG_PACE and pace is not None:
         log.info("読み %.3f 秒/モーラ: %s", pace, text[:24])
-    return (down, pace) if want_rate else down
+    # 返り値は常に (音声, 秒/モーラ)。呼び出し側で型が変わらないようにする
+    return down, pace
 
 
 _VOWELS = set("aiueoAIUEON")
@@ -1192,6 +1194,7 @@ async def ws_handler(request: web.Request):
         sentences = [s for s in sentences if SPEAKABLE_RE.search(s)] or sentences[:1]
         t0 = time.monotonic()
         await send_json({"type": "tts", "state": "start"})
+        state["phase"] = "speak"
         nxt = asyncio.create_task(synthesize(session, sentences[0]))
         sent = 0
         first = None
@@ -1214,6 +1217,7 @@ async def ws_handler(request: web.Request):
                     first = time.monotonic() - t0
                 await asyncio.sleep(FRAME_MS / 1000 * 0.85)
         await send_json({"type": "tts", "state": "stop"})
+        state["phase"] = "tail"
         log.info("spoke %d frames (%.1fs) in %d sentences, first audio %.2fs: %s",
                  sent, sent * FRAME_MS / 1000, len(sentences), first or -1, text)
 
@@ -1302,10 +1306,21 @@ async def ws_handler(request: web.Request):
 
     def start_listening(auto: bool):
         if state.get("drop_frames"):
-            log.info("聞いていない間に %d フレーム届いていた（最大 rms=%.0f）",
-                     state["drop_frames"], state.get("drop_max_rms", 0.0))
+            # 局面ごとに分けて数える。読み上げ送出中にも届いているなら
+            # サーバー側だけで割り込みを作れる。届かないなら本体側の話
+            log.info("聞いていない間に %d フレーム（考え中 %d/最大 %.0f・"
+                     "読み上げ中 %d/最大 %.0f・鳴り終わり待ち %d/最大 %.0f）",
+                     state["drop_frames"],
+                     state.get("drop_think", 0), state.get("rms_think", 0.0),
+                     state.get("drop_speak", 0), state.get("rms_speak", 0.0),
+                     state.get("drop_tail", 0), state.get("rms_tail", 0.0))
             state["drop_frames"] = 0
             state["drop_max_rms"] = 0.0
+            for k in ("drop_think", "drop_speak", "drop_tail"):
+                state[k] = 0
+            for k in ("rms_think", "rms_speak", "rms_tail"):
+                state[k] = 0.0
+        state["phase"] = "think"
         state["listening"] = True
         state["auto"] = auto
         state["speech_ms"] = 0.0
@@ -1384,9 +1399,14 @@ async def ws_handler(request: web.Request):
                     except Exception:
                         chunk = b""
                     if chunk:
+                        rms = frame_rms(chunk)
+                        ph = state.get("phase", "think")
                         state["drop_frames"] = state.get("drop_frames", 0) + 1
                         state["drop_max_rms"] = max(
-                            state.get("drop_max_rms", 0.0), frame_rms(chunk))
+                            state.get("drop_max_rms", 0.0), rms)
+                        state["drop_" + ph] = state.get("drop_" + ph, 0) + 1
+                        state["rms_" + ph] = max(
+                            state.get("rms_" + ph, 0.0), rms)
             elif msg.type == aiohttp.WSMsgType.TEXT:
                 try:
                     data = json.loads(msg.data)

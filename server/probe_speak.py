@@ -58,7 +58,8 @@ async def one(session, name, args):
     PACES.clear()
     pcm = b""
     for seg in segs:
-        pcm += await app._openjtalk_once(seg, want_rate=True)
+        seg_pcm, _ = await app._openjtalk_once(seg)
+        pcm += seg_pcm
     sec = len(pcm) / 2.0 / app.DOWN_RATE
     return {"name": name, "text": text, "short": short, "segs": segs,
             "cut": short != text.strip(), "sec": sec,
