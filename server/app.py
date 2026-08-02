@@ -877,6 +877,17 @@ def fix_reading(text: str) -> str:
     return JA_SPACE_RE.sub("", text)
 
 
+# 生成が壊れると省略記号などの羅列を返す（実機 2026-08-02 10:29、gpt-oss が
+# 「緑が \\ ………」と点線 90 字超を返し、そのまま合成された。195 応答中 1 回）。
+# 省略記号・バックスラッシュ・不可視文字が空白を挟んで 5 個以上続いたら
+# 応答ごと捨てて空を返し、呼び出し側の FALLBACK_REPLY に合流させる
+_GARB = r"(?:[…‥\\\u200b\u200c\u200d\ufeff]|\.{2,})"
+DEGENERATE_RE = re.compile(_GARB + r"(?:\s*" + _GARB + r"){4,}")
+# 演出の「……」は 1 個に畳む。不可視文字とバックスラッシュは常に落とす
+INVISIBLE_RE = re.compile("[\u200b\u200c\u200d\ufeff\\\\]")
+ELLIPSIS_RUN_RE = re.compile(r"(?:[…‥]|\.{2,})(?:\s*(?:[…‥]|\.{2,}))+")
+
+
 def clean_reply(text) -> str:
     """ツール呼び出しの断片を読み上げさせない。
 
@@ -893,6 +904,12 @@ def clean_reply(text) -> str:
     text = _drop_tool_json(text)
     # 壊れた JSON の落ち穂（対応の取れない括弧）は読み上げても無意味
     text = re.sub(r"[{}\[\]]", "", text)
+    # 壊れた生成（点線の羅列）は応答ごと捨てる。空になった応答は
+    # 呼び出し側が FALLBACK_REPLY（もう一度お願いします）に置き換えて読む
+    if DEGENERATE_RE.search(text):
+        return ""
+    text = INVISIBLE_RE.sub("", text)
+    text = ELLIPSIS_RUN_RE.sub("…", text)
     text = fix_reading(text)
     return re.sub(r"[ 	]+", " ", text).strip()
 
@@ -1242,6 +1259,11 @@ async def ws_handler(request: web.Request):
             await send_json({"type": "stt", "text": "エラー: %s" % e})
 
     def start_listening(auto: bool):
+        if state.get("drop_frames"):
+            log.info("聞いていない間に %d フレーム届いていた（最大 rms=%.0f）",
+                     state["drop_frames"], state.get("drop_max_rms", 0.0))
+            state["drop_frames"] = 0
+            state["drop_max_rms"] = 0.0
         state["listening"] = True
         state["auto"] = auto
         state["speech_ms"] = 0.0
@@ -1311,6 +1333,18 @@ async def ws_handler(request: web.Request):
                             log.info("発話の終わりを検出（音声 %.0fms / 無音 %.0fms）",
                                      state["speech_ms"], state["silence_ms"])
                             finish_listening()
+                else:
+                    # 聞いていない間（読み上げ中など）にマイクが届くかの実測。
+                    # 割り込み（barge-in）対応の材料にする。推測で決めない。
+                    # 同じ decoder に通すのは opus の状態を切らさないため
+                    try:
+                        chunk = decoder.decode(msg.data)
+                    except Exception:
+                        chunk = b""
+                    if chunk:
+                        state["drop_frames"] = state.get("drop_frames", 0) + 1
+                        state["drop_max_rms"] = max(
+                            state.get("drop_max_rms", 0.0), frame_rms(chunk))
             elif msg.type == aiohttp.WSMsgType.TEXT:
                 try:
                     data = json.loads(msg.data)
