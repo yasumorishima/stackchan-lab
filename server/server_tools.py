@@ -1278,7 +1278,9 @@ async def get_sky(session, args, ctx=None) -> str:
 
 # ---- 電車の遅延（公共交通オープンデータセンター ODPT） -----------------------
 # キー不要の api-public は都営地下鉄のみ。無料の consumer key（odpt.org で登録）を
-# ODPT_TOKEN に入れると JR東日本・京急・東急・相鉄・東京メトロも読める。
+# ODPT_TOKEN に入れると JR東日本・京急・東急・相鉄・東京メトロ・
+# 横浜市営地下鉄も読める（横浜シーサイドラインは ODPT に無い。
+# ckan.odpt.org カタログ実確認 2026-08-02）。
 # 平常時は odpt:trainInformationStatus が無く、異常時だけ入る。
 ODPT_TOKEN = os.environ.get("ODPT_TOKEN", "").strip()
 
@@ -1291,8 +1293,10 @@ ODPT_PUBLIC_URL = os.environ.get(
     "https://api-public.odpt.org/api/v4/odpt:TrainInformation")
 ODPT_KEYED_URL = os.environ.get(
     "ODPT_KEYED_URL", "https://api.odpt.org/api/v4/odpt:TrainInformation")
+# 並び順が読み上げの優先順（user 指定: 京急がデフォルト 2026-08-02）
 TRAIN_OPERATORS = os.environ.get(
-    "TRAIN_OPERATORS", "JR-East,Keikyu,Tokyu,Sotetsu,TokyoMetro,Toei")
+    "TRAIN_OPERATORS",
+    "Keikyu,JR-East,YokohamaMunicipal,Tokyu,Sotetsu,TokyoMetro,Toei")
 TRAIN_CACHE_TTL = float(os.environ.get("TRAIN_CACHE_TTL", "180"))
 TRAIN_STALE_MAX = float(os.environ.get("TRAIN_STALE_MAX", "3600"))
 TRAIN_MAX_LINES = int(os.environ.get("TRAIN_MAX_LINES", "3"))
@@ -1351,6 +1355,10 @@ TRAIN_LINE_NAMES = {
     "Toei.Oedo": "都営大江戸線",
     "Toei.Arakawa": "都電荒川線",
     "Toei.NipporiToneri": "日暮里・舎人ライナー",
+    # Railway ID はキー到着後の実データで要確認（違っても名前が引けない
+    # だけで「一部の路線」に丸まる。落ちない）
+    "YokohamaMunicipal.Blue": "横浜市営地下鉄ブルーライン",
+    "YokohamaMunicipal.Green": "横浜市営地下鉄グリーンライン",
 }
 
 
@@ -1359,8 +1367,17 @@ def _train_line_name(rid: str) -> str:
     return TRAIN_LINE_NAMES.get(key, "")
 
 
+_TRAIN_OPS = [o.strip() for o in TRAIN_OPERATORS.split(",") if o.strip()]
+
+
+def _train_rank(rid) -> int:
+    """身近な事業者から読む（TRAIN_OPERATORS の並び順。京急が先頭）。"""
+    op = str(rid or "").replace("odpt.Railway:", "").split(".")[0]
+    return _TRAIN_OPS.index(op) if op in _TRAIN_OPS else len(_TRAIN_OPS)
+
+
 def _train_line(items, keyed: bool) -> str:
-    scope = "横浜まわりの主な路線" if keyed else "都営地下鉄"
+    scope = "東京・神奈川の主な路線" if keyed else "都営地下鉄"
     bad = []
     for e in items:
         st = (e.get("odpt:trainInformationStatus") or {})
@@ -1370,20 +1387,22 @@ def _train_line(items, keyed: bool) -> str:
         name = _train_line_name(e.get("odpt:railway"))
         cause = (e.get("odpt:trainInformationCause") or {})
         cause = cause.get("ja") if isinstance(cause, dict) else cause
-        bad.append((name, str(st), str(cause or "")))
+        bad.append((_train_rank(e.get("odpt:railway")), name,
+                    str(st), str(cause or "")))
+    bad.sort(key=lambda b: b[0])
     if not bad:
         line = "いま%sに大きな遅れは出ていません。" % scope
         if not keyed:
             line += "いまは都営地下鉄しか調べられません。"
         return line
-    named = [b for b in bad if b[0]]
+    named = [b for b in bad if b[1]]
     shown = named[:TRAIN_MAX_LINES] if named else bad[:TRAIN_MAX_LINES]
-    parts = ["%s%s" % (n or "一部の路線", "は" + s) for n, s, _ in shown]
+    parts = ["%s%s" % (n or "一部の路線", "は" + s) for _, n, s, _ in shown]
     head = "いま、" + "、".join(parts) + "です。"
     rest = len(bad) - len(shown)
     if rest > 0:
         head += "ほかにも%d路線で乱れが出ています。" % rest
-    cause = next((c for _, _, c in shown if c), "")
+    cause = next((c for _, _, _, c in shown if c), "")
     if cause:
         head += "原因は%sです。" % cause
     return head

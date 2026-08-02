@@ -444,6 +444,18 @@ async def main():
         ok = ok and good
         print("%-4s _train_line(平常/キー無し): %s" % ("OK" if good else "NG", line))
 
+        TR2 = [{"odpt:railway": "odpt.Railway:TokyoMetro.Ginza",
+                "odpt:trainInformationStatus": {"ja": "遅延"}},
+               {"odpt:railway": "odpt.Railway:YokohamaMunicipal.Blue",
+                "odpt:trainInformationStatus": {"ja": "運転見合わせ"}},
+               {"odpt:railway": "odpt.Railway:Keikyu.Main",
+                "odpt:trainInformationStatus": {"ja": "遅延"}}]
+        line = server_tools._train_line(TR2, True)
+        good = (line.index("京急本線") < line.index("横浜市営地下鉄ブルーライン")
+                < line.index("地下鉄銀座線"))
+        ok = ok and good
+        print("%-4s _train_line(京急を先に読む): %s" % ("OK" if good else "NG", line))
+
         # ---- ニュース・地震・警報 ----
         text = await server_tools.call(s, "get_news", {})
         print("%-28s %s" % ("ニュースを実取得", text[:80]))
