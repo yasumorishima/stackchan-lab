@@ -44,6 +44,8 @@ CASES = [
     ("今日の天気を教えて。", "get_weather", {"when": "today"}),
     ("あしたの大阪の天気は？", "get_weather", {"place": "大阪", "when": "tomorrow"}),
     ("鳥取の天気を教えて。", "get_weather", {"place": "鳥取"}),
+    ("1週間の天気を教えて。", "get_weather", {"when": "week"}),
+    ("週間天気はどんな感じ？", "get_weather", {"when": "week"}),
     ("音量を五十にして。", "self_audio_speaker_set_volume", {"volume": 50}),
     ("ボリュームを下げて、二十くらいに。", "self_audio_speaker_set_volume", {"volume": 20}),
     ("いまドル円いくら？", "get_usdjpy", {}),
