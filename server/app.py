@@ -437,6 +437,20 @@ async def voicevox_tts(session: aiohttp.ClientSession, text: str, base: str, hea
 # 位置が語境界でないと直らない（「教えても、らえると」で実測 17.6s のまま）ので、
 # テキストごと分けて別々に合成する。分ければ切り方が多少悪くても各片は正常な速さ。
 OJT_MAX_MORA = int(os.environ.get("OJT_MAX_MORA", "30"))
+# 🔴 2026-08-02 訂正: 破綻はモーラ数では決まらない。統制実験で
+# 「あさひ」×10（読点なし 30 モーラ）は 0.122 秒/モーラで健全なのに、
+# 実文「何か聞きたいことややってほしいことがあれば教えてください」は
+# 29 モーラで 0.235、「春のことでも他に…くださいね。」は 0.358 に落ちる。
+# 同じ文に読点を 1 つ入れるだけで 0.127 へ戻る＝語の並びしだいで
+# 時間長モデルが壊れる。閾値では予測できないので、合成してから
+# 実測の速さを見て、遅ければ分け直す（下の openjtalk_tts）。
+# 健全は 0.118〜0.136、破綻は 0.235 以上（実測）。境目はこの間に置く
+OJT_BAD_PACE = float(os.environ.get("OJT_BAD_PACE", "0.17"))
+# 短い片は分け直しても直しようが無いので測っても使わない
+OJT_RESPLIT_MIN_MORA = int(os.environ.get("OJT_RESPLIT_MIN_MORA", "12"))
+# 分け直すときの目安。元の片より短くしないと同じ結果になる
+OJT_RESPLIT_STEP = float(os.environ.get("OJT_RESPLIT_STEP", "0.6"))
+OJT_RESPLIT_ROUNDS = int(os.environ.get("OJT_RESPLIT_ROUNDS", "2"))
 # Open JTalk は合成のたびに前 0.41 秒・後 0.58 秒ほどの無音を必ず付ける。
 # 文ごとに合成するので短い返事ほど無音の比率が上がり（実測で 27〜56%）、
 # 特に最後の文が間延びして聞こえる。切り詰めてから短い間だけ足し直す。
@@ -559,21 +573,22 @@ def _mora_prefix(s: str, limit: int) -> int:
     return len(s)
 
 
-def split_long_runs(text: str):
+def split_long_runs(text: str, limit: int = None):
     """呼気段落が OJT_MAX_MORA を超えないよう、語境界らしい所でテキストを分ける。
 
     一文字助詞は直後が平仮名だと語中の可能性が高い（「教えてもらえる」の「も」）
     ので、直後が漢字・カタカナ等のときだけ切る。
     """
+    limit = OJT_MAX_MORA if limit is None else max(4, limit)
     sep = chr(0)
     out = []
     for run in re.split("([" + OJT_PAUSES + "])", text):
-        if run in OJT_PAUSES or _mora_est(run) <= OJT_MAX_MORA:
+        if run in OJT_PAUSES or _mora_est(run) <= limit:
             out.append(run)
             continue
         s = run
-        while _mora_est(s) > OJT_MAX_MORA:
-            n = _mora_prefix(s, OJT_MAX_MORA)
+        while _mora_est(s) > limit:
+            n = _mora_prefix(s, limit)
             window = s[:n]
             cut = -1
             for p in OJT_PARTICLES_2:
@@ -608,6 +623,32 @@ OPENJTALK_VOICE = os.environ.get(
     "/usr/share/hts-voice/nitech-jp-atr503-m001/nitech_jp_atr503_m001.htsvoice")
 
 
+async def _synth_checked(text: str, rounds: int = OJT_RESPLIT_ROUNDS):
+    """1 片を合成し、読みが遅ければ短く分け直してから合成し直す。
+
+    どこで壊れるかは語の並びしだいで、モーラ数からは予測できない
+    （OJT_BAD_PACE のコメント参照）。合成は速い（RTF≈0.06）ので、
+    測ってから直す方が閾値を当てにするより確実で、余計な分割も増えない。
+    """
+    pcm, pace = await _openjtalk_once(text, want_rate=True)
+    mora = _mora_est(text)
+    if (pace is None or pace <= OJT_BAD_PACE or rounds <= 0
+            or mora < OJT_RESPLIT_MIN_MORA):
+        return [pcm]
+    limit = max(4, int(mora * OJT_RESPLIT_STEP))
+    segs = split_long_runs(text, limit)
+    if len(segs) < 2:
+        # 切り所が無い。分け直せないので、そのまま出す（読みは壊れるが無音よりよい）
+        log.warning("読みが遅いが分けられない（%.3f 秒/モーラ）: %s", pace, text[:30])
+        return [pcm]
+    log.info("読みが遅いので %d 片に分け直す（%.3f 秒/モーラ）: %s",
+             len(segs), pace, text[:30])
+    out = []
+    for seg in segs:
+        out.extend(await _synth_checked(seg, rounds - 1))
+    return out
+
+
 async def openjtalk_tts(text: str) -> bytes:
     """長い呼気段落を分けて合成し、間に短い無音を挟んで繋ぐ（スローモーション対策）。
 
@@ -615,8 +656,9 @@ async def openjtalk_tts(text: str) -> bytes:
     落とす。文ごとに合成するので、短い返事ほど無音の比率が上がり
     （実測で全体の 27〜56%）、特に最後の文が間延びして聞こえるため。
     """
-    segs = split_long_runs(text)
-    parts = [await _openjtalk_once(seg) for seg in segs]
+    parts = []
+    for seg in split_long_runs(text):
+        parts.extend(await _synth_checked(seg))
     gap = bytes(2 * int(DOWN_RATE * 0.12))
     joined = gap.join(_trim_silence(p) for p in parts)
     return joined + bytes(2 * int(DOWN_RATE * OJT_END_PAUSE))
@@ -673,9 +715,9 @@ async def _openjtalk_once(text: str, want_rate: bool = None):
     if ch != 1 or width != 2:
         raise RuntimeError("unexpected wav: ch=%d width=%d" % (ch, width))
     down = resample_linear(pcm, rate, DOWN_RATE)
-    if want_rate and pace is not None:
+    if OJT_LOG_PACE and pace is not None:
         log.info("読み %.3f 秒/モーラ: %s", pace, text[:24])
-    return down
+    return (down, pace) if want_rate else down
 
 
 _VOWELS = set("aiueoAIUEON")
