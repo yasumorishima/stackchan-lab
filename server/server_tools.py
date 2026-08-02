@@ -1572,6 +1572,320 @@ async def get_fuel_surcharge(session, args, ctx=None) -> str:
             % (zone, amt, label))
 
 
+# ---- 渡航情報（外務省 海外安全情報オープンデータ） ---------------------------
+# 公式の open data（e-Gov データカタログ登録・キー不要・登録不要）。案内ページ
+# anzen.mofa.go.jp/opendata/opendata.html は 2026-08-02 時点でメンテ中だが、
+# 配布本体の ezairyu.mofa.go.jp は生きている（実取得で確認）。
+# 国別 XML は Light 版でも 1.5MB あるが、危険情報と広域情報は先頭にあり、後ろは
+# 領事メールが延々と続くだけなので <mail が出たら読むのをやめる（RPi5 に大きな
+# 本文を持たない）。キャッシュは XML でなく読み終えた要約だけ持つ。
+TRAVEL_URL = os.environ.get(
+    "TRAVEL_URL", "https://www.ezairyu.mofa.go.jp/opendata/country/%sL.xml")
+TRAVEL_CACHE_TTL = float(os.environ.get("TRAVEL_CACHE_TTL", "1800"))    # 30 分
+TRAVEL_STALE_MAX = float(os.environ.get("TRAVEL_STALE_MAX", "604800"))  # 7 日
+TRAVEL_MAX_BYTES = int(os.environ.get("TRAVEL_MAX_BYTES", "400000"))
+# 広域情報は複数の国に同じものが出るので、毎回付けると回答が長くなる
+TRAVEL_SPOT_DAYS = int(os.environ.get("TRAVEL_SPOT_DAYS", "7"))
+# 行き先を言われなかった時。ドバイ経由の旅行が user の主用途
+TRAVEL_DEFAULT = os.environ.get("TRAVEL_DEFAULT", "0971")
+TRAVEL_MAX_CHARS = 150
+TRAVEL_TITLE_MAX = 20
+
+TRAVEL_LEVELS = {4: "退避してください", 3: "渡航は止めてください",
+                 2: "不要不急の渡航は止めてください", 1: "十分注意してください"}
+
+# 国コード一覧（外務省 海外安全情報オープンデータの country.xlsx・207 件）
+# 形は「電話の国番号:日本語名」。名前の ／ は別名、（）は地域の内訳
+TRAVEL_COUNTRY_SRC = (
+    "0060:マレーシア 0062:インドネシア 0063:フィリピン 0065:シンガポール 0066:タイ "
+    "0082:大韓民国／韓国 0084:ベトナム 0086:中華人民共和国／中国 0091:インド 0092:パキスタン "
+    "0094:スリランカ 0095:ミャンマー 0670:東ティモール 0673:ブルネイ 0850:北朝鮮 0852:香港 "
+    "0853:マカオ 0855:カンボジア 0856:ラオス 0880:バングラデシュ 0886:台湾 0960:モルディブ "
+    "0975:ブータン 0976:モンゴル 0977:ネパール 0061:オーストラリア／豪州 0064:ニュージーランド "
+    "0674:ナウル 0675:パプアニューギニア 0676:トンガ 0677:ソロモン諸島 0678:バヌアツ "
+    "0679:フィジー 0680:パラオ 0682:クック諸島 0683:ニウエ 0685:サモア独立国 0686:キリバス "
+    "0687:ニューカレドニア（仏領） 0688:ツバル 0691:ミクロネシア 0692:マーシャル諸島 "
+    "1001:アメリカ合衆国／米国（北マリアナ諸島） 1002:アメリカ合衆国／米国（グアム） 1684:サモア（米領） "
+    "9689:タヒチ（仏領ポリネシア） 1000:アメリカ合衆国／米国（本土） 1808:アメリカ合衆国／米国（ハワイ） "
+    "9001:カナダ 0051:ペルー 0052:メキシコ 0053:キューバ 0054:アルゼンチン 0055:ブラジル "
+    "0056:チリ 0057:コロンビア 0058:ベネズエラ 0473:グレナダ 0501:ベリーズ 0502:グアテマラ "
+    "0503:エルサルバドル 0504:ホンジュラス 0505:ニカラグア 0506:コスタリカ 0507:パナマ "
+    "0509:ハイチ 0591:ボリビア 0592:ガイアナ 0593:エクアドル 0595:パラグアイ 0597:スリナム "
+    "0598:ウルグアイ 0758:セントルシア 0767:ドミニカ国 0784:セントビンセント及びグレナディーン諸島 "
+    "0809:ドミニカ共和国 0868:トリニダード・トバゴ 0869:セントクリストファー・ネービス 0876:ジャマイカ "
+    "1242:バハマ 1246:バルバドス 1268:アンティグア・バーブーダ 0007:カザフスタン 0030:ギリシャ "
+    "0031:オランダ 0032:ベルギー 0033:フランス 0034:スペイン 0036:ハンガリー 0039:イタリア "
+    "0040:ルーマニア 0041:スイス 0043:オーストリア "
+    "0044:英国／イギリス／グレートブリテン及び北部アイルランド連合王国 0045:デンマーク 0046:スウェーデン "
+    "0047:ノルウェー 0048:ポーランド 0049:ドイツ 0351:ポルトガル 0352:ルクセンブルク "
+    "0353:アイルランド 0354:アイスランド 0355:アルバニア 0356:マルタ 0357:キプロス／サイプラス "
+    "0358:フィンランド 0359:ブルガリア 0370:リトアニア 0371:ラトビア 0372:エストニア "
+    "0373:モルドバ 0374:アルメニア 0375:ベラルーシ 0376:アンドラ 0377:モナコ "
+    "0378:サンマリノ 0380:ウクライナ 0381:セルビア 0382:モンテネグロ 0385:クロアチア "
+    "0386:スロベニア 0387:ボスニア・ヘルツェゴビナ 0389:北マケドニア共和国 0420:チェコ "
+    "0421:スロバキア 0423:リヒテンシュタイン 0992:タジキスタン 0993:トルクメニスタン "
+    "0994:アゼルバイジャン 0995:ジョージア（旧グルジア） 0996:キルギス 0998:ウズベキスタン "
+    "9007:ロシア 9039:バチカン市国 9381:コソボ 0090:トルコ 0093:アフガニスタン 0098:イラン "
+    "0961:レバノン 0962:ヨルダン 0963:シリア 0964:イラク 0965:クウェート "
+    "0966:サウジアラビア 0967:イエメン 0968:オマーン 0970:パレスチナ 0971:アラブ首長国連邦 "
+    "0972:イスラエル 0973:バーレーン 0974:カタール 0020:エジプト 0027:南アフリカ共和国 "
+    "0211:南スーダン 0212:モロッコ 0213:アルジェリア 0216:チュニジア 0218:リビア "
+    "0220:ガンビア 0221:セネガル 0222:モーリタニア 0223:マリ 0224:ギニア "
+    "0225:コートジボワール 0226:ブルキナファソ 0227:ニジェール 0228:トーゴ 0229:ベナン "
+    "0230:モーリシャス 0231:リベリア 0232:シエラレオネ 0233:ガーナ 0234:ナイジェリア "
+    "0235:チャド 0236:中央アフリカ 0237:カメルーン 0238:カーボベルデ 0239:サントメ・プリンシペ "
+    "0240:赤道ギニア 0241:ガボン 0242:コンゴ共和国 0243:コンゴ民主共和国 0244:アンゴラ "
+    "0245:ギニアビサウ 0248:セーシェル 0249:スーダン 0250:ルワンダ 0251:エチオピア "
+    "0252:ソマリア 0253:ジブチ 0254:ケニア 0255:タンザニア 0256:ウガンダ 0257:ブルンジ "
+    "0258:モザンビーク 0260:ザンビア 0261:マダガスカル 0263:ジンバブエ 0264:ナミビア "
+    "0265:マラウイ 0266:レソト 0267:ボツワナ 0268:エスワティニ 0269:コモロ 0291:エリトリア "
+    "9212:西サハラ"
+)
+
+# 読み上げるときの呼び方（表の名前が長い・括弧付きで割れているものだけ）
+TRAVEL_DISPLAY = {
+    "1000": "アメリカ", "1001": "北マリアナ諸島", "1002": "グアム",
+    "1808": "ハワイ", "1684": "アメリカ領サモア", "9689": "タヒチ",
+    "0687": "ニューカレドニア", "0044": "イギリス", "0086": "中国",
+    "0082": "韓国", "0061": "オーストラリア", "0995": "ジョージア",
+    "0389": "北マケドニア",
+}
+
+# 表に無い言い方（都市名・通称）。表の名前より先に見る＝「米国」のように
+# 同じ言い方が本土・グアム・ハワイに並ぶとき、本土を選ばせるため
+TRAVEL_ALIASES = {
+    "0971": ("ドバイ", "アブダビ", "UAE"), "0974": ("ドーハ",),
+    "0966": ("リヤド", "ジェッダ"), "0090": ("イスタンブール", "トルコ共和国"),
+    "0098": ("テヘラン",), "0020": ("カイロ",), "0995": ("グルジア",),
+    "0082": ("ソウル", "釜山"), "0086": ("北京", "上海"), "0886": ("台北",),
+    "0852": ("香港",), "0066": ("バンコク",), "0084": ("ハノイ", "ホーチミン"),
+    "0063": ("マニラ", "セブ"), "0060": ("クアラルンプール",),
+    "0062": ("バリ", "ジャカルタ"), "0091": ("デリー", "ムンバイ"),
+    "0061": ("シドニー", "メルボルン"), "0064": ("オークランド",),
+    "1808": ("ホノルル",), "1001": ("サイパン",),
+    "1000": ("アメリカ", "アメリカ合衆国", "米国", "USA", "ニューヨーク",
+             "ロサンゼルス", "サンフランシスコ", "ラスベガス"),
+    "9001": ("バンクーバー", "トロント"), "0033": ("パリ",),
+    "0044": ("ロンドン",), "0039": ("ローマ", "ミラノ", "ベネチア"),
+    "0034": ("バルセロナ", "マドリード"),
+    "0049": ("ベルリン", "ミュンヘン", "フランクフルト"),
+    "0043": ("ウィーン",), "0041": ("チューリッヒ", "ジュネーブ"),
+    "0031": ("アムステルダム",), "0358": ("ヘルシンキ",),
+    "9007": ("モスクワ",), "0972": ("エルサレム", "テルアビブ"),
+    "1684": ("アメリカ領サモア", "米領サモア"), "0685": ("サモア",),
+    "0767": ("ドミニカ",),
+}
+
+
+def _travel_index():
+    """表の名前から「引き当てに使う言い方」を作る。"""
+    drop = {"本土"}   # 「アメリカ合衆国（本土）」の括弧内は誤爆するので使わない
+    idx, names = [], {}
+    for item in TRAVEL_COUNTRY_SRC.split():
+        cd, _, name = item.partition(":")
+        names[cd] = name
+        aliases = []
+        for part in name.split("／"):
+            m = re.match(r"^(.*)（(.+)）$", part)
+            if m:
+                aliases.append(m.group(1))
+                aliases.append(m.group(2))
+            else:
+                aliases.append(part)
+        idx.append((cd, tuple(a for a in aliases if a and a not in drop)))
+    return idx, names
+
+
+TRAVEL_INDEX, TRAVEL_NAMES = _travel_index()
+TRAVEL_ALIAS_INDEX = list(TRAVEL_ALIASES.items())
+_travel_cache = {}   # 国コード -> (取得時刻 monotonic, 読み終えた要約)
+
+
+def _travel_find(q: str) -> str:
+    """言われた文字列から国コードを引く。
+
+    「いちばん長く一致した国」を選ぶ。短い名前が長い名前に含まれる組
+    （インド / インドネシア、ギニア / パプアニューギニア、ドミニカ国 /
+    ドミニカ共和国）があるので、最長一致でないと取り違える。同じ長さで
+    並んだ時だけこちらの指定を勝たせる（「米国」は本土・グアム・ハワイの
+    3 つに並ぶので、表の順ではなく本土を選ばせたい）。
+    """
+    q = re.sub(r"[\s　]+", "", q or "")
+    if not q:
+        return TRAVEL_DEFAULT
+    best_cd, best_key = "", (0, 0)
+    for table, mine in ((TRAVEL_INDEX, 0), (TRAVEL_ALIAS_INDEX, 1)):
+        for cd, aliases in table:
+            for a in aliases:
+                if (len(a), mine) > best_key and a in q:
+                    best_cd, best_key = cd, (len(a), mine)
+    if best_cd:
+        return best_cd
+    # 言われた方が正式名称より短い場合（「南アフリカ」に対し表は
+    # 「南アフリカ共和国」）。ただし「コンゴ」のように複数の国に当たる
+    # 言い方は、取り違えると危ないので選ばずに聞き返す
+    if len(q) >= 3:
+        hit = set()
+        for table, _mine in ((TRAVEL_INDEX, 0), (TRAVEL_ALIAS_INDEX, 1)):
+            for cd, aliases in table:
+                if any(q in a for a in aliases):
+                    hit.add(cd)
+        if len(hit) == 1:
+            return hit.pop()
+    return ""
+
+
+def _travel_name(cd: str) -> str:
+    if cd in TRAVEL_DISPLAY:
+        return TRAVEL_DISPLAY[cd]
+    return re.sub(r"（.*?）", "", TRAVEL_NAMES.get(cd, "").split("／")[0])
+
+
+def _travel_ymd(s):
+    m = re.match(r"(\d{4})/(\d{1,2})/(\d{1,2})", (s or "").strip())
+    if not m:
+        return None
+    try:
+        return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def _travel_parse(xml: str) -> dict:
+    """危険情報のレベル・発表日・広域の注意喚起を読み出す。
+
+    形が違うものは読まずに投げる。取得先が 200 でメンテ用の HTML を返した
+    とき、素通りさせると「危険情報は出ていません」と断言してしまう
+    （レベル 4 の国で「安全」と読み上げるのが最悪の壊れ方）。
+    """
+    if "<opendata" not in xml or "<riskLevel" not in xml:
+        raise ValueError("危険情報の形をしていない応答")
+
+    def one(tag):
+        m = re.search("<" + tag + r"[^>]*>(.*?)</" + tag + ">", xml, re.S)
+        return re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
+
+    spots, seen = [], set()
+    for m in re.finditer(r"<wideareaSpot>(.*?)</wideareaSpot>", xml, re.S):
+        body = m.group(1)
+        t = re.search(r"<title>(.*?)</title>", body, re.S)
+        if not t:
+            continue
+        title = re.sub(r"\s+", "", t.group(1))
+        if not title or title in seen:
+            continue
+        seen.add(title)
+        d = re.search(r"<leaveDate[^>]*>(.*?)</leaveDate>", body, re.S)
+        spots.append((_travel_ymd(d.group(1)) if d else None, title))
+    return {
+        "risk": [n for n in (4, 3, 2, 1) if one("riskLevel%d" % n) == "1"],
+        "infection": [n for n in (4, 3, 2, 1)
+                      if one("infectionLevel%d" % n) == "1"],
+        "date": _travel_ymd(one("riskLeaveDate")),
+        "title": one("riskTitle"),
+        "spots": spots,
+    }
+
+
+async def _travel_fetch(session, cd: str) -> str:
+    """必要な先頭だけ読んで打ち切る（全部で 1.5MB あるため）。"""
+    buf = bytearray()
+    tmo = aiohttp.ClientTimeout(total=30)
+    async with session.get(TRAVEL_URL % cd, timeout=tmo,
+                           headers={"User-Agent": FUEL_UA}) as r:
+        r.raise_for_status()
+        async for chunk in r.content.iter_chunked(65536):
+            buf += chunk
+            if len(buf) >= TRAVEL_MAX_BYTES:
+                break
+            # 領事メールが始まったら以降は要らない。境目で切れても、
+            # 途中の <wideareaSpot> は閉じ tag が無いので拾われない
+            if buf.find(b"<mail>") >= 0 or buf.find(b"<mail ") >= 0:
+                break
+    return buf.decode("utf-8", "ignore")
+
+
+def _travel_spot_title(title: str) -> str:
+    """広域情報の題名を読み上げ向けに詰める。
+
+    実物は「【広域情報】海外における写真・動画撮影及びＳＮＳ等への投稿に
+    関する注意喚起」のように読点が無いまま 37 字あり、そのまま入れると
+    読点で区切った 1 かたまりが 40 字を超えて合成が崩れる。
+    """
+    title = re.sub(r"^【[^】]*】", "", title).strip()
+    if len(title) <= TRAVEL_TITLE_MAX:
+        return title
+    head = title[:TRAVEL_TITLE_MAX]
+    cut = max(head.rfind("・"), head.rfind("（"), head.rfind("、"))
+    if cut >= TRAVEL_TITLE_MAX // 2:
+        head = head[:cut]
+    head = re.sub(r"[のへにをとがはや、・]+$", "", head)
+    return head + "など"
+
+
+def _travel_say(cd: str, data: dict, today) -> str:
+    name = _travel_name(cd)
+    if data["risk"]:
+        top = data["risk"][0]
+        many = "いちばん高いところで" if len(data["risk"]) > 1 else ""
+        head = ("%sの危険情報は、%sレベル%d、%s、の段階です。"
+                % (name, many, top, TRAVEL_LEVELS[top]))
+    else:
+        head = "%sに危険情報は出ていません。" % name
+    # (つなぐ時の形, 文を終える時の形)。「発表です、最近では」を避ける
+    tail = []
+    if data["risk"] and data["date"]:
+        d = "%d年%d月%d日" % (data["date"].year, data["date"].month,
+                              data["date"].day)
+        tail.append(("これは%sの発表で" % d, "これは%sの発表です" % d))
+    if data["infection"]:
+        n = data["infection"][0]
+        tail.append(("感染症の危険情報もレベル%dで" % n,
+                     "感染症の危険情報もレベル%dです" % n))
+    recent = None
+    for d, title in data["spots"]:
+        if d and (today - d).days <= TRAVEL_SPOT_DAYS:
+            if recent is None or d > recent[0]:
+                recent = (d, title)
+    if recent:
+        # 広域情報は複数の国にまたがって出るもの。その国だけの話に
+        # 聞こえないよう「広い地域向け」と断る
+        title = _travel_spot_title(recent[1])
+        tail.append(("広い地域向けの注意喚起として、%sも出ていますが" % title,
+                     "広い地域向けの注意喚起として、%sも出ています" % title))
+    kept = []
+    for clause in tail:
+        cand = [c[0] for c in kept] + [clause[1]]
+        if len(head) + len("、".join(cand)) + 1 > TRAVEL_MAX_CHARS:
+            break
+        kept.append(clause)
+    if not kept:
+        return head
+    return head + "、".join([c[0] for c in kept[:-1]] + [kept[-1][1]]) + "。"
+
+
+async def get_travel_advisory(session, args, ctx=None) -> str:
+    q = str((args or {}).get("country") or "").strip()
+    cd = _travel_find(q)
+    if not cd:
+        return ("%sの渡航情報は分かりませんでした。国の名前で聞いてください。"
+                % q[:16])
+    now = time.monotonic()
+    got = _travel_cache.get(cd)
+    data = got[1] if got and now - got[0] < TRAVEL_CACHE_TTL else None
+    if data is None:
+        try:
+            data = _travel_parse(await _travel_fetch(session, cd))
+            _travel_cache[cd] = (now, data)
+        except Exception as e:
+            log.warning("travel unavailable: %s: %s", type(e).__name__,
+                        str(e)[:120])
+            data = got[1] if got and now - got[0] < TRAVEL_STALE_MAX else None
+    if data is None:
+        return "error: いま渡航情報を取れませんでした（取得先が応答しません）"
+    return _travel_say(cd, data, now_jst().date())
+
+
 SPECS = [{
     "type": "function",
     "function": {
@@ -1724,6 +2038,23 @@ SPECS = [{
             },
         },
     },
+}, {
+    "type": "function",
+    "function": {
+        "name": "get_travel_advisory",
+        "description": "海外の渡航情報（外務省の危険情報・感染症危険情報・"
+                       "注意喚起）を調べる。「ドバイは安全？」"
+                       "「タイの渡航情報は？」「フランス行っても大丈夫？」"
+                       "などに使う。国を言われなければアラブ首長国連邦。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "country": {"type": "string",
+                            "description": "国や都市の名前。例: ドバイ、タイ、"
+                                           "フランス。省略可"},
+            },
+        },
+    },
 }]
 
 HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy,
@@ -1738,7 +2069,8 @@ HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy,
             "get_onthisday": get_onthisday,
             "get_sky": get_sky,
             "get_train": get_train,
-            "get_fuel_surcharge": get_fuel_surcharge}
+            "get_fuel_surcharge": get_fuel_surcharge,
+            "get_travel_advisory": get_travel_advisory}
 
 
 def specs():

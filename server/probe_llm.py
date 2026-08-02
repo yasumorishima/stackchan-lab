@@ -66,6 +66,14 @@ CASES = [
     ("今日は何の日？", "get_onthisday", {}),
     ("今夜の月はどんな形？", "get_sky", {}),
     ("日の入りって何時？", "get_sky", {}),
+    ("燃油サーチャージって今いくら？", "get_fuel_surcharge", {}),
+    ("ドバイまでのサーチャージ教えて。", "get_fuel_surcharge",
+     {"destination": "ドバイ"}),
+    ("ドバイって今安全なの？", "get_travel_advisory", {}),
+    ("タイの渡航情報を教えて。", "get_travel_advisory",
+     {"country": "タイ"}),
+    ("フランス行っても大丈夫かな。", "get_travel_advisory",
+     {"country": "フランス"}),
     ("ありがとう、またね。", None, {}),
 ]
 

@@ -502,6 +502,163 @@ async def main():
         if text.startswith('error:') or '中東' not in text:
             ok = False
 
+        # ---- 渡航情報（外務省 海外安全情報オープンデータ） ----
+        TRAVEL_FIND = [
+            ('', '0971'), ('ドバイ経由で行く', '0971'), ('UAE', '0971'),
+            ('インド', '0091'), ('インドネシア', '0062'),
+            ('ギニア', '0224'), ('パプアニューギニア', '0675'),
+            ('ドミニカ', '0767'), ('ドミニカ共和国', '0809'),
+            ('米国', '1000'), ('ハワイ', '1808'), ('グアム', '1002'),
+            ('サモア', '0685'), ('アメリカ領サモア', '1684'),
+            ('パリ', '0033'), ('ぬるぽ国', ''),
+            # 表で 4 件が同じ長さで並ぶ（本土・グアム・ハワイ・北マリアナ）
+            ('アメリカ合衆国', '1000'),
+            # 言われた方が正式名称より短い
+            ('南アフリカ', '0027'), ('マケドニア', '0389'),
+            ('北マケドニア', '0389'), ('ボスニア', '0387'),
+            # 複数の国に当たる言い方は選ばずに聞き返す
+            ('コンゴ', ''), ('コンゴ民主共和国', '0243'),
+        ]
+        for q, want in TRAVEL_FIND:
+            got = server_tools._travel_find(q)
+            good = got == want
+            ok = ok and good
+            print('%-4s 渡航: 国の引き当て %-12s -> %s (期待 %s)'
+                  % ('OK' if good else 'NG', q or '（省略）', got, want))
+
+        TRAVEL_XML = (
+            '<opendata dataType="L">'
+            '<area><cd>50</cd></area>'
+            '<country areaCd="50" countryCd="42"><cd>0971</cd></country>'
+            '<riskLevel4>0</riskLevel4><riskLevel3>0</riskLevel3>'
+            '<riskLevel2>1</riskLevel2><riskLevel1>1</riskLevel1>'
+            '<infectionLevel4>0</infectionLevel4>'
+            '<infectionLevel3>0</infectionLevel3>'
+            '<infectionLevel2>0</infectionLevel2>'
+            '<infectionLevel1>1</infectionLevel1>'
+            '<riskLeaveDate keyCd="2026T066">2026/06/25 00:00:00'
+            '</riskLeaveDate>'
+            '<riskTitle>アラブ首長国連邦の危険情報</riskTitle>'
+            '<wideareaSpot><typeCd>C50</typeCd>'
+            '<leaveDate keyCd="a">2026/07/20 00:00:00</leaveDate>'
+            '<title>中東情勢を受けた注意喚起</title></wideareaSpot>'
+            '<wideareaSpot><typeCd>C50</typeCd>'
+            '<leaveDate keyCd="b">2026/01/05 00:00:00</leaveDate>'
+            '<title>ずっと前の注意喚起</title></wideareaSpot>'
+            '<wideareaSpot><typeCd>C50</typeCd>'
+            '<leaveDate keyCd="a">2026/07/20 00:00:00</leaveDate>'
+            '<title>中東情勢を受けた注意喚起</title></wideareaSpot>'
+            '<mail keyCd="x"><title>領事メール</title></mail>'
+            '</opendata>')
+        data = server_tools._travel_parse(TRAVEL_XML)
+        good = (data['risk'] == [2, 1] and data['infection'] == [1]
+                and data['date'] == server_tools.datetime.date(2026, 6, 25)
+                and len(data['spots']) == 2)
+        ok = ok and good
+        print('%-4s 渡航: XML を読む risk=%s inf=%s date=%s 注意喚起=%d件'
+              % ('OK' if good else 'NG', data['risk'], data['infection'],
+                 data['date'], len(data['spots'])))
+
+        say = server_tools._travel_say(
+            '0971', data, server_tools.datetime.date(2026, 7, 25))
+        good = ('いちばん高いところでレベル2' in say
+                and '2026年6月25日の発表で' in say
+                and '感染症の危険情報もレベル1で' in say
+                and '広い地域向けの注意喚起として、中東情勢' in say
+                and 'ずっと前' not in say
+                and len(say) <= server_tools.TRAVEL_MAX_CHARS)
+        ok = ok and good
+        print('%-4s 渡航: 読み上げ文 %d字: %s'
+              % ('OK' if good else 'NG', len(say), say))
+
+        # 新しくない注意喚起は言わない
+        say2 = server_tools._travel_say(
+            '0971', data, server_tools.datetime.date(2026, 9, 30))
+        good = ('注意喚起' not in say2 and 'これは2026年6月25日の発表で' in say2
+                and say2.endswith('感染症の危険情報もレベル1です。'))
+        ok = ok and good
+        print('%-4s 渡航: 古い注意喚起は落とす: %s'
+              % ('OK' if good else 'NG', say2))
+
+        # 危険情報が無い国は、その事実だけ言う
+        empty = server_tools._travel_parse(
+            '<opendata><riskLevel4>0</riskLevel4><riskLevel3>0</riskLevel3>'
+            '<riskLevel2>0</riskLevel2><riskLevel1>0</riskLevel1></opendata>')
+        say3 = server_tools._travel_say(
+            '0033', empty, server_tools.datetime.date(2026, 8, 1))
+        good = say3 == 'フランスに危険情報は出ていません。'
+        ok = ok and good
+        print('%-4s 渡航: 危険情報なし: %s' % ('OK' if good else 'NG', say3))
+
+        # 長い題名は切り詰める（読み上げが伸びないように）
+        longdata = dict(data)
+        longdata['spots'] = [(server_tools.datetime.date(2026, 7, 20),
+                              'あ' * 60)]
+        say4 = server_tools._travel_say(
+            '0971', longdata, server_tools.datetime.date(2026, 7, 25))
+        good = (len(say4) <= server_tools.TRAVEL_MAX_CHARS
+                and 'あ' * 40 not in say4)
+        ok = ok and good
+        print('%-4s 渡航: 長い題名でも %d字に収まる'
+              % ('OK' if good else 'NG', len(say4)))
+
+        # 取得先が 200 でメンテ用の HTML を返しても「危険情報なし」と読まない
+        try:
+            server_tools._travel_parse(
+                '<!doctype html><html><body>ただいまメンテナンス中です'
+                '</body></html>')
+            good = False
+        except ValueError:
+            good = True
+        ok = ok and good
+        print('%-4s 渡航: XML でない応答は読まずに投げる'
+              % ('OK' if good else 'NG'))
+
+        # 広域情報の題名は【】を落とし、読み上げが崩れない長さに詰める
+        TITLES = [
+            ('【広域情報】海外における写真・動画撮影及びＳＮＳ等への投稿に関する注意喚起',
+             '海外における写真・'),
+            ('中東情勢を受けた注意喚起', '中東情勢を受けた注意喚起'),
+        ]
+        for raw, want_head in TITLES:
+            got = server_tools._travel_spot_title(raw)
+            good = (got.startswith(want_head) and '【' not in got
+                    and len(got) <= server_tools.TRAVEL_TITLE_MAX + 2)
+            ok = ok and good
+            print('%-4s 渡航: 題名を詰める %d字 -> %d字: %s'
+                  % ('OK' if good else 'NG', len(raw), len(got), got))
+
+        text = await server_tools.call(s, 'get_travel_advisory',
+                                       {'country': 'ドバイ'})
+        print('%-28s %s' % ('渡航情報を実取得（ドバイ）', text[:80]))
+        if text.startswith('error:') or 'アラブ首長国連邦' not in text:
+            ok = False
+        text = await server_tools.call(s, 'get_travel_advisory',
+                                       {'country': 'ぬるぽ国'})
+        good = '分かりませんでした' in text
+        ok = ok and good
+        print('%-4s 渡航: 知らない国は聞き返す: %s'
+              % ('OK' if good else 'NG', text[:40]))
+
+        # 取得先が死んでいる: 新しい値があれば読む・無ければ穏当に断る
+        real_travel = server_tools.TRAVEL_URL
+        server_tools.TRAVEL_URL = 'http://127.0.0.1:9/%s.xml'
+        text = await server_tools.call(s, 'get_travel_advisory',
+                                       {'country': 'ドバイ'})
+        good = not text.startswith('error:')
+        ok = ok and good
+        print('%-4s 渡航: 死んでいるが直前の値あり: %s'
+              % ('OK' if good else 'NG', text[:40]))
+        server_tools._travel_cache.clear()
+        text = await server_tools.call(s, 'get_travel_advisory',
+                                       {'country': 'ドバイ'})
+        good = '取れませんでした' in text
+        ok = ok and good
+        print('%-4s 渡航: 取得先が死んでいる: %s'
+              % ('OK' if good else 'NG', text))
+        server_tools.TRAVEL_URL = real_travel
+        server_tools._travel_cache.clear()
+
         # ---- ニュース・地震・警報 ----
         text = await server_tools.call(s, "get_news", {})
         print("%-28s %s" % ("ニュースを実取得", text[:80]))
