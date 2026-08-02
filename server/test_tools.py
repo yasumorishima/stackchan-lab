@@ -456,6 +456,52 @@ async def main():
         ok = ok and good
         print("%-4s _train_line(京急を先に読む): %s" % ("OK" if good else "NG", line))
 
+        # ---- 燃油サーチャージ ----
+        FUEL_HTML = (
+            '<p>運賃額　2026年5月1日から2026年6月30日ご購入分まで</p>'
+            '<table><tr><th>路線</th><th>日本円</th></tr>'
+            '<tr><td>日本-欧州・北米（ハワイ除く）*1・中東・オセアニア</td>'
+            '<td>56,000</td></tr>'
+            '<tr><td>日本-韓国・ロシア</td><td>6,700</td></tr></table>'
+            '<p>運賃額　2026年7月1日から2026年8月31日ご購入分まで</p>'
+            '<table><tr><th>路線</th><th>日本円</th></tr>'
+            '<tr><td>日本-欧州・北米（ハワイ除く）*1・中東・オセアニア</td>'
+            '<td>65,000</td></tr>'
+            '<tr><td>日本-ハワイ・インド・インドネシア</td><td>40,400</td></tr>'
+            '<tr><td>日本-東アジア（韓国を除く）*7*9</td><td>15,400</td></tr>'
+            '<tr><td>日本-韓国・ロシア</td><td>7,400</td></tr></table>')
+        label, table = server_tools._fuel_pick(
+            FUEL_HTML, server_tools.datetime.date(2026, 8, 2))
+        amt = server_tools._fuel_amount(table, '中東')
+        good = label == '2026年8月31日ご購入分まで' and amt == '65,000'
+        ok = ok and good
+        print('%-4s 燃油: きょうの期間の表を選ぶ: %s %s'
+              % ('OK' if good else 'NG', label, amt))
+        label, table = server_tools._fuel_pick(
+            FUEL_HTML, server_tools.datetime.date(2026, 9, 15))
+        good = label == '2026年8月31日ご購入分まで'
+        ok = ok and good
+        print('%-4s 燃油: 谷間は最新の表に落ちる: %s'
+              % ('OK' if good else 'NG', label))
+        # 「（〜除く）」の注記に誤爆しない（査読指摘の再発防止）
+        for z, want in (('韓国', '7,400'), ('ハワイ', '40,400'),
+                        ('東アジア', '15,400'), ('中東', '65,000')):
+            amt = server_tools._fuel_amount(table, z)
+            good = amt == want
+            ok = ok and good
+            print('%-4s 燃油: 行の選択（%s）: %s'
+                  % ('OK' if good else 'NG', z, amt))
+        text = await server_tools.call(s, 'get_fuel_surcharge',
+                                       {'destination': 'よく分からない場所'})
+        good = '区分は分かりませんでした' in text
+        ok = ok and good
+        print('%-4s 燃油: 未知の行き先は聞き返す: %s' % ('OK' if good else 'NG', text[:40]))
+        text = await server_tools.call(s, 'get_fuel_surcharge',
+                                       {'destination': 'ドバイ'})
+        print('%-28s %s' % ('燃油を実取得（ドバイ）', text[:80]))
+        if text.startswith('error:') or '中東' not in text:
+            ok = False
+
         # ---- ニュース・地震・警報 ----
         text = await server_tools.call(s, "get_news", {})
         print("%-28s %s" % ("ニュースを実取得", text[:80]))

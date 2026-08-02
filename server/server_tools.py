@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -1452,6 +1453,125 @@ async def get_train(session, args, ctx=None) -> str:
     return line + stale
 
 
+# ---- 燃油サーチャージ（ANA 公式ページ） --------------------------------------
+# 公式の API は無い。ANA の燃油特別付加運賃ページ（静的 HTML・UA 必須）から、
+# きょうの発券日に効く期間の「日本発」表を読む。JAL 公式は bot 遮断（403 実測
+# 2026-08-02）で取れないため、ANA 基準の目安として読み上げる。改定は 2 か月ごと
+FUEL_URL = os.environ.get(
+    "FUEL_URL", "https://www.ana.co.jp/ja/jp/guide/plan/charge/fuelsurcharge/")
+FUEL_CACHE_TTL = float(os.environ.get("FUEL_CACHE_TTL", "43200"))   # 12 時間
+FUEL_STALE_MAX = float(os.environ.get("FUEL_STALE_MAX", "604800"))  # 7 日
+FUEL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+_fuel_cache = []   # [(取得時刻 monotonic, html)] を 1 件だけ
+
+# 行き先の言い方 → 表の行ラベルに入っている語。ドバイ経由の旅行が user の
+# 主用途なので、行き先を言われなければ中東
+FUEL_ZONES = [
+    ("中東", ("中東", "ドバイ", "アラブ", "UAE", "トルコ", "カタール", "ドーハ")),
+    ("欧州", ("欧州", "ヨーロッパ", "パリ", "ロンドン", "フランクフルト", "ローマ")),
+    ("北米", ("北米", "アメリカ", "ニューヨーク", "ロサンゼルス", "シカゴ", "カナダ")),
+    ("オセアニア", ("オセアニア", "オーストラリア", "シドニー", "ニュージーランド")),
+    ("ハワイ", ("ハワイ", "ホノルル")),
+    ("インドネシア", ("インドネシア", "バリ", "ジャカルタ")),
+    ("インド", ("インド",)),
+    ("タイ", ("タイ", "バンコク")),
+    ("シンガポール", ("シンガポール",)),
+    ("マレーシア", ("マレーシア", "クアラルンプール")),
+    ("ベトナム", ("ベトナム", "ハノイ", "ホーチミン")),
+    ("グアム", ("グアム",)),
+    ("フィリピン", ("フィリピン", "マニラ", "セブ")),
+    ("東アジア", ("東アジア", "中国", "上海", "北京", "台湾", "台北", "香港")),
+    ("韓国", ("韓国", "ソウル")),
+]
+_FUEL_PERIOD_RE = re.compile(
+    r"運賃額[^0-9<>]{0,6}(\d{4})年(\d{1,2})月(\d{1,2})日から"
+    r"(\d{4})年(\d{1,2})月(\d{1,2})日ご購入分まで")
+
+
+def _fuel_pick(html, today):
+    """きょうの発券日に効く期間を選び (期間の言い方, 日本発の表HTML) を返す。
+
+    きょうを含む期間が無ければ（改定の谷間）、終了日が一番先の表を使う。
+    期間見出しの直後の 1 つ目の表が「旅行開始国が日本」の表（実ページ確認済み）。
+    """
+    marks = list(_FUEL_PERIOD_RE.finditer(html))
+    best = None
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(html)
+        d2 = datetime.date(int(m.group(4)), int(m.group(5)), int(m.group(6)))
+        d1 = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        key = (d1 <= today <= d2, d2)
+        if best is None or key > best[0]:
+            best = (key, html[m.start():end], d2)
+    if best is None:
+        return "", ""
+    _, seg, d2 = best
+    label = "%d年%d月%d日ご購入分まで" % (d2.year, d2.month, d2.day)
+    t = re.search(r"<table.*?</table>", seg, re.S)
+    return label, (t.group(0) if t else "")
+
+
+def _fuel_amount(table_html, zone):
+    """表から zone（中東 など）を含む行の金額（カンマ入り数字）を返す。"""
+    for row in re.findall(r"<tr.*?</tr>", table_html, re.S):
+        cells = re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", row, re.S)
+        if len(cells) < 2:
+            continue
+        label = re.sub(r"<[^>]+>|\s", "", cells[0])
+        # 「（ハワイ除く）」「（韓国を除く）」の注記に部分一致すると
+        # 別の行の額を返してしまう（査読指摘・実ページで確認）
+        label = re.sub(r"（[^）]*除く）", "", label)
+        if zone in label:
+            amt = re.sub(r"<[^>]+>|\s", "", cells[1])
+            if re.fullmatch(r"[0-9,]+", amt):
+                return amt
+    return ""
+
+
+async def get_fuel_surcharge(session, args, ctx=None) -> str:
+    dest = str((args or {}).get("destination") or "").strip()
+    zone = ""
+    for z, aliases in FUEL_ZONES:
+        if any(a in dest for a in aliases):
+            zone = z
+            break
+    if dest and not zone:
+        return ("%sの区分は分かりませんでした。中東、欧州、北米、ハワイ、"
+                "東アジアなどの方面で聞いてください。" % dest)
+    zone = zone or "中東"
+    now = time.monotonic()
+    html = ""
+    if _fuel_cache and now - _fuel_cache[0][0] < FUEL_CACHE_TTL:
+        html = _fuel_cache[0][1]
+    else:
+        try:
+            tmo = aiohttp.ClientTimeout(total=15)
+            async with session.get(FUEL_URL, timeout=tmo,
+                                   headers={"User-Agent": FUEL_UA}) as r:
+                html = await r.text()
+            if _FUEL_PERIOD_RE.search(html):
+                _fuel_cache[:] = [(now, html)]
+            else:
+                # 形が変わった・メンテ中など。中身が無いものは cache しない
+                html = ""
+        except Exception as e:
+            log.warning("fuel unavailable: %s: %s", type(e).__name__,
+                        str(e)[:120])
+            html = ""
+        if not html and _fuel_cache and now - _fuel_cache[0][0] < FUEL_STALE_MAX:
+            html = _fuel_cache[0][1]
+    if not html:
+        return "error: いま燃油サーチャージを取れませんでした（取得先が応答しません）"
+    label, table = _fuel_pick(html, now_jst().date())
+    amt = _fuel_amount(table, zone)
+    if not amt:
+        return "error: いま燃油サーチャージを取れませんでした（ページの形が変わったようです）"
+    # 読点は合成の破綻防止（句読点間 34 モーラ以下に保つ）
+    return ("いま買う国際線のきっぷだと、ANAの場合、日本から%s方面の"
+            "燃油サーチャージは、片道%s円です。この額は、%sです。"
+            % (zone, amt, label))
+
+
 SPECS = [{
     "type": "function",
     "function": {
@@ -1589,6 +1709,21 @@ SPECS = [{
                        "などに使う。",
         "parameters": {"type": "object", "properties": {}},
     },
+}, {
+    "type": "function",
+    "function": {
+        "name": "get_fuel_surcharge",
+        "description": "国際線の燃油サーチャージ（燃油特別付加運賃）を調べる。"
+                       "「ドバイまでのサーチャージいくら？」「燃油サーチャージは？」"
+                       "などに使う。行き先を言われなければ中東（ドバイ）方面。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "destination": {"type": "string",
+                                "description": "行き先。例: ドバイ、パリ、ハワイ。省略可"},
+            },
+        },
+    },
 }]
 
 HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy,
@@ -1602,7 +1737,8 @@ HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy,
             "get_heat": get_heat,
             "get_onthisday": get_onthisday,
             "get_sky": get_sky,
-            "get_train": get_train}
+            "get_train": get_train,
+            "get_fuel_surcharge": get_fuel_surcharge}
 
 
 def specs():
