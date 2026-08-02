@@ -502,6 +502,50 @@ async def main():
         if text.startswith('error:') or '中東' not in text:
             ok = False
 
+        # ---- 週間予報 ----
+        WEEK_DAILY = {
+            'time': ['2026-08-03', '2026-08-04', '2026-08-05', '2026-08-06',
+                     '2026-08-07', '2026-08-08', '2026-08-09'],
+            'temperature_2m_max': [26.2, 26.9, 30.0, 31.1, 32.1, 29.0, 28.0],
+            'temperature_2m_min': [22.9, 21.5, 23.0, 24.0, 25.5, 24.0, 23.0],
+            'precipitation_probability_max': [55, 24, 10, 61, 70, 5, 0],
+        }
+        line = server_tools._week_line('横浜市', WEEK_DAILY,
+                                       WEEK_DAILY['time'])
+        good = ('8月3日(月)から8月9日(日)' in line
+                and '最高26.2〜32.1度' in line and '最低21.5〜25.5度' in line
+                and '雨が降りそうな日 3日(月)・6日(木)・7日(金)' in line)
+        ok = ok and good
+        print('%-4s 週間: 気温の幅と雨の日: %s' % ('OK' if good else 'NG', line))
+
+        dry = dict(WEEK_DAILY, precipitation_probability_max=[10] * 7)
+        line = server_tools._week_line('札幌市', dry, dry['time'])
+        good = '降水確率が高い日はなし' in line
+        ok = ok and good
+        print('%-4s 週間: 雨の日が無い: %s' % ('OK' if good else 'NG', line))
+
+        # 日付と紛れるので「ほか（5日）」とは言わない
+        wet = dict(WEEK_DAILY, precipitation_probability_max=[60] * 5 + [0, 0])
+        line = server_tools._week_line('横浜市', wet, wet['time'])
+        good = 'ほとんどの日が雨模様' in line and '（5日）' not in line
+        ok = ok and good
+        print('%-4s 週間: 雨の日が多い: %s' % ('OK' if good else 'NG', line))
+
+        broken = {'time': [], 'temperature_2m_max': [],
+                  'temperature_2m_min': []}
+        line = server_tools._week_line('横浜市', broken, [])
+        good = line.startswith('error:')
+        ok = ok and good
+        print('%-4s 週間: 取れなければ素直に断る: %s'
+              % ('OK' if good else 'NG', line))
+
+        # 前段の試験が「値が全部 null」のキャッシュを残しているので消す
+        server_tools._forecast_cache.clear()
+        text = await server_tools.call(s, 'get_weather', {'when': 'week'})
+        print('%-28s %s' % ('週間予報を実取得', text))
+        if text.startswith('error:') or 'から' not in text:
+            ok = False
+
         # ---- 渡航情報（外務省 海外安全情報オープンデータ） ----
         TRAVEL_FIND = [
             ('', '0971'), ('ドバイ経由で行く', '0971'), ('UAE', '0971'),
@@ -844,7 +888,8 @@ async def main():
 
     # 過去の日は今日として答えない
     PASTS = [("昨日の天気", "past"), ("おとといの天気", "past"),
-             ("今週の天気は", None), ("今度の日曜は", None),
+             ("今週の天気は", "week"), ("1週間の天気", "week"),
+             ("週間天気を教えて", "week"), ("今度の日曜は", None),
              ("大阪に住んでいますが天気は", None), ("今の天気", "now"),
              ("昨日は暑かったけど今日はどう", "today")]
     for text, want in PASTS:

@@ -155,7 +155,7 @@ async def _forecast(session, lat: float, lon: float):
         "current": "temperature_2m,weather_code,wind_speed_10m,relative_humidity_2m",
         "daily": ("weather_code,temperature_2m_max,temperature_2m_min,"
                   "precipitation_probability_max"),
-        "forecast_days": 3,
+        "forecast_days": WEEK_DAYS,
     })
     last = ""
     for attempt in range(3):
@@ -183,12 +183,19 @@ async def _forecast(session, lat: float, lon: float):
 
 
 WHEN_OFFSET = {"today": 0, "tomorrow": 1, "day_after_tomorrow": 2}
-WHEN_VALUES = ("now", "today", "tomorrow", "day_after_tomorrow")
+WHEN_VALUES = ("now", "today", "tomorrow", "day_after_tomorrow", "week")
+# 「これから 1 週間」= きょうを含む 7 日。1 日ずつ読むと 1 分を超えるので、
+# 気温の幅と雨が降りそうな日だけにまとめる
+WEEK_DAYS = 7
+WEEK_RAIN_PROB = 50
 
 # 発話から日を読む表。長い語を先に見る（「明後日」を「明日」で拾わないため、
 # また「今日」を「今」で拾わないため、並び順に意味がある）
 PAST = "past"
 DAY_WORDS = (
+    # 「今週」は「今」より先に見る（「今の」と紛れないよう長い語を先に）
+    ("week", ("1週間", "１週間", "一週間", "週間", "今週", "この先一週間",
+              "先一週間")),
     ("day_after_tomorrow", ("明後日", "あさって", "アサッテ")),
     ("tomorrow", ("明日", "あした", "あす", "アシタ")),
     ("today", ("今日", "きょう", "本日", "キョウ")),
@@ -234,6 +241,39 @@ def infer_when(ctx) -> str:
     return "today"
 
 
+def _week_line(shown: str, daily: dict, days: list) -> str:
+    """これから 1 週間を 1 行にまとめる。
+
+    7 日を 1 日ずつ読むと読み上げが 1 分を超える（実測で 1 日ぶん約 8 秒）。
+    毎日の値でなく「気温の幅」と「雨が降りそうな日」に絞る。
+    """
+    hi = [v for v in (daily.get("temperature_2m_max") or []) if v is not None]
+    lo = [v for v in (daily.get("temperature_2m_min") or []) if v is not None]
+    prob = daily.get("precipitation_probability_max") or []
+    if not days or not hi or not lo:
+        return "error: %s の週間予報が取れませんでした" % shown
+    first = datetime.date.fromisoformat(days[0])
+    last = datetime.date.fromisoformat(days[-1])
+    span = "%d月%d日(%s)から%d月%d日(%s)" % (
+        first.month, first.day, WDAY[first.weekday()],
+        last.month, last.day, WDAY[last.weekday()])
+    rain = []
+    for n, day in enumerate(days):
+        p = prob[n] if n < len(prob) else None
+        if p is not None and p >= WEEK_RAIN_PROB:
+            d = datetime.date.fromisoformat(day)
+            rain.append("%d日(%s)" % (d.day, WDAY[d.weekday()]))
+    if not rain:
+        wet = "降水確率が高い日はなし"
+    elif len(rain) >= 5:
+        # 「ほか（5日）」は日付の 5 日と紛れる（声だと直せない）
+        wet = "ほとんどの日が雨模様"
+    else:
+        wet = "雨が降りそうな日 %s" % "・".join(rain)
+    return "%s %s 最高%.1f〜%.1f度 最低%.1f〜%.1f度 %s" % (
+        shown, span, min(hi), max(hi), min(lo), max(lo), wet)
+
+
 async def get_weather(session, args, ctx=None) -> str:
     place = str(args.get("place") or DEFAULT_PLACE)
     when = str(args.get("when") or "")
@@ -243,7 +283,8 @@ async def get_weather(session, args, ctx=None) -> str:
         when = infer_when(ctx)
     if when == PAST:
         # 予報しか取れないので、今日として答えず分からないと言う
-        return "error: 過去の天気は分かりません。今日からあさってまでなら調べられます"
+        return ("error: 過去の天気は分かりません。"
+                "今日からこの先 1 週間なら調べられます")
     if isinstance(ctx, dict):
         # 次の追い質問で引き継げるように、実際に使った値を呼び出し側へ返す
         ctx["resolved_when"] = when
@@ -268,8 +309,11 @@ async def get_weather(session, args, ctx=None) -> str:
         if not now_part:
             return "error: %s の実況が取れませんでした" % shown
         return "%s の天気: %s%s" % (shown, now_part, stale)
-    i = WHEN_OFFSET.get(when, 0)
     days = daily.get("time") or []
+    if when == "week":
+        line = _week_line(shown, daily, days)
+        return line if line.startswith("error:") else line + stale
+    i = WHEN_OFFSET.get(when, 0)
     if i >= len(days):
         return "error: %s の予報は取れません" % when
     d = datetime.date.fromisoformat(days[i])
@@ -1890,7 +1934,9 @@ SPECS = [{
     "type": "function",
     "function": {
         "name": "get_weather",
-        "description": "指定した場所の天気を調べる。今の天気・今日/明日/明後日の予報。"
+        "description": "指定した場所の天気を調べる。今の天気・今日/明日/明後日"
+                       "の予報・これから1週間の見通し（week）。"
+                       "「週間天気」「今週どう？」には week を使う。"
                        "場所を言われなければ既定（" + DEFAULT_PLACE + "）で調べる。",
         "parameters": {
             "type": "object",
@@ -1898,7 +1944,8 @@ SPECS = [{
                 "place": {"type": "string",
                           "description": "地名。例: 横浜、東京、大阪。省略可"},
                 "when": {"type": "string",
-                         "enum": ["now", "today", "tomorrow", "day_after_tomorrow"],
+                         "enum": ["now", "today", "tomorrow",
+                                  "day_after_tomorrow", "week"],
                          "description": "いつの天気か。既定は today"},
             },
         },

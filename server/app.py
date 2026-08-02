@@ -474,10 +474,25 @@ def _avoid_mid_token(s: str, cut: int) -> int:
 
     「29」を「2」「9」に割ると読みそのものが壊れる（実際に踏んだ）。
     """
+    def kind(c):
+        if not c:
+            return ""
+        if c.isdigit() or c in ".,%〜～":
+            return "n"          # 数と範囲・単位記号（26.2〜32.1 を割らない）
+        if c.isascii() and c.isalpha():
+            return "a"          # 英字
+        if "ァ" <= c <= "ヺ" or c == "ー":
+            return "k"          # カタカナ（外来語は 1 語）
+        if "一" <= c <= "鿕" or c in "々〆":
+            return "j"          # 漢字（熟語は 1 語）
+        return ""               # 平仮名・記号はここでは守らない
+
     def same_token(a, b):
-        if not a or not b:
+        x, y = kind(a), kind(b)
+        if not x or not y:
             return False
-        return ((a.isdigit() or a == ".") and (b.isdigit() or b == ".")) or                (a.isalpha() and a.isascii() and b.isalpha() and b.isascii())
+        # 「26.2 度」「89%」のように数のうしろに単位が付く形も 1 語として扱う
+        return x == y or (x == "n" and y == "j")
 
     i = cut
     while i > 1 and same_token(s[i - 1:i], s[i:i + 1]):
@@ -892,6 +907,15 @@ JA_CHAR_RE = re.compile("[" + "ぁ-ゖァ-ヺ一-鿕" + "]")
 # 記号の読み。℃ は「ど シー」と読まれてしまう（実測 28℃ -> にじゅうはちどシー）
 SYMBOL_READ = (("℃", "度"), ("°C", "度"), ("㎡", "平方メートル"))
 EMPHASIS_RE = re.compile(r"\*{1,2}|__")
+# 生成が箇条書き・表のような書き方をすると、区切りが空白とコロンだけになり
+# 読点が 1 つも無いまま 50 モーラを超える（実機 2026-08-03 の天気「最高気温：
+# 26.2 度 最低気温：22.9 度 …」）。読点が無いと切り所も無く、字数で切るので
+# 「現|在」「55|%」のように語の途中で切れて途切れ途切れに聞こえた。
+# 声に出す前に区切りを読点へ直す（消すと語が繋がるので「詰める」ではない）
+LIST_COLON_RE = re.compile("(?<=[" + _JA + "])[：:]" + _SP + "*")
+# 絵文字は読み上げられない（読まれても意味が無い）
+EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF"
+                      "\uFE0F\u20E3\u2190-\u21FF\u2300-\u23FF]")
 READ_AS = [
     ("AI Engine", "エーアイエンジン"),
     ("Open JTalk", "オープンジェイトーク"),
@@ -918,7 +942,9 @@ def fix_reading(text: str) -> str:
         text)
     text = CLOSER_RE.sub("", text)
     text = NUM_SPACE_RE.sub("", text)
-    return JA_SPACE_RE.sub("", text)
+    text = JA_SPACE_RE.sub("", text)
+    text = EMOJI_RE.sub("", text)
+    return LIST_COLON_RE.sub("は、", text)
 
 
 # 生成が壊れると省略記号などの羅列を返す（実機 2026-08-02 10:29、gpt-oss が
