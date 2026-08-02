@@ -101,6 +101,12 @@ VAD_MAX_MS = float(os.environ.get("VAD_MAX_MS", "15000"))
 # 受信バッファの絶対上限（フレーム数）。VAD が効かない手動モードの保険
 MAX_BUFFER_FRAMES = int(float(os.environ.get("MAX_BUFFER_MS", "120000")) / 60.0)
 # 読み上げが本体で鳴り終わるまでの余裕。短いと自分の声を拾って再認識する
+# 割り込み（barge-in）。本体は鳴らしている間ほぼマイクを送らないので、
+# 文の切れ目で一度 tts を閉じ、鳴り終わってから短い窓を開けて聞く
+BARGE_IN = os.environ.get("BARGE_IN", "1") not in ("0", "false", "no")
+BARGE_MIN_SEC = float(os.environ.get("BARGE_MIN_SEC", "6"))
+BARGE_WINDOW = float(os.environ.get("BARGE_WINDOW", "0.4"))
+BARGE_SPEECH_MS = float(os.environ.get("BARGE_SPEECH_MS", "240"))
 SPEAK_TAIL_SEC = float(os.environ.get("SPEAK_TAIL_SEC", "0.8"))
 # こちらが話した直後なら相槌にも返事をする猶予 [s]
 FILLER_FOLLOWUP_SEC = float(os.environ.get("FILLER_FOLLOWUP_SEC", "15"))
@@ -1213,6 +1219,33 @@ async def ws_handler(request: web.Request):
         except Exception:
             log.exception("先出しの server hello に失敗した")
 
+    async def listen_gap(sent: int, t0: float):
+        """文の切れ目に、割り込みを聞くための窓を作る。
+
+        戻り値は (割り込まれたか, 新しい t0)。t0 は鳴り終わり待ちの計算に
+        使うので、貯まりが空になった時点に取り直す。
+        """
+        await send_json({"type": "tts", "state": "stop"})
+        state["phase"] = "tail"
+        lead = sent * FRAME_MS / 1000.0 - (time.monotonic() - t0)
+        await asyncio.sleep(max(0.0, lead) + BARGE_WINDOW)
+        heard, speech = state["listening"], state.get("speech_ms", 0.0)
+        log.info("文の切れ目で %.1f 秒聞いた（本体が聞き始めた=%s・音声 %.0fms・"
+                 "最大rms %.0f）", BARGE_WINDOW, heard, speech,
+                 state.get("max_rms", 0.0))
+        if heard and speech >= BARGE_SPEECH_MS:
+            log.info("読み上げ中に話しかけられたので残りをやめる")
+            return True, t0
+        if heard:
+            # 続きを流す前に聞くのをやめる（自分の声を拾って往復しないため）
+            state["listening"] = False
+            pcm_chunks.clear()
+            state["stream"] = None
+        await send_json({"type": "tts", "state": "start"})
+        state["phase"] = "speak"
+        # ここで貯まりは空。以後の先行ぶんはこの時点から数え直す
+        return False, time.monotonic() - sent * FRAME_MS / 1000.0
+
     async def speak(text: str):
         # 文ごとに合成して送る。次の文は今の文を流している裏で作る（初音までを短く）
         sentences = quicken_first(split_sentences(text))
@@ -1235,6 +1268,13 @@ async def ws_handler(request: web.Request):
                 nxt = asyncio.create_task(synthesize(session, sentences[i + 1]))
             if not pcm:
                 continue
+            # 長い返事の途中だけ、割り込みを聞く窓を挟む。短い返事に挟むと
+            # 間延びするだけで、そもそも待てるので挟まない
+            if (BARGE_IN and sent
+                    and sent * FRAME_MS / 1000.0 >= BARGE_MIN_SEC):
+                barged, t0 = await listen_gap(sent, t0)
+                if barged:
+                    return
             await send_json({"type": "tts", "state": "sentence_start", "text": s})
             for packet in encoder.encode_stream(pcm):
                 await ws.send_bytes(packet)
