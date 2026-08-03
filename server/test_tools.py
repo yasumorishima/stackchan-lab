@@ -948,6 +948,116 @@ async def main():
             ok = False
         print("%-4s 日の読み取り: %-22s -> %s (期待 %s)" % (mark, text, got, want))
 
+    # ---- プロ野球（NPB） ----
+    # 球団名の言われ方
+    for said, want in (("ベイスターズ", "横浜DeNAベイスターズ"),
+                       ("横浜", "横浜DeNAベイスターズ"),
+                       ("ベイスターズの速報", "横浜DeNAベイスターズ"),
+                       ("巨人", "読売ジャイアンツ"),
+                       ("ソフトバンク", "福岡ソフトバンクホークス"),
+                       ("", None), ("ぬるぽ", None)):
+        got = server_tools.npb_match(said)
+        mark = "OK" if got == want else "NG"
+        if got != want:
+            ok = False
+        print("%-4s 球団名: %-16s -> %s" % (mark, said or "(空)", got))
+
+    # 速報の読み取り（取得先の作りが変わったら気づけるよう、形を固定して試す）
+    live_html = (
+        "<h5>8月3日（月）</h5>"
+        + chr(60) + 'p class="right">21時16分更新</p>'
+        + chr(60) + 'div id="score_live_basic">'
+        + chr(60) + 'a href="/scores/2026/0803/b-e-13/" class="link_block">'
+        + chr(60) + 'td class="team1"><img alt="オリックス・バファローズ"></td>'
+        + chr(60) + 'td class="score">6</td><td class="score">4</td>'
+        + chr(60) + 'td class="team2"><img alt="東北楽天ゴールデンイーグルス"></td>'
+        + chr(60) + 'td class="state" colspan="5">（東京ドーム）' + NL + "9回表</td></a>"
+        + chr(60) + 'div class="standings_wrap_c"><time>8月2日現在</time>'
+        + "<tr><th>阪神タイガース 阪神</th><td>94</td><td>53</td><td>40</td>"
+        + "<td>1</td><td>.570</td><td>-</td></tr>"
+        + "<tr><th>横浜DeNAベイスターズ 横浜DeNA</th><td>95</td><td>41</td>"
+        + "<td>51</td><td>3</td><td>.446</td><td>12.0</td></tr>")
+    live = server_tools._parse_live(live_html)
+    g = live["games"][0] if live["games"] else {}
+    checks2 = [("速報の日付", live["day"], "8月3日（月）"),
+               ("速報の更新時刻", live["at"], "21時16分更新"),
+               ("速報の試合数", len(live["games"]), 1),
+               ("速報の得点", (g.get("s1"), g.get("s2")), ("6", "4")),
+               ("速報の状況", g.get("state"), "（東京ドーム） 9回表"),
+               ("勝敗表の順位", live["stand"]["横浜DeNAベイスターズ"]["rank"], 2),
+               ("勝敗表の勝敗", live["stand"]["横浜DeNAベイスターズ"]["l"], "51")]
+
+    # 1 行の作り方。開始前は得点が「*」で、状況に球場と開始時刻が入る
+    for memo, g, want in (
+            ("試合中", {"t1": "横浜DeNAベイスターズ", "t2": "阪神タイガース",
+                     "s1": "3", "s2": "2", "state": "（横浜） 7回裏"},
+             "横浜DeNA 3 対 2 阪神、横浜 7回裏"),
+            ("開始前", {"t1": "横浜DeNAベイスターズ", "t2": "阪神タイガース",
+                     "s1": "*", "s2": "*", "state": "（横浜） 18:00"},
+             "横浜DeNA 対 阪神は横浜 18:00"),
+            ("中止", {"t1": "横浜DeNAベイスターズ", "t2": "阪神タイガース",
+                    "s1": "", "s2": "", "state": "中止"},
+             "横浜DeNA 対 阪神は中止"),
+            ("状況が空", {"t1": "横浜DeNAベイスターズ", "t2": "阪神タイガース",
+                      "s1": "*", "s2": "*", "state": ""},
+             "横浜DeNA 対 阪神はこれからです")):
+        got = server_tools._game_line(g)
+        mark = "OK" if got == want else "NG"
+        if got != want:
+            ok = False
+        print("%-4s 速報の1行(%s): %s" % (mark, memo, got))
+
+    # 公示の読み取り
+    roster_html = (
+        "<h4>2026年8月3日の出場選手登録、登録抹消</h4>"
+        + "<h5>出場選手登録</h5><table><tr><td>なし</td></tr></table>"
+        + "<h5>出場選手登録抹消</h5><table>"
+        + "<tr>" + chr(60) + 'td class="team">横浜DeNAベイスターズ</td>'
+        + chr(60) + 'td class="pos">投手</td>' + chr(60) + 'td class="num">43</td>'
+        + "<td><a href=x>深沢　鳳介</a></td></tr></table>"
+        + "<h4>出場選手一覧</h4>" + chr(60) + 'td class="team">阪神タイガース</td>'
+        + chr(60) + 'td class="pos">投手</td><td><a href=x>読まない　選手</a></td>')
+    ros = server_tools._parse_roster(roster_html)
+    checks2 += [("公示の日付", ros["day"], "8月3日"),
+                ("公示の登録", len(ros["add"]), 0),
+                ("公示の抹消", len(ros["drop"]), 1),
+                ("公示の選手名", ros["drop"][0]["name"] if ros["drop"] else "",
+                 "深沢鳳介")]
+
+    # 応援歌の読み取り（ふりがなは丸括弧。最後の 1 行だけ span が無い作り）
+    song_html = (
+        chr(60) + 'h3 class="heading inherit-height">牧 秀悟</h3>'
+        + chr(60) + 'span class="text__color--sub-text">(おおおおー)</span>'
+        + "<br>(かっとばせーしゅうご！)"
+        + chr(60) + 'h3 class="heading inherit-height">林 琢真</h3>'
+        + chr(60) + 'span class="text__color--sub-text">(しゃーぷに)</span>'
+        + chr(60) + 'h4>選手の呼び方（苗字以外の場合）</h4>'
+        + chr(60) + 'script>ga("body");</script>(ひろわない)')
+    songs = server_tools._parse_songs(song_html)
+    checks2 += [("応援歌の人数", len(songs), 2),
+                ("応援歌の行", songs.get("牧秀悟"),
+                 ["おおおおー", "かっとばせーしゅうご！"]),
+                ("応援歌は見出しで切る", songs.get("林琢真"), ["しゃーぷに"]),
+                ("応援歌の姓引き", server_tools._find_player(songs, "牧"), "牧秀悟"),
+                ("応援歌の空振り", server_tools._find_player(songs, "だれか"), None)]
+
+    for memo, got, want in checks2:
+        mark = "OK" if got == want else "NG"
+        if got != want:
+            ok = False
+        print("%-4s %-16s -> %s (期待 %s)" % (mark, memo, got, want))
+
+    # 実際に取りに行く経路（取得先が落ちていれば error: で返る）
+    async with aiohttp.ClientSession() as s2:
+        for name, args in (("get_baseball", {"team": "ベイスターズ"}),
+                           ("get_roster_move", {}),
+                           ("get_cheer_song", {"player": "牧"})):
+            text = await server_tools.call(s2, name, args)
+            bad = text.startswith("error:")
+            if bad:
+                ok = False
+            print("%-4s %-16s %s" % ("NG" if bad else "OK", name, text[:70]))
+
     print("jst:", server_tools.jst_stamp())
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

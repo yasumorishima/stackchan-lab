@@ -2123,6 +2123,388 @@ async def get_travel_advisory(session, args, ctx=None) -> str:
     return _travel_world_say(sweep, area)
 
 
+# ---- プロ野球（NPB の公開ページ。キー不要・無料） ----------------------------
+# 速報は npb.jp/games/<年>/ の「試合速報」（1 分ごとに更新）と、同じページに
+# 載っている勝敗表。公示（出場選手登録・抹消）は npb.jp/announcement/roster/。
+NPB_LIVE_URL = os.environ.get("NPB_LIVE_URL", "https://npb.jp/games/")
+NPB_ROSTER_URL = os.environ.get(
+    "NPB_ROSTER_URL", "https://npb.jp/announcement/roster/")
+NPB_LIVE_TTL = float(os.environ.get("NPB_LIVE_TTL", "60"))
+NPB_ROSTER_TTL = float(os.environ.get("NPB_ROSTER_TTL", "1800"))
+NPB_STALE_MAX = float(os.environ.get("NPB_STALE_MAX", "10800"))
+NPB_UA = {"User-Agent": "Mozilla/5.0"}
+NPB_TEAM = os.environ.get("NPB_TEAM", "横浜DeNAベイスターズ")
+
+# 正式名 -> 声に出す短い名前 / 言われ方の候補。公示も勝敗表も正式名で書いてある
+NPB_TEAMS = [
+    ("横浜DeNAベイスターズ", "横浜DeNA",
+     ["ベイスターズ", "ベイ", "DeNA", "でぃーえぬえー", "横浜"]),
+    ("阪神タイガース", "阪神", ["タイガース", "虎"]),
+    ("読売ジャイアンツ", "巨人", ["ジャイアンツ", "読売"]),
+    ("東京ヤクルトスワローズ", "ヤクルト", ["スワローズ", "燕"]),
+    ("広島東洋カープ", "広島", ["カープ", "鯉"]),
+    ("中日ドラゴンズ", "中日", ["ドラゴンズ", "竜"]),
+    ("福岡ソフトバンクホークス", "ソフトバンク", ["ホークス", "鷹"]),
+    ("北海道日本ハムファイターズ", "日本ハム", ["ファイターズ", "ハム"]),
+    ("千葉ロッテマリーンズ", "ロッテ", ["マリーンズ"]),
+    ("オリックス・バファローズ", "オリックス", ["バファローズ"]),
+    ("東北楽天ゴールデンイーグルス", "楽天", ["イーグルス", "ゴールデンイーグルス"]),
+    ("埼玉西武ライオンズ", "西武", ["ライオンズ", "獅子"]),
+]
+
+_npb_live_cache = []      # [(取得時刻 monotonic, パース済み)] を 1 件だけ
+_npb_roster_cache = []
+
+
+def npb_short(full: str) -> str:
+    for name, short, _ in NPB_TEAMS:
+        if name == full:
+            return short
+    return full
+
+
+def npb_match(text: str):
+    """言われた名前から正式名を決める。分からなければ None。"""
+    t = (text or "").strip()
+    if not t:
+        return None
+    for name, short, alias in NPB_TEAMS:
+        if t == name or t == short or t in alias:
+            return name
+    # 「ベイスターズの速報」のように前後が付いた形。長い候補から順に見る
+    cands = []
+    for name, short, alias in NPB_TEAMS:
+        for c in [name, short] + alias:
+            cands.append((len(c), c, name))
+    for _, c, name in sorted(cands, reverse=True):
+        if c in t:
+            return name
+    return None
+
+
+def _npb_text(seg: str) -> str:
+    """タグを落として空白を 1 つに詰める（改行やタブも空白として扱う）。"""
+    return " ".join(re.sub("<[^>]*>", " ", seg).split())
+
+
+def _parse_live(html: str) -> dict:
+    """試合速報の一覧と、同じページの勝敗表を読む。"""
+    i = html.find('id="score_live_basic"')
+    if i < 0:
+        raise RuntimeError("試合速報の枠が見つからない")
+    seg = html[i:]
+    j = seg.find("<h4>")            # 次の見出し（勝敗表）の手前まで
+    if j > 0:
+        seg = seg[:j]
+    games = []
+    for block in seg.split('class="link_block"')[1:]:
+        teams = re.findall('alt="([^"]+)"', block)
+        scores = re.findall('<td class="score">(.*?)</td>', block, re.S)
+        m = re.search('<td class="state"[^>]*>(.*?)</td>', block, re.S)
+        if len(teams) < 2 or len(scores) < 2:
+            continue
+        games.append({"t1": teams[0], "t2": teams[1],
+                      "s1": _npb_text(scores[0]), "s2": _npb_text(scores[1]),
+                      "state": _npb_text(m.group(1)) if m else ""})
+    head = html[:i]
+    m = re.search("<h5>([^<]+)</h5>", head)
+    day = m.group(1).strip() if m else ""
+    m = re.search('<p class="right">([^<]+)</p>', head)
+    at = m.group(1).strip() if m else ""
+    return {"day": day, "at": at, "games": games,
+            "stand": _parse_standings(html)}
+
+
+def _parse_standings(html: str) -> dict:
+    """勝敗表。順位はページに書いていないので、行の並び順を順位とみなす。"""
+    out = {}
+    for lg, key in (("セ・リーグ", "standings_wrap_c"),
+                    ("パ・リーグ", "standings_wrap_p")):
+        i = html.find(key)
+        if i < 0:
+            continue
+        end = html.find("standings_wrap", i + len(key))
+        seg = html[i:end if end > i else i + 12000]
+        m = re.search("<time>([^<]+)</time>", seg)
+        asof = m.group(1).strip() if m else ""
+        rank = 0
+        for row in seg.split("</tr>"):
+            txt = _npb_text(row)
+            name = None
+            for nm, short, _ in NPB_TEAMS:
+                if nm in txt:
+                    name = nm
+                    break
+            if name is None:
+                continue
+            nums = [t for t in txt.split() if t.replace(".", "").isdigit()]
+            if len(nums) < 4:
+                continue
+            rank += 1
+            out[name] = {"lg": lg, "rank": rank, "asof": asof,
+                         "w": nums[1], "l": nums[2], "d": nums[3]}
+    return out
+
+
+async def _npb_fetch(session, url: str) -> str:
+    async with session.get(url, headers=NPB_UA,
+                           timeout=aiohttp.ClientTimeout(total=15)) as r:
+        raw = await r.read()
+        if r.status != 200:
+            raise RuntimeError("npb %d" % r.status)
+    return raw.decode("utf-8", "replace")
+
+
+async def _npb_live(session):
+    """(取得時刻, パース済み) を返す。取れない時は古い値、それも無ければ raise。"""
+    now = time.monotonic()
+    if _npb_live_cache and now - _npb_live_cache[0][0] < NPB_LIVE_TTL:
+        return _npb_live_cache[0]
+    url = "%s%d/" % (NPB_LIVE_URL, now_jst().year)
+    try:
+        data = _parse_live(await _npb_fetch(session, url))
+        _npb_live_cache[:] = [(now, data)]
+    except Exception as e:
+        log.warning("npb live unavailable: %s: %s", type(e).__name__, e)
+        if not (_npb_live_cache and now - _npb_live_cache[0][0] < NPB_STALE_MAX):
+            raise
+    return _npb_live_cache[0]
+
+
+def _game_line(g: dict) -> str:
+    t1, t2 = npb_short(g["t1"]), npb_short(g["t2"])
+    state = g["state"].replace("（", "").replace("）", "").strip()
+    if not (g["s1"].isdigit() and g["s2"].isdigit()):
+        # 開始前は得点が「*」。state に球場と開始時刻が入っている
+        return "%s 対 %sは%s" % (t1, t2, state or "これからです")
+    if not state:
+        return "%s %s 対 %s %s" % (t1, g["s1"], g["s2"], t2)
+    return "%s %s 対 %s %s、%s" % (t1, g["s1"], g["s2"], t2, state)
+
+
+async def get_baseball(session, args, ctx=None) -> str:
+    want = npb_match(str(args.get("team") or "")[:MAX_PLACE_LEN])
+    try:
+        ts, data = await _npb_live(session)
+    except Exception:
+        return "error: いまプロ野球の速報を取れませんでした（取得先が応答しません）"
+    age = time.monotonic() - ts
+    stale = "※%d分前の情報です。" % int(age / 60) if age > 600 else ""
+    day = data["day"] or "今日"
+    games = data["games"]
+    if want:
+        short = npb_short(want)
+        mine = [g for g in games if want in (g["t1"], g["t2"])]
+        if mine:
+            out = "%sの速報です。%s。" % (day, "。".join(_game_line(g) for g in mine))
+        else:
+            out = "%sは%sの試合はありません。" % (day, short)
+        st = data["stand"].get(want)
+        if st:
+            out += "順位は%s%d位、%s勝%s敗%s分です（%s）。" % (
+                st["lg"], st["rank"], st["w"], st["l"], st["d"], st["asof"])
+        return out + stale
+    head = ("%sは試合がありません。" % day if not games
+            else "%sの速報です。%s。" % (day,
+                                  "。".join(_game_line(g) for g in games)))
+    return head + _stand_line(data["stand"]) + stale
+
+
+def _stand_line(stand: dict) -> str:
+    """球団を言われない時に添える順位表。上から順に短い名前で並べる。"""
+    out = []
+    for lg in ("セ・リーグ", "パ・リーグ"):
+        rows = sorted(((v["rank"], k) for k, v in stand.items()
+                       if v["lg"] == lg))
+        if not rows:
+            continue
+        out.append("%sは、%sの順です。"
+                   % (lg, "、".join(npb_short(k) for _, k in rows)))
+    return "".join(out)
+
+
+def _parse_roster(html: str) -> dict:
+    """出場選手登録・登録抹消の公示。後半の「出場選手一覧」は読まない。"""
+    m = re.search("<h4>([^<]*出場選手登録[^<]*)</h4>", html)
+    if m is None:
+        raise RuntimeError("公示の見出しが見つからない")
+    day = ""
+    d = re.search("([0-9]+)年([0-9]+)月([0-9]+)日", m.group(1))
+    if d:
+        day = "%s月%s日" % (d.group(2), d.group(3))
+    end = html.find("出場選手一覧", m.end())
+    seg = html[m.end():end if end > 0 else len(html)]
+    out = {"day": day, "add": [], "drop": []}
+    for part in seg.split("<h5>")[1:]:
+        k = part.find("</h5>")
+        head = part[:k] if k > 0 else ""
+        if "抹消" in head:
+            key = "drop"
+        elif "出場選手登録" in head:
+            key = "add"
+        else:
+            continue
+        e = part.find("</table>")
+        for row in (part[:e] if e > 0 else part).split("</tr>"):
+            t = re.search('<td class="team">(.*?)</td>', row, re.S)
+            p = re.search('<td class="pos">(.*?)</td>', row, re.S)
+            n = re.search('<td class="num">(.*?)</td>', row, re.S)
+            names = re.findall("<a[^>]*>(.*?)</a>", row, re.S)
+            if not (t and p and names):
+                continue
+            out[key].append({"team": _npb_text(t.group(1)),
+                             "pos": _npb_text(p.group(1)),
+                             "num": _npb_text(n.group(1)) if n else "",
+                             "name": _npb_text(names[-1]).replace(" ", "")})
+    return out
+
+
+async def _npb_roster(session):
+    now = time.monotonic()
+    if _npb_roster_cache and now - _npb_roster_cache[0][0] < NPB_ROSTER_TTL:
+        return _npb_roster_cache[0]
+    try:
+        data = _parse_roster(await _npb_fetch(session, NPB_ROSTER_URL))
+        _npb_roster_cache[:] = [(now, data)]
+    except Exception as e:
+        log.warning("npb roster unavailable: %s: %s", type(e).__name__, e)
+        if not (_npb_roster_cache
+                and now - _npb_roster_cache[0][0] < NPB_STALE_MAX):
+            raise
+    return _npb_roster_cache[0]
+
+
+def _move_line(rows, team_known: bool) -> str:
+    out = []
+    for r in rows:
+        who = "%s %s" % (r["pos"], r["name"])
+        out.append(who if team_known else "%sの%s" % (npb_short(r["team"]), who))
+    return "、".join(out)
+
+
+async def get_roster_move(session, args, ctx=None) -> str:
+    want = npb_match(str(args.get("team") or "")[:MAX_PLACE_LEN])
+    try:
+        ts, data = await _npb_roster(session)
+    except Exception:
+        return "error: いま公示を取れませんでした（取得先が応答しません）"
+    add, drop = data["add"], data["drop"]
+    if want:
+        add = [r for r in add if r["team"] == want]
+        drop = [r for r in drop if r["team"] == want]
+    head = "%sの公示です。" % (data["day"] or "今日")
+    if want:
+        head = "%sの%sの公示です。" % (data["day"] or "今日", npb_short(want))
+    if not add and not drop:
+        return head + "出場選手の登録も抹消もありません。"
+    parts = []
+    parts.append("登録は、" + _move_line(add, bool(want)) + "です。"
+                 if add else "登録はありません。")
+    parts.append("抹消は、" + _move_line(drop, bool(want)) + "です。"
+                 if drop else "抹消はありません。")
+    return head + "".join(parts)
+
+
+# ---- 選手応援歌（横浜DeNAベイスターズ 公式） --------------------------------
+# 公式サイトが歌詞とふりがなを載せている（音源は無い）。読み上げにはふりがな
+# の方を使う。歌詞はリポジトリに置かず、その都度取りに行く。
+SONG_URL = os.environ.get("BAYSTARS_SONG_URL",
+                          "https://sp.baystars.co.jp/player_songs/index")
+SONG_TTL = float(os.environ.get("BAYSTARS_SONG_TTL", "86400"))
+_song_cache = []
+
+
+# ふりがなは仮名で書いてあり英字は出てこない。取りこぼした script の
+# 断片は実測でどれも英字を含んでいた（'"body"' / 'j,b' / 広告の URL）
+_NOT_READING = re.compile('[A-Za-z]')
+
+
+def _reading_like(x: str) -> bool:
+    """ふりがなは仮名で書いてある。英字が混じる行は歌詞ではない。"""
+    return not _NOT_READING.search(x)
+
+
+def _parse_songs(html: str) -> dict:
+    """選手名 -> 応援歌の読み（行ごと）。ふりがなは丸括弧で書かれている。"""
+    out = {}
+    for part in re.split('<h3 class="heading[^"]*">', html)[1:]:
+        k = part.find("</h3>")
+        if k < 0:
+            continue
+        name = _npb_text(part[:k]).replace(" ", "")
+        body = part[k:]
+        cuts = [body.find(t) for t in ("<h3", "<h4", "<script", "<footer")]
+        cuts = [c for c in cuts if c > 0]
+        if cuts:
+            body = body[:min(cuts)]
+        lines = [x.strip() for x in
+                 re.findall("[(（]([^()（）]+)[)）]", _npb_text(body))]
+        lines = [x for x in lines if x and _reading_like(x)]
+        if name and lines:
+            out[name] = lines
+    if not out:
+        raise RuntimeError("応援歌が 1 人ぶんも読めない")
+    return out
+
+
+async def _songs_fetch(session):
+    async with session.get(SONG_URL, headers=NPB_UA,
+                           timeout=aiohttp.ClientTimeout(total=15)) as r:
+        raw = await r.read()
+        if r.status != 200:
+            raise RuntimeError("baystars %d" % r.status)
+    data = _parse_songs(raw.decode("utf-8", "replace"))
+    _song_cache[:] = [(time.monotonic(), data)]
+    return data
+
+
+async def _songs(session):
+    """取れない時は古い歌詞で答える（歌詞はめったに変わらない）。"""
+    now = time.monotonic()
+    if _song_cache and now - _song_cache[0][0] < SONG_TTL:
+        return _song_cache[0][1]
+    try:
+        return await _songs_fetch(session)
+    except Exception as e:
+        log.warning("cheer song unavailable: %s: %s", type(e).__name__, e)
+        if _song_cache:
+            return _song_cache[0][1]
+        raise
+
+
+def _find_player(songs: dict, who: str):
+    """言われた名前で引く。姓だけ・名だけでも当てる。1 人に絞れなければ None。"""
+    q = "".join(who.split()).replace("　", "").replace("選手", "")
+    if not q:
+        return None
+    if q in songs:
+        return q
+    hit = [n for n in songs if q == n.replace(" ", "")]
+    if len(hit) == 1:
+        return hit[0]
+    hit = [n for n in songs if q in n.replace(" ", "")]
+    if len(hit) == 1:
+        return hit[0]
+    return None
+
+
+async def get_cheer_song(session, args, ctx=None) -> str:
+    who = str(args.get("player") or "")[:MAX_PLACE_LEN]
+    try:
+        songs = await _songs(session)
+    except Exception as e:
+        log.warning("cheer song unavailable: %s: %s", type(e).__name__, e)
+        return "error: いま応援歌を取れませんでした（取得先が応答しません）"
+    if not who:
+        return ("応援歌が分かるのは、" + "、".join(songs) +
+                "、の%d件です。誰の応援歌にしますか。" % len(songs))
+    name = _find_player(songs, who)
+    if name is None:
+        return ("%sの応援歌は載っていません。分かるのは、" % who
+                + "、".join(songs) + "、です。")
+    return "%sの応援歌です。" % name + "。".join(songs[name]) + "。"
+
+
 SPECS = [{
     "type": "function",
     "function": {
@@ -2297,6 +2679,55 @@ SPECS = [{
             },
         },
     },
+}, {
+    "type": "function",
+    "function": {
+        "name": "get_baseball",
+        "description": "プロ野球（NPB）の今日の試合の速報と順位を調べる。"
+                       "「ベイスターズ勝ってる？」「今日の野球どう？」"
+                       "「今何位？」などに使う。"
+                       "球団を言われなければ今日の全試合を答える。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "team": {"type": "string",
+                         "description": "球団名。例: ベイスターズ、阪神、"
+                                        "ソフトバンク。省略すると全試合"},
+            },
+        },
+    },
+}, {
+    "type": "function",
+    "function": {
+        "name": "get_roster_move",
+        "description": "プロ野球（NPB）の今日の公示＝出場選手の登録・登録抹消を"
+                       "調べる。「選手の入れ替えあった？」「誰か抹消された？」"
+                       "「一軍に上がった選手いる？」などに使う。"
+                       "球団を言われなければ 12 球団ぜんぶ答える。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "team": {"type": "string",
+                         "description": "球団名。省略すると 12 球団ぜんぶ"},
+            },
+        },
+    },
+}, {
+    "type": "function",
+    "function": {
+        "name": "get_cheer_song",
+        "description": "横浜DeNAベイスターズの選手応援歌の歌詞を調べる。"
+                       "「牧の応援歌うたって」「ベイスターズの応援歌教えて」"
+                       "などに使う。返ってきた歌詞は要約せず、そのまま読む。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "player": {"type": "string",
+                           "description": "選手名。例: 牧秀悟、筒香。"
+                                          "省略すると分かる選手の一覧"},
+            },
+        },
+    },
 }]
 
 HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy,
@@ -2312,7 +2743,10 @@ HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy,
             "get_sky": get_sky,
             "get_train": get_train,
             "get_fuel_surcharge": get_fuel_surcharge,
-            "get_travel_advisory": get_travel_advisory}
+            "get_travel_advisory": get_travel_advisory,
+            "get_baseball": get_baseball,
+            "get_roster_move": get_roster_move,
+            "get_cheer_song": get_cheer_song}
 
 
 def specs():
