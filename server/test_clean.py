@@ -76,7 +76,8 @@ CLEAN = [
 SHORTEN = [
     ("こんにちは。", "こんにちは。", "そのまま"),
     ("晴れです。26度です。湿度は73%です。風はおだやかです。傘はいりません。夕方は涼しくなります。おしまい。",
-     "晴れです。26度です。湿度は73%です。風はおだやかです。傘はいりません。夕方は涼しくなります。", "7 文目を落とす"),
+     "晴れです。26度です。湿度は73%です。風はおだやかです。傘はいりません。夕方は涼しくなります。おしまい。",
+     "7 文は全部読む"),
     # 2 文で切ると網羅した答えが 1 項目で終わる（実機 12:42 の get_sky）
     ("晴れです。32度です。降水確率は41%です。",
      "晴れです。32度です。降水確率は41%です。", "3 文は全部読む"),
@@ -310,6 +311,25 @@ for _t, _want, _memo in _TAIL:
     _got = app.trim_incomplete_tail(_t)
     ng += _got != _want
     print("%s %s: %r" % ("OK" if _got == _want else "NG", _memo, _got))
+
+# 応援歌のように繰り返しが中身そのものの時は、言い直しを畳まない
+_VERBATIM = [
+    ("オオオオー オオオオー。オオオオオ オオオオオ。かっとばせ。かっとばせー！",
+     "オオオオー オオオオー。オオオオオ オオオオオ。かっとばせ。かっとばせー！",
+     "繰り返しを残す"),
+    ("1。2。3。4。5。6。7。8。9。10。11。12。13。",
+     "1。2。3。4。5。6。7。8。9。10。11。12。", "13 文目は落とす"),
+]
+for _t, _want, _memo in _VERBATIM:
+    n_split += 1
+    _got = app.shorten_reply(_t, True)
+    ng += _got != _want
+    print("%s %s: %r" % ("OK" if _got == _want else "NG", _memo, _got))
+    n_split += 1
+    _folded = app.shorten_reply(_t)
+    _ok = len(_folded) < len(_want)
+    ng += not _ok
+    print("%s 既定では畳む: %r" % ("OK" if _ok else "NG", _folded))
 
 total = len(CLEAN) + len(SHORTEN) + n_split
 print("")

@@ -222,11 +222,12 @@ SYSTEM_PROMPT = os.environ.get(
     "この時刻を応答に書き写してはいけません（時刻を聞かれた時だけ答えます）。",
 )
 # 読み上げる文の数と長さの上限。システム文で頼むのではなく code 側で切る
-# 2 文だと網羅した答えが 1 項目で終わる（2026-08-03 12:42 の実機は
+# 6 文でも足りない（2026-08-03 の応援歌は 9 行あり、締めの「かっとばせー！」
+# が落ちた）。2 文だと網羅した答えが 1 項目で終わる（同日 12:42 の実機は
 # get_sky の答えが「日の出は、04:52 頃です。」で終わり、日の入りと月齢が
 # 落ちた。同じ履歴の再現で本文 215 字 → 読み上げ 51 字）。声の長さを
 # 決めているのは字数の方なので、文の数はそれを邪魔しない位置まで広げる
-MAX_SENTENCES = int(os.environ.get("MAX_SENTENCES", "6"))
+MAX_SENTENCES = int(os.environ.get("MAX_SENTENCES", "12"))
 # 字数を広げたのは、網羅した答え（燃油サーチャージの全方面で 177 字、
 # 渡航情報の世界集計で 79 字）が途中で切れないため
 MAX_REPLY_CHARS = int(os.environ.get("MAX_REPLY_CHARS", "240"))
@@ -1113,14 +1114,20 @@ def dedupe_sentences(parts):
     return out
 
 
-def shorten_reply(text: str) -> str:
+# 返ってきた言葉をそのまま読む道具。繰り返しを畳むと中身が壊れる
+VERBATIM_TOOLS = {"get_cheer_song"}
+
+
+def shorten_reply(text: str, verbatim: bool = False) -> str:
     """読み上げる長さを code 側で切る。
 
     「2 文以内」をシステム文で頼むと、その指示ぶんだけツール選択が弱くなる
     （qwen2.5:3b 実測: 指示なし 呼び出し 7/9、指示ありの長いシステム文 1/9）。
     形は code で守る方が確実で、プロンプトも短く保てる。
     """
-    parts = dedupe_sentences(plain_sentences(text))
+    parts = plain_sentences(text)
+    if not verbatim:
+        parts = dedupe_sentences(parts)
     text = "".join(parts[:MAX_SENTENCES])
     if len(text) > MAX_REPLY_CHARS:
         head = text[:MAX_REPLY_CHARS]
@@ -1142,11 +1149,13 @@ async def respond(session, history, tools=None, call_tool=None):
         return "ドライランです。音声の往復だけ確認しています。", []
     msgs = list(history)
     trace = []
+    verbatim = False
     for _ in range(MAX_TOOL_ROUNDS):
         msg = await sakura_chat(session, msgs, tools)
         calls = msg.get("tool_calls") or []
         if not calls or call_tool is None:
-            reply = shorten_reply(clean_reply(msg.get("content")))
+            reply = shorten_reply(clean_reply(msg.get("content")),
+                                  verbatim)
             if not reply:
                 log.warning("空の応答（本文=%r）",
                             (msg.get("content") or "")[:120])
@@ -1184,6 +1193,8 @@ async def respond(session, history, tools=None, call_tool=None):
                     result = await call_tool(name, args)
                 except Exception as e:
                     result = "error: %s" % e
+            if name in VERBATIM_TOOLS:
+                verbatim = True
             log.info("tool %s(%s) -> %s", name, args, str(result)[:200])
             out = {"role": "tool", "tool_call_id": c["id"],
                    "content": str(result)}
