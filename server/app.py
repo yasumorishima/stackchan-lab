@@ -220,9 +220,13 @@ SYSTEM_PROMPT = os.environ.get(
     "この時刻を応答に書き写してはいけません（時刻を聞かれた時だけ答えます）。",
 )
 # 読み上げる文の数と長さの上限。システム文で頼むのではなく code 側で切る
-MAX_SENTENCES = int(os.environ.get("MAX_SENTENCES", "2"))
-# 2 文までは据え置き。字数だけ広げたのは、網羅した答え（燃油サーチャージの
-# 全方面で 177 字、渡航情報の世界集計で 79 字）が途中で切れないため
+# 2 文だと網羅した答えが 1 項目で終わる（2026-08-03 12:42 の実機は
+# get_sky の答えが「日の出は、04:52 頃です。」で終わり、日の入りと月齢が
+# 落ちた。同じ履歴の再現で本文 215 字 → 読み上げ 51 字）。声の長さを
+# 決めているのは字数の方なので、文の数はそれを邪魔しない位置まで広げる
+MAX_SENTENCES = int(os.environ.get("MAX_SENTENCES", "6"))
+# 字数を広げたのは、網羅した答え（燃油サーチャージの全方面で 177 字、
+# 渡航情報の世界集計で 79 字）が途中で切れないため
 MAX_REPLY_CHARS = int(os.environ.get("MAX_REPLY_CHARS", "240"))
 # 直前に調べた「いつの天気か」を Device-Id ごとに覚える時間 [s]。
 # 省略形の追い質問（「じゃあ鳥取は？」）で引き継ぐためだが、長く持つと
@@ -352,8 +356,10 @@ async def chat_once(session: aiohttp.ClientSession, history, tools,
         "temperature": 0.7,
         # gpt-oss 系は tools 付きだと思考（analysis チャネル）にもトークンを使い、
         # 200 だと本文が空のまま length で切れることがある（probe_followup で実測）。
+        # 400 でも足りない時があり、2026-08-03 06:54 の実機は本文が
+        # 「…天気：晴れ時々くもり 最高気温」で終わってそのまま読み上げた。
         # さくらはリクエスト数課金なので上げてもコストは変わらない。
-        "max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "400")),
+        "max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "800")),
         "stream": False,
     }
     if tools:
@@ -368,7 +374,31 @@ async def chat_once(session: aiohttp.ClientSession, history, tools,
         body = await r.json()
         if r.status != 200:
             raise ChatHTTPError(r.status, body)
-        return body["choices"][0]["message"]
+        choice = body["choices"][0]
+        msg = choice["message"]
+        if choice.get("finish_reason") == "length" and msg.get("content"):
+            msg["content"] = trim_incomplete_tail(msg["content"])
+        return msg
+
+
+def trim_incomplete_tail(text: str) -> str:
+    """生成が上限で切れた時、言いかけの最後の一片を落とす。
+
+    2026-08-03 06:54 の実機は「…最高気温」で終わり、その語をそのまま
+    読み上げた。完結した文が 1 つでもあれば、そこまでを答えにする。
+    1 つも無い時は落とすと答えが消えてしまうので、そのまま読む
+    （切れた事実はログに残す）。
+    """
+    cut = max(text.rfind(c) for c in "。．！？!?")
+    if cut < 0:
+        log.warning("生成が上限で切れた（完結した文が無いのでそのまま読む）: %r",
+                    text[-30:])
+        return text
+    tail = text[cut + 1:].strip()
+    if tail:
+        log.warning("生成が上限で切れたので言いかけの %d 字を落とす: %r",
+                    len(tail), tail[:40])
+    return text[:cut + 1]
 
 
 async def sakura_chat(session: aiohttp.ClientSession, history, tools=None) -> dict:
@@ -963,7 +993,25 @@ EMPHASIS_RE = re.compile(r"\*{1,2}|__")
 # 26.2 度 最低気温：22.9 度 …」）。読点が無いと切り所も無く、字数で切るので
 # 「現|在」「55|%」のように語の途中で切れて途切れ途切れに聞こえた。
 # 声に出す前に区切りを読点へ直す（消すと語が繋がるので「詰める」ではない）
-LIST_COLON_RE = re.compile("(?<=[" + _JA + "])[：:]" + _SP + "*")
+LIST_COLON_RE = re.compile("(?<=[" + _JA + "）)])[：:]" + _SP + "*")
+# 言い切りの後ろのコロンまで「〜は、」にすると「こんな感じですは、」に
+# なる（2026-08-03 の燃油サーチャージ全方面の再現で実測）。言い切りと
+# 閉じ括弧の後ろは句点にして、そこで文を閉じる
+DECL_END_RE = re.compile("(?:です|ます|でした|ました|だった|である|ですね|ますね)$")
+# 生成が固有名詞を書き崩すことがある（2026-08-03 実機の
+# 「ナスディック総合指数」「カンボジ国」）。読みでなく綴りの取り違えで、
+# 声にすると別の語に聞こえるので、聞いて分かる形に戻す
+MISWRITTEN = (("ナスディック", "ナスダック"), ("カンボジ国", "カンボジア"))
+
+
+def _colon_to_pause(m) -> str:
+    head = m.string[:m.start()]
+    if DECL_END_RE.search(head):
+        return "。"
+    # 閉じ括弧の後ろに「は、」を付けると「〜片道）は、」になる。
+    # 句点にすると一覧の途中で文が切れる（実測「（中国・香港・台湾など）。
+    # 15,400円」）ので、間だけ空ける
+    return "、" if head.endswith(("）", ")")) else "は、"
 # 絵文字は読み上げられない（読まれても意味が無い）
 EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF"
                       "\uFE0F\u20E3\u2190-\u21FF\u2300-\u23FF]")
@@ -995,7 +1043,9 @@ def fix_reading(text: str) -> str:
     text = NUM_SPACE_RE.sub("", text)
     text = JA_SPACE_RE.sub("", text)
     text = EMOJI_RE.sub("", text)
-    return LIST_COLON_RE.sub("は、", text)
+    for wrong, right in MISWRITTEN:
+        text = text.replace(wrong, right)
+    return LIST_COLON_RE.sub(_colon_to_pause, text)
 
 
 # 生成が壊れると省略記号などの羅列を返す（実機 2026-08-02 10:29、gpt-oss が
@@ -1272,12 +1322,21 @@ async def ws_handler(request: web.Request):
         """
         await send_json({"type": "tts", "state": "stop"})
         state["phase"] = "tail"
+        # 窓の中だけを測る。聞き始めていない間の speech_ms は前の発話の
+        # 残りで、2026-08-03 のログは 0.4 秒の窓に「音声 660ms」と出ていた
+        # （聞き始めた時は start_listening が 0 に戻すので、その分は真値）
+        state["speech_ms"] = 0.0
+        state["max_rms"] = 0.0
+        base_frames = state.get("drop_tail", 0)
         lead = sent * FRAME_MS / 1000.0 - (time.monotonic() - t0)
         await asyncio.sleep(max(0.0, lead) + BARGE_WINDOW)
-        heard, speech = state["listening"], state.get("speech_ms", 0.0)
-        log.info("文の切れ目で %.1f 秒聞いた（本体が聞き始めた=%s・音声 %.0fms・"
-                 "最大rms %.0f）", BARGE_WINDOW, heard, speech,
-                 state.get("max_rms", 0.0))
+        heard = state["listening"]
+        speech = state.get("speech_ms", 0.0) if heard else 0.0
+        log.info("文の切れ目で %.1f 秒聞いた（本体が聞き始めた=%s・窓の音声 %.0fms・"
+                 "最大rms %.0f・聞かないまま届いた %d フレーム）",
+                 BARGE_WINDOW, heard, speech,
+                 state.get("max_rms", 0.0) if heard else 0.0,
+                 state.get("drop_tail", 0) - base_frames)
         if heard and speech >= BARGE_SPEECH_MS:
             log.info("読み上げ中に話しかけられたので残りをやめる")
             return True, t0
