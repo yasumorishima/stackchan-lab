@@ -109,6 +109,8 @@ BARGE_WINDOW = float(os.environ.get("BARGE_WINDOW", "0.4"))
 BARGE_SPEECH_MS = float(os.environ.get("BARGE_SPEECH_MS", "240"))
 BARGE_SEEK_SEC = float(os.environ.get("BARGE_SEEK_SEC", "2.0"))
 BARGE_PAUSE_RMS = float(os.environ.get("BARGE_PAUSE_RMS", "300"))
+# 本体が「聞き始めた」と言ってくるまで待つ上限 [s]（貯まりの見積りに足す）
+BARGE_LISTEN_WAIT = float(os.environ.get("BARGE_LISTEN_WAIT", "2.5"))
 SPEAK_TAIL_SEC = float(os.environ.get("SPEAK_TAIL_SEC", "0.8"))
 # こちらが話した直後なら相槌にも返事をする猶予 [s]
 FILLER_FOLLOWUP_SEC = float(os.environ.get("FILLER_FOLLOWUP_SEC", "15"))
@@ -1266,7 +1268,8 @@ async def ws_handler(request: web.Request):
     state = {"listening": False, "hello_done": False, "history": history,
              "stream": None, "mcp": None, "mcp_task": None, "task": None,
              "hello_task": None, "auto": False, "last_spoke": 0.0,
-             "speech_ms": 0.0, "silence_ms": 0.0, "max_rms": 0.0}
+             "speech_ms": 0.0, "silence_ms": 0.0, "max_rms": 0.0,
+             "listen_evt": asyncio.Event()}
 
     async def send_json(obj):
         await ws.send_str(json.dumps(obj, ensure_ascii=False))
@@ -1328,19 +1331,43 @@ async def ws_handler(request: web.Request):
         state["speech_ms"] = 0.0
         state["max_rms"] = 0.0
         base_frames = state.get("drop_tail", 0)
+        evt = state["listen_evt"]
+        evt.clear()
         lead = sent * FRAME_MS / 1000.0 - (time.monotonic() - t0)
-        await asyncio.sleep(max(0.0, lead) + BARGE_WINDOW)
-        heard = state["listening"]
+        # 貯まりの見積り（lead）で窓を開けると空振りする。2026-08-03 の実ログ
+        # では、返事の 1 つ目の窓が閉じた 0.5〜1.1 秒あとに本体の listen start
+        # が届いていた（t0 を合成の前に取っているので、本体が鳴らし始めるまで
+        # の分だけ lead が短い。2 つ目以降は t0 を取り直すので合う）。加えて
+        # 本体側にも貯まりがある。見積りではなく合図そのものを待つ
+        w0 = time.monotonic()
+        try:
+            await asyncio.wait_for(evt.wait(),
+                                   max(0.0, lead) + BARGE_LISTEN_WAIT)
+            came = True
+        except asyncio.TimeoutError:
+            came = False
+        waited = time.monotonic() - w0
+        win = 0.0
+        if came:
+            # 声が立った時点で切り上げる（黙っている時だけ窓いっぱい待つ）
+            end = time.monotonic() + BARGE_WINDOW
+            while time.monotonic() < end:
+                if state.get("speech_ms", 0.0) >= BARGE_SPEECH_MS:
+                    break
+                await asyncio.sleep(0.02)
+            win = time.monotonic() - end + BARGE_WINDOW
+        heard = came and state["listening"]
         speech = state.get("speech_ms", 0.0) if heard else 0.0
-        log.info("文の切れ目で %.1f 秒聞いた（本体が聞き始めた=%s・窓の音声 %.0fms・"
-                 "最大rms %.0f・聞かないまま届いた %d フレーム）",
-                 BARGE_WINDOW, heard, speech,
+        log.info("文の切れ目で聞いた（本体が聞き始めた=%s・合図まで %.2f 秒・"
+                 "窓 %.2f 秒の音声 %.0fms・最大rms %.0f・"
+                 "聞かないまま届いた %d フレーム）",
+                 heard, waited, win, speech,
                  state.get("max_rms", 0.0) if heard else 0.0,
                  state.get("drop_tail", 0) - base_frames)
         if heard and speech >= BARGE_SPEECH_MS:
             log.info("読み上げ中に話しかけられたので残りをやめる")
             return True, t0
-        if heard:
+        if state["listening"]:
             # 続きを流す前に聞くのをやめる（自分の声を拾って往復しないため）
             state["listening"] = False
             pcm_chunks.clear()
@@ -1499,6 +1526,7 @@ async def ws_handler(request: web.Request):
                 state[k] = 0.0
         state["phase"] = "think"
         state["listening"] = True
+        state["listen_evt"].set()
         state["auto"] = auto
         state["speech_ms"] = 0.0
         state["silence_ms"] = 0.0
