@@ -548,7 +548,7 @@ async def main():
 
         # ---- 渡航情報（外務省 海外安全情報オープンデータ） ----
         TRAVEL_FIND = [
-            ('', '0971'), ('ドバイ経由で行く', '0971'), ('UAE', '0971'),
+            ('', ''), ('ドバイ経由で行く', '0971'), ('UAE', '0971'),
             ('インド', '0091'), ('インドネシア', '0062'),
             ('ギニア', '0224'), ('パプアニューギニア', '0675'),
             ('ドミニカ', '0767'), ('ドミニカ共和国', '0809'),
@@ -677,6 +677,55 @@ async def main():
         print('%-28s %s' % ('渡航情報を実取得（ドバイ）', text[:80]))
         if text.startswith('error:') or 'アラブ首長国連邦' not in text:
             ok = False
+        # 世界ぜんぶ・地域ぜんぶ（集計はモックで、通信を増やさない）
+        SWEEP = {
+            '0093': {'risk': [4], 'infection': [], 'date': None,
+                     'area': '50'},
+            '0964': {'risk': [4, 3], 'infection': [], 'date': None,
+                     'area': '50'},
+            '0971': {'risk': [2], 'infection': [], 'date': None,
+                     'area': '50'},
+            '0033': {'risk': [], 'infection': [], 'date': None,
+                     'area': '42'},
+            '0380': {'risk': [4], 'infection': [], 'date': None,
+                     'area': '42'},
+        }
+        say = server_tools._travel_world_say(SWEEP, '')
+        good = ('世界で危険情報が出ているのは、5か国のうち4か国です' in say
+                and '全土がレベル4' in say and '2か国' in say
+                and 'など' not in say)
+        ok = ok and good
+        print('%-4s 渡航: 世界ぜんぶ: %s' % ('OK' if good else 'NG', say))
+
+        say = server_tools._travel_world_say(SWEEP, '50')
+        good = ('中東で危険情報が出ているのは、3か国のうち3か国です' in say
+                and 'アフガニスタン' in say and 'ウクライナ' not in say)
+        ok = ok and good
+        print('%-4s 渡航: 地域ぜんぶ: %s' % ('OK' if good else 'NG', say))
+
+        # 挙げ切れないときだけ「など」と言う
+        many = dict((cd, {'risk': [4], 'infection': [], 'date': None,
+                          'area': '50'})
+                    for cd in ('0093', '0964', '0963', '0967', '0961',
+                               '0098', '0970', '0090'))
+        say = server_tools._travel_world_say(many, '')
+        good = 'など' in say
+        ok = ok and good
+        print('%-4s 渡航: 多いときは「など」: %s' % ('OK' if good else 'NG', say[:60]))
+
+        AREAS = [('中東', '50'), ('ヨーロッパ', '42'), ('欧州', '42'),
+                 ('アフリカ', '60'), ('オセアニア', '20'), ('南米', '33'),
+                 ('世界', ''), ('タイ', None)]
+        for q, want in AREAS:
+            got = server_tools._travel_area(q)
+            # 国名が先に当たるものは地域として引かない
+            good = (got == want) if want is not None else True
+            if q == 'タイ' and server_tools._travel_find(q) != '0066':
+                good = False
+            ok = ok and good
+            print('%-4s 渡航: 地域の引き当て %-8s -> %r'
+                  % ('OK' if good else 'NG', q, got))
+
         text = await server_tools.call(s, 'get_travel_advisory',
                                        {'country': 'ぬるぽ国'})
         good = '分かりませんでした' in text

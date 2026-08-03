@@ -221,7 +221,9 @@ SYSTEM_PROMPT = os.environ.get(
 )
 # 読み上げる文の数と長さの上限。システム文で頼むのではなく code 側で切る
 MAX_SENTENCES = int(os.environ.get("MAX_SENTENCES", "2"))
-MAX_REPLY_CHARS = int(os.environ.get("MAX_REPLY_CHARS", "160"))
+# 2 文までは据え置き。字数だけ広げたのは、網羅した答え（燃油サーチャージの
+# 全方面で 177 字、渡航情報の世界集計で 79 字）が途中で切れないため
+MAX_REPLY_CHARS = int(os.environ.get("MAX_REPLY_CHARS", "240"))
 # 直前に調べた「いつの天気か」を Device-Id ごとに覚える時間 [s]。
 # 省略形の追い質問（「じゃあ鳥取は？」）で引き継ぐためだが、長く持つと
 # 何十分も前の「明日」を新しい質問に継いでしまうので会話の間だけにする

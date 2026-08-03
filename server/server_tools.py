@@ -1572,6 +1572,25 @@ def _fuel_amount(table_html, zone):
     return ""
 
 
+def _fuel_rows(table_html):
+    """表の全行を [(方面, 金額)] で返す。読み上げ向けに注記や記号を落とす。"""
+    out = []
+    for row in re.findall(r"<tr.*?</tr>", table_html, re.S):
+        cells = re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", row, re.S)
+        if len(cells) < 2:
+            continue
+        amt = re.sub(r"<[^>]+>|\s", "", cells[1])
+        if not re.fullmatch(r"[0-9,]+", amt):
+            continue          # 見出し行
+        zone = re.sub(r"<[^>]+>|\s", "", cells[0])
+        zone = re.sub(r"^日本[-−ー]", "", zone)      # 「日本-」は毎行同じ
+        zone = re.sub(r"（[^）]*）", "", zone)        # 「（ハワイ除く）」等の注記
+        zone = re.sub(r"\*[0-9*]*", "", zone)        # 「*1」等の脚注記号
+        if zone:
+            out.append((zone, amt))
+    return out
+
+
 async def get_fuel_surcharge(session, args, ctx=None) -> str:
     dest = str((args or {}).get("destination") or "").strip()
     zone = ""
@@ -1582,7 +1601,7 @@ async def get_fuel_surcharge(session, args, ctx=None) -> str:
     if dest and not zone:
         return ("%sの区分は分かりませんでした。中東、欧州、北米、ハワイ、"
                 "東アジアなどの方面で聞いてください。" % dest)
-    zone = zone or "中東"
+    # zone が空＝行き先を言われていない。中東に決め打ちせず全方面を読む
     now = time.monotonic()
     html = ""
     if _fuel_cache and now - _fuel_cache[0][0] < FUEL_CACHE_TTL:
@@ -1607,6 +1626,17 @@ async def get_fuel_surcharge(session, args, ctx=None) -> str:
     if not html:
         return "error: いま燃油サーチャージを取れませんでした（取得先が応答しません）"
     label, table = _fuel_pick(html, now_jst().date())
+    if not zone:
+        # 行き先を言われなければ全方面を読む（1 方面だけに絞らない）
+        rows = _fuel_rows(table)
+        if not rows:
+            return ("error: いま燃油サーチャージを取れませんでした"
+                    "（ページの形が変わったようです）")
+        # 「2026年8月31日ご購入分まで」の年は今期の話なので言わない
+        when = re.sub(r"^\d{4}年", "", label)
+        body = "、".join("%sが%s円" % (z, a) for z, a in rows)
+        return ("%s、ANAの日本発、片道の燃油サーチャージです。%sです。"
+                % (when, body))
     amt = _fuel_amount(table, zone)
     if not amt:
         return "error: いま燃油サーチャージを取れませんでした（ページの形が変わったようです）"
@@ -1637,53 +1667,83 @@ TRAVEL_TITLE_MAX = 20
 
 TRAVEL_LEVELS = {4: "退避してください", 3: "渡航は止めてください",
                  2: "不要不急の渡航は止めてください", 1: "十分注意してください"}
+# 地域コード（外務省 area.xlsx）。地域を言われたらその地域だけ集計する
+TRAVEL_AREAS = {"10": "アジア", "20": "大洋州", "30": "北米", "33": "中南米",
+                "42": "ヨーロッパ", "50": "中東", "60": "アフリカ"}
+TRAVEL_AREA_WORDS = (
+    ("50", ("中東", "中近東")), ("42", ("ヨーロッパ", "欧州")),
+    ("33", ("中南米", "南米", "中米", "ラテンアメリカ")),
+    ("30", ("北米", "北アメリカ")),
+    ("20", ("大洋州", "オセアニア", "太平洋")),
+    ("60", ("アフリカ",)), ("10", ("アジア",)),
+    ("", ("世界", "全部", "ぜんぶ", "全体", "海外", "外国")),
+)
+# 全 207 か国の集計。危険レベルは XML の先頭にあるので、広域情報の手前で
+# 打ち切れば 1 か国 4KB 程度で済む（実測 5.2 秒 / 0.85MB / 207 件成功）
+TRAVEL_SWEEP_TTL = float(os.environ.get("TRAVEL_SWEEP_TTL", "43200"))  # 12 時間
+TRAVEL_SWEEP_CONC = int(os.environ.get("TRAVEL_SWEEP_CONC", "8"))
+TRAVEL_SWEEP_BYTES = int(os.environ.get("TRAVEL_SWEEP_BYTES", "60000"))
+TRAVEL_NAME_MAX = 3   # 読み上げで並べる国名の数
 
 # 国コード一覧（外務省 海外安全情報オープンデータの country.xlsx・207 件）
-# 形は「電話の国番号:日本語名」。名前の ／ は別名、（）は地域の内訳
+# 形は「地域コード:電話の国番号:日本語名」。名前の ／ は別名、（）は内訳
 TRAVEL_COUNTRY_SRC = (
-    "0060:マレーシア 0062:インドネシア 0063:フィリピン 0065:シンガポール 0066:タイ "
-    "0082:大韓民国／韓国 0084:ベトナム 0086:中華人民共和国／中国 0091:インド 0092:パキスタン "
-    "0094:スリランカ 0095:ミャンマー 0670:東ティモール 0673:ブルネイ 0850:北朝鮮 0852:香港 "
-    "0853:マカオ 0855:カンボジア 0856:ラオス 0880:バングラデシュ 0886:台湾 0960:モルディブ "
-    "0975:ブータン 0976:モンゴル 0977:ネパール 0061:オーストラリア／豪州 0064:ニュージーランド "
-    "0674:ナウル 0675:パプアニューギニア 0676:トンガ 0677:ソロモン諸島 0678:バヌアツ "
-    "0679:フィジー 0680:パラオ 0682:クック諸島 0683:ニウエ 0685:サモア独立国 0686:キリバス "
-    "0687:ニューカレドニア（仏領） 0688:ツバル 0691:ミクロネシア 0692:マーシャル諸島 "
-    "1001:アメリカ合衆国／米国（北マリアナ諸島） 1002:アメリカ合衆国／米国（グアム） 1684:サモア（米領） "
-    "9689:タヒチ（仏領ポリネシア） 1000:アメリカ合衆国／米国（本土） 1808:アメリカ合衆国／米国（ハワイ） "
-    "9001:カナダ 0051:ペルー 0052:メキシコ 0053:キューバ 0054:アルゼンチン 0055:ブラジル "
-    "0056:チリ 0057:コロンビア 0058:ベネズエラ 0473:グレナダ 0501:ベリーズ 0502:グアテマラ "
-    "0503:エルサルバドル 0504:ホンジュラス 0505:ニカラグア 0506:コスタリカ 0507:パナマ "
-    "0509:ハイチ 0591:ボリビア 0592:ガイアナ 0593:エクアドル 0595:パラグアイ 0597:スリナム "
-    "0598:ウルグアイ 0758:セントルシア 0767:ドミニカ国 0784:セントビンセント及びグレナディーン諸島 "
-    "0809:ドミニカ共和国 0868:トリニダード・トバゴ 0869:セントクリストファー・ネービス 0876:ジャマイカ "
-    "1242:バハマ 1246:バルバドス 1268:アンティグア・バーブーダ 0007:カザフスタン 0030:ギリシャ "
-    "0031:オランダ 0032:ベルギー 0033:フランス 0034:スペイン 0036:ハンガリー 0039:イタリア "
-    "0040:ルーマニア 0041:スイス 0043:オーストリア "
-    "0044:英国／イギリス／グレートブリテン及び北部アイルランド連合王国 0045:デンマーク 0046:スウェーデン "
-    "0047:ノルウェー 0048:ポーランド 0049:ドイツ 0351:ポルトガル 0352:ルクセンブルク "
-    "0353:アイルランド 0354:アイスランド 0355:アルバニア 0356:マルタ 0357:キプロス／サイプラス "
-    "0358:フィンランド 0359:ブルガリア 0370:リトアニア 0371:ラトビア 0372:エストニア "
-    "0373:モルドバ 0374:アルメニア 0375:ベラルーシ 0376:アンドラ 0377:モナコ "
-    "0378:サンマリノ 0380:ウクライナ 0381:セルビア 0382:モンテネグロ 0385:クロアチア "
-    "0386:スロベニア 0387:ボスニア・ヘルツェゴビナ 0389:北マケドニア共和国 0420:チェコ "
-    "0421:スロバキア 0423:リヒテンシュタイン 0992:タジキスタン 0993:トルクメニスタン "
-    "0994:アゼルバイジャン 0995:ジョージア（旧グルジア） 0996:キルギス 0998:ウズベキスタン "
-    "9007:ロシア 9039:バチカン市国 9381:コソボ 0090:トルコ 0093:アフガニスタン 0098:イラン "
-    "0961:レバノン 0962:ヨルダン 0963:シリア 0964:イラク 0965:クウェート "
-    "0966:サウジアラビア 0967:イエメン 0968:オマーン 0970:パレスチナ 0971:アラブ首長国連邦 "
-    "0972:イスラエル 0973:バーレーン 0974:カタール 0020:エジプト 0027:南アフリカ共和国 "
-    "0211:南スーダン 0212:モロッコ 0213:アルジェリア 0216:チュニジア 0218:リビア "
-    "0220:ガンビア 0221:セネガル 0222:モーリタニア 0223:マリ 0224:ギニア "
-    "0225:コートジボワール 0226:ブルキナファソ 0227:ニジェール 0228:トーゴ 0229:ベナン "
-    "0230:モーリシャス 0231:リベリア 0232:シエラレオネ 0233:ガーナ 0234:ナイジェリア "
-    "0235:チャド 0236:中央アフリカ 0237:カメルーン 0238:カーボベルデ 0239:サントメ・プリンシペ "
-    "0240:赤道ギニア 0241:ガボン 0242:コンゴ共和国 0243:コンゴ民主共和国 0244:アンゴラ "
-    "0245:ギニアビサウ 0248:セーシェル 0249:スーダン 0250:ルワンダ 0251:エチオピア "
-    "0252:ソマリア 0253:ジブチ 0254:ケニア 0255:タンザニア 0256:ウガンダ 0257:ブルンジ "
-    "0258:モザンビーク 0260:ザンビア 0261:マダガスカル 0263:ジンバブエ 0264:ナミビア "
-    "0265:マラウイ 0266:レソト 0267:ボツワナ 0268:エスワティニ 0269:コモロ 0291:エリトリア "
-    "9212:西サハラ"
+    "10:0060:マレーシア 10:0062:インドネシア 10:0063:フィリピン 10:0065:シンガポール "
+    "10:0066:タイ 10:0082:大韓民国／韓国 10:0084:ベトナム 10:0086:中華人民共和国／中国 "
+    "10:0091:インド 10:0092:パキスタン 10:0094:スリランカ 10:0095:ミャンマー "
+    "10:0670:東ティモール 10:0673:ブルネイ 10:0850:北朝鮮 10:0852:香港 "
+    "10:0853:マカオ 10:0855:カンボジア 10:0856:ラオス 10:0880:バングラデシュ "
+    "10:0886:台湾 10:0960:モルディブ 10:0975:ブータン 10:0976:モンゴル "
+    "10:0977:ネパール 20:0061:オーストラリア／豪州 20:0064:ニュージーランド 20:0674:ナウル "
+    "20:0675:パプアニューギニア 20:0676:トンガ 20:0677:ソロモン諸島 20:0678:バヌアツ "
+    "20:0679:フィジー 20:0680:パラオ 20:0682:クック諸島 20:0683:ニウエ "
+    "20:0685:サモア独立国 20:0686:キリバス 20:0687:ニューカレドニア（仏領） 20:0688:ツバル "
+    "20:0691:ミクロネシア 20:0692:マーシャル諸島 20:1001:アメリカ合衆国／米国（北マリアナ諸島） "
+    "20:1002:アメリカ合衆国／米国（グアム） 20:1684:サモア（米領） 20:9689:タヒチ（仏領ポリネシア） "
+    "30:1000:アメリカ合衆国／米国（本土） 30:1808:アメリカ合衆国／米国（ハワイ） 30:9001:カナダ "
+    "33:0051:ペルー 33:0052:メキシコ 33:0053:キューバ 33:0054:アルゼンチン "
+    "33:0055:ブラジル 33:0056:チリ 33:0057:コロンビア 33:0058:ベネズエラ "
+    "33:0473:グレナダ 33:0501:ベリーズ 33:0502:グアテマラ 33:0503:エルサルバドル "
+    "33:0504:ホンジュラス 33:0505:ニカラグア 33:0506:コスタリカ 33:0507:パナマ "
+    "33:0509:ハイチ 33:0591:ボリビア 33:0592:ガイアナ 33:0593:エクアドル "
+    "33:0595:パラグアイ 33:0597:スリナム 33:0598:ウルグアイ 33:0758:セントルシア "
+    "33:0767:ドミニカ国 33:0784:セントビンセント及びグレナディーン諸島 33:0809:ドミニカ共和国 "
+    "33:0868:トリニダード・トバゴ 33:0869:セントクリストファー・ネービス 33:0876:ジャマイカ "
+    "33:1242:バハマ 33:1246:バルバドス 33:1268:アンティグア・バーブーダ "
+    "42:0007:カザフスタン 42:0030:ギリシャ 42:0031:オランダ 42:0032:ベルギー "
+    "42:0033:フランス 42:0034:スペイン 42:0036:ハンガリー 42:0039:イタリア "
+    "42:0040:ルーマニア 42:0041:スイス 42:0043:オーストリア "
+    "42:0044:英国／イギリス／グレートブリテン及び北部アイルランド連合王国 42:0045:デンマーク "
+    "42:0046:スウェーデン 42:0047:ノルウェー 42:0048:ポーランド 42:0049:ドイツ "
+    "42:0351:ポルトガル 42:0352:ルクセンブルク 42:0353:アイルランド 42:0354:アイスランド "
+    "42:0355:アルバニア 42:0356:マルタ 42:0357:キプロス／サイプラス 42:0358:フィンランド "
+    "42:0359:ブルガリア 42:0370:リトアニア 42:0371:ラトビア 42:0372:エストニア "
+    "42:0373:モルドバ 42:0374:アルメニア 42:0375:ベラルーシ 42:0376:アンドラ "
+    "42:0377:モナコ 42:0378:サンマリノ 42:0380:ウクライナ 42:0381:セルビア "
+    "42:0382:モンテネグロ 42:0385:クロアチア 42:0386:スロベニア "
+    "42:0387:ボスニア・ヘルツェゴビナ 42:0389:北マケドニア共和国 42:0420:チェコ "
+    "42:0421:スロバキア 42:0423:リヒテンシュタイン 42:0992:タジキスタン "
+    "42:0993:トルクメニスタン 42:0994:アゼルバイジャン 42:0995:ジョージア（旧グルジア） "
+    "42:0996:キルギス 42:0998:ウズベキスタン 42:9007:ロシア 42:9039:バチカン市国 "
+    "42:9381:コソボ 50:0090:トルコ 50:0093:アフガニスタン 50:0098:イラン "
+    "50:0961:レバノン 50:0962:ヨルダン 50:0963:シリア 50:0964:イラク "
+    "50:0965:クウェート 50:0966:サウジアラビア 50:0967:イエメン 50:0968:オマーン "
+    "50:0970:パレスチナ 50:0971:アラブ首長国連邦 50:0972:イスラエル 50:0973:バーレーン "
+    "50:0974:カタール 60:0020:エジプト 60:0027:南アフリカ共和国 60:0211:南スーダン "
+    "60:0212:モロッコ 60:0213:アルジェリア 60:0216:チュニジア 60:0218:リビア "
+    "60:0220:ガンビア 60:0221:セネガル 60:0222:モーリタニア 60:0223:マリ "
+    "60:0224:ギニア 60:0225:コートジボワール 60:0226:ブルキナファソ 60:0227:ニジェール "
+    "60:0228:トーゴ 60:0229:ベナン 60:0230:モーリシャス 60:0231:リベリア "
+    "60:0232:シエラレオネ 60:0233:ガーナ 60:0234:ナイジェリア 60:0235:チャド "
+    "60:0236:中央アフリカ 60:0237:カメルーン 60:0238:カーボベルデ "
+    "60:0239:サントメ・プリンシペ 60:0240:赤道ギニア 60:0241:ガボン 60:0242:コンゴ共和国 "
+    "60:0243:コンゴ民主共和国 60:0244:アンゴラ 60:0245:ギニアビサウ 60:0248:セーシェル "
+    "60:0249:スーダン 60:0250:ルワンダ 60:0251:エチオピア 60:0252:ソマリア "
+    "60:0253:ジブチ 60:0254:ケニア 60:0255:タンザニア 60:0256:ウガンダ "
+    "60:0257:ブルンジ 60:0258:モザンビーク 60:0260:ザンビア 60:0261:マダガスカル "
+    "60:0263:ジンバブエ 60:0264:ナミビア 60:0265:マラウイ 60:0266:レソト "
+    "60:0267:ボツワナ 60:0268:エスワティニ 60:0269:コモロ 60:0291:エリトリア "
+    "60:9212:西サハラ"
 )
 
 # 読み上げるときの呼び方（表の名前が長い・括弧付きで割れているものだけ）
@@ -1724,10 +1784,11 @@ TRAVEL_ALIASES = {
 def _travel_index():
     """表の名前から「引き当てに使う言い方」を作る。"""
     drop = {"本土"}   # 「アメリカ合衆国（本土）」の括弧内は誤爆するので使わない
-    idx, names = [], {}
+    idx, names, areas = [], {}, {}
     for item in TRAVEL_COUNTRY_SRC.split():
-        cd, _, name = item.partition(":")
+        area, cd, name = item.split(":", 2)
         names[cd] = name
+        areas[cd] = area
         aliases = []
         for part in name.split("／"):
             m = re.match(r"^(.*)（(.+)）$", part)
@@ -1737,10 +1798,10 @@ def _travel_index():
             else:
                 aliases.append(part)
         idx.append((cd, tuple(a for a in aliases if a and a not in drop)))
-    return idx, names
+    return idx, names, areas
 
 
-TRAVEL_INDEX, TRAVEL_NAMES = _travel_index()
+TRAVEL_INDEX, TRAVEL_NAMES, TRAVEL_AREA_OF = _travel_index()
 TRAVEL_ALIAS_INDEX = list(TRAVEL_ALIASES.items())
 _travel_cache = {}   # 国コード -> (取得時刻 monotonic, 読み終えた要約)
 
@@ -1756,7 +1817,7 @@ def _travel_find(q: str) -> str:
     """
     q = re.sub(r"[\s　]+", "", q or "")
     if not q:
-        return TRAVEL_DEFAULT
+        return ""      # 何も言われなければ世界ぜんぶ（既定の国へ落とさない）
     best_cd, best_key = "", (0, 0)
     for table, mine in ((TRAVEL_INDEX, 0), (TRAVEL_ALIAS_INDEX, 1)):
         for cd, aliases in table:
@@ -1777,6 +1838,19 @@ def _travel_find(q: str) -> str:
         if len(hit) == 1:
             return hit.pop()
     return ""
+
+
+def _travel_area(q: str):
+    """言われた文字列が地域（中東・ヨーロッパ 等）や「世界」なら地域コードを返す。
+
+    国名より後に見る（「南アフリカ」は国、「アフリカ」は地域）。
+    世界ぜんぶのときは空文字を返す。当たらなければ None。
+    """
+    q = re.sub(r"[\s　]+", "", q or "")
+    for area, words in TRAVEL_AREA_WORDS:
+        if any(w in q for w in words):
+            return area
+    return None
 
 
 def _travel_name(cd: str) -> str:
@@ -1908,12 +1982,111 @@ def _travel_say(cd: str, data: dict, today) -> str:
     return head + "、".join([c[0] for c in kept[:-1]] + [kept[-1][1]]) + "。"
 
 
-async def get_travel_advisory(session, args, ctx=None) -> str:
-    q = str((args or {}).get("country") or "").strip()
-    cd = _travel_find(q)
-    if not cd:
-        return ("%sの渡航情報は分かりませんでした。国の名前で聞いてください。"
-                % q[:16])
+_travel_sweep_cache = []   # [(取得時刻, {国コード: まとめ})] を 1 件だけ
+_travel_sweeping = []      # 裏で走らせている取り直しを 1 本だけ持つ
+
+
+async def _travel_light(session, cd: str, sem):
+    """危険レベルの塊だけ読む（広域情報・領事メールの手前で打ち切る）。"""
+    async with sem:
+        buf = bytearray()
+        try:
+            async with session.get(
+                    TRAVEL_URL % cd, timeout=aiohttp.ClientTimeout(total=30),
+                    headers={"User-Agent": FUEL_UA}) as r:
+                r.raise_for_status()
+                async for chunk in r.content.iter_chunked(4096):
+                    buf += chunk
+                    if (buf.find(b"<wideareaSpot") >= 0
+                            or buf.find(b"<mail") >= 0
+                            or len(buf) >= TRAVEL_SWEEP_BYTES):
+                        break
+        except Exception as e:
+            log.warning("travel sweep %s: %s", cd, type(e).__name__)
+            return cd, None
+        try:
+            d = _travel_parse(buf.decode("utf-8", "ignore"))
+        except ValueError:
+            return cd, None
+        return cd, {"risk": d["risk"], "infection": d["infection"],
+                    "date": d["date"], "area": TRAVEL_AREA_OF.get(cd, "")}
+
+
+async def _travel_all(session) -> dict:
+    """207 か国ぶんを一度に集める。1 か国 4KB 程度・実測 5.2 秒。"""
+    codes = list(TRAVEL_NAMES)
+    sem = asyncio.Semaphore(TRAVEL_SWEEP_CONC)
+    got = await asyncio.gather(
+        *[_travel_light(session, cd, sem) for cd in codes])
+    out = {cd: d for cd, d in got if d}
+    log.info("渡航情報を %d か国ぶん集計した（取れなかったのは %d）",
+             len(out), len(codes) - len(out))
+    if len(out) < len(codes) * 0.8:
+        # 半端な集計で「◯か国です」と数を言うと嘘になる
+        raise RuntimeError("集計が %d/%d しか取れない" % (len(out), len(codes)))
+    return out
+
+
+async def _travel_sweep(session) -> dict:
+    now = time.monotonic()
+    if _travel_sweep_cache and now - _travel_sweep_cache[0][0] < TRAVEL_SWEEP_TTL:
+        return _travel_sweep_cache[0][1]
+    if _travel_sweep_cache:
+        # 古い値で答えつつ裏で取り直す（読み上げを 5 秒待たせない）
+        if not _travel_sweeping:
+            async def refresh():
+                try:
+                    out = await _travel_all(session)
+                    _travel_sweep_cache[:] = [(time.monotonic(), out)]
+                except Exception as e:
+                    log.warning("travel sweep refresh: %s: %s",
+                                type(e).__name__, str(e)[:120])
+                finally:
+                    _travel_sweeping.clear()
+            _travel_sweeping.append(asyncio.create_task(refresh()))
+        return _travel_sweep_cache[0][1]
+    out = await _travel_all(session)
+    _travel_sweep_cache[:] = [(now, out)]
+    return out
+
+
+def _travel_world_say(sweep: dict, area: str) -> str:
+    """世界ぜんぶ（area="" ）か、ひとつの地域ぜんぶをまとめて言う。"""
+    rows = [(cd, d) for cd, d in sweep.items() if not area or d["area"] == area]
+    if not rows:
+        return "error: その地域の渡航情報が分かりませんでした"
+    where = TRAVEL_AREAS.get(area, "世界")
+    have = [(cd, d) for cd, d in rows if d["risk"]]
+    whole4 = [cd for cd, d in have if d["risk"] == [4]]
+    any4 = [cd for cd, d in have if 4 in d["risk"]]
+    any3 = [cd for cd, d in have if 3 in d["risk"]]
+
+    def names(cds):
+        shown = [_travel_name(c) for c in cds[:TRAVEL_NAME_MAX]]
+        # 挙げ切ったときに「など」と言わない（1 か国なのに「など」は変）
+        return "・".join(shown) + ("など" if len(cds) > len(shown) else "")
+
+    head = ("%sで危険情報が出ているのは、%dか国のうち%dか国です。"
+            % (where, len(rows), len(have)))
+    if whole4:
+        tail = ("全土がレベル4、退避してください、なのは%dか国で、%sです。"
+                % (len(whole4), names(whole4)))
+    elif any4:
+        tail = ("一部にレベル4、退避してください、の地域があるのは%dか国で、"
+                "%sです。" % (len(any4), names(any4)))
+    elif any3:
+        tail = ("いちばん高いのはレベル3、渡航は止めてください、で%dか国です。"
+                % len(any3))
+    elif have:
+        tail = ("いちばん高いのはレベル%dです。"
+                % max(d["risk"][0] for _, d in have))
+    else:
+        tail = "危険情報が出ている国はありません。"
+    return head + tail
+
+
+async def _travel_one(session, cd: str) -> str:
+    """1 か国ぶん（危険レベル・発表日・新しい広域の注意喚起）。"""
     now = time.monotonic()
     got = _travel_cache.get(cd)
     data = got[1] if got and now - got[0] < TRAVEL_CACHE_TTL else None
@@ -1928,6 +2101,26 @@ async def get_travel_advisory(session, args, ctx=None) -> str:
     if data is None:
         return "error: いま渡航情報を取れませんでした（取得先が応答しません）"
     return _travel_say(cd, data, now_jst().date())
+
+
+async def get_travel_advisory(session, args, ctx=None) -> str:
+    q = str((args or {}).get("country") or "").strip()
+    area = ""
+    if q:
+        cd = _travel_find(q)
+        if cd:
+            return await _travel_one(session, cd)
+        area = _travel_area(q)
+        if area is None:
+            return ("%sの渡航情報は分かりませんでした。国か地域の名前で"
+                    "聞いてください。" % q[:16])
+    try:
+        sweep = await _travel_sweep(session)
+    except Exception as e:
+        log.warning("travel sweep failed: %s: %s", type(e).__name__,
+                    str(e)[:120])
+        return "error: いま渡航情報を取れませんでした（取得先が応答しません）"
+    return _travel_world_say(sweep, area)
 
 
 SPECS = [{
@@ -2076,7 +2269,7 @@ SPECS = [{
         "name": "get_fuel_surcharge",
         "description": "国際線の燃油サーチャージ（燃油特別付加運賃）を調べる。"
                        "「ドバイまでのサーチャージいくら？」「燃油サーチャージは？」"
-                       "などに使う。行き先を言われなければ中東（ドバイ）方面。",
+                       "などに使う。行き先を言われなければ全方面をまとめて答える。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -2089,16 +2282,18 @@ SPECS = [{
     "type": "function",
     "function": {
         "name": "get_travel_advisory",
-        "description": "海外の渡航情報（外務省の危険情報・感染症危険情報・"
-                       "注意喚起）を調べる。「ドバイは安全？」"
-                       "「タイの渡航情報は？」「フランス行っても大丈夫？」"
-                       "などに使う。国を言われなければアラブ首長国連邦。",
+        "description": "海外の渡航情報（外務省の危険情報）を調べる。"
+                       "国を言われたらその国、「中東」「ヨーロッパ」などの"
+                       "地域ならその地域ぜんぶ、何も言われなければ世界ぜんぶを"
+                       "まとめて答える。「ドバイは安全？」「海外の危険情報は？」"
+                       "「中東はどう？」などに使う。",
         "parameters": {
             "type": "object",
             "properties": {
                 "country": {"type": "string",
-                            "description": "国や都市の名前。例: ドバイ、タイ、"
-                                           "フランス。省略可"},
+                            "description": "国・都市・地域の名前。例: ドバイ、"
+                                           "タイ、中東、ヨーロッパ。"
+                                           "省略すると世界ぜんぶ"},
             },
         },
     },
