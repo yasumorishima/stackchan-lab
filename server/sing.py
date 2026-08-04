@@ -78,6 +78,13 @@ def _split_len(length, room):
 
 
 def _note_xml(pitch, length, lyric, tie):
+    """1 音ぶんの XML。tie は (つなぎ始め, つなぎ終わり) の 2 つ。
+
+    Sinsy が受け取れるのは start と stop だけで、真ん中の音に continue と書くと
+    「<tie> tag has unexpected attribute(type)」で読み込みごと落ちる。3 つ以上に
+    割れた音の真ん中は、stop と start を両方書く。
+    """
+    start, stop = tie
     x = ["      <note>"]
     if pitch is None:
         x.append("        <rest/>")
@@ -90,16 +97,20 @@ def _note_xml(pitch, length, lyric, tie):
         x.append("          <octave>%d</octave>" % octave)
         x.append("        </pitch>")
     x.append("        <duration>%d</duration>" % length)
-    if tie:
-        x.append('        <tie type="%s"/>' % tie)
+    # ここに <tie type="..."/> は書かない。Sinsy の読み込みが
+    # 「<tie> tag has unexpected attribute(type)」で落ちる（小節をまたぐ長い音で
+    # 初めて出た）。つなぎは下の <notations><tied> だけで足りる
     kind, dotted = _TYPES[length]
     x.append("        <voice>1</voice>")
     x.append("        <type>%s</type>" % kind)
     if dotted:
         x.append("        <dot/>")
-    if tie:
+    if start or stop:
         x.append("        <notations>")
-        x.append('          <tied type="%s"/>' % tie)
+        if stop:
+            x.append('          <tied type="stop"/>')
+        if start:
+            x.append('          <tied type="start"/>')
         x.append("        </notations>")
     if lyric:
         x.append("        <lyric>")
@@ -147,15 +158,9 @@ def musicxml(notes, tempo=120, beats=4, beat_type=4, title="song"):
             for i, piece in enumerate(pieces):
                 more = (length > 0) or (i < len(pieces) - 1)
                 if pitch is None:
-                    tie = None
-                elif first and more:
-                    tie = "start"
-                elif not first and more:
-                    tie = "continue"
-                elif not first:
-                    tie = "stop"
+                    tie = (False, False)
                 else:
-                    tie = None
+                    tie = (more, not first)
                 measure += _note_xml(pitch, piece,
                                      lyric if first else "", tie)
                 room -= piece
@@ -170,7 +175,7 @@ def musicxml(notes, tempo=120, beats=4, beat_type=4, title="song"):
         # 最後の小節が余っていたら休みで埋める
         pieces, _ = _split_len(room, room)
         for piece in pieces:
-            measure += _note_xml(None, piece, "", None)
+            measure += _note_xml(None, piece, "", (False, False))
         measure.append("    </measure>")
         body += measure
 

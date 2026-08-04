@@ -63,24 +63,30 @@ def f0_track(x, rate=RATE):
     return semi
 
 
-def fix_octaves(semi, k=15):
+OCTAVE_SPAN = 9.0        # 曲の中心からこれだけ離れたら 1 オクターブ間違い
+
+
+def fix_octaves(semi):
     """自己相関が 1 オクターブ間違える所を直す。
 
     周期の 2 倍・1/2 の所にも山が立つので、ときどき 12 半音ずれた値が出る。
-    まわりの中央値から 12 半音ちょうど離れている値は、寄せて直す。
+    **曲全体の中心**から 9 半音より離れた値は、12 半音ずつ寄せて中心に近づける
+    （まわりの中央値と比べる作りにしたら、低い値が固まって出る所で直せなかった。
+    実測: 牧秀悟の音源は中心 A4 なのに下位 5% が A1 だった）。9 半音までは動かさ
+    ないので、1 オクターブ半に届く旋律はそのまま残る。
     """
+    v = semi[~np.isnan(semi)]
+    if len(v) < 10:
+        return semi
+    center = float(np.median(v))
     out = semi.copy()
-    for i in range(len(semi)):
-        if np.isnan(semi[i]):
+    for i in range(len(out)):
+        if np.isnan(out[i]):
             continue
-        w = semi[max(0, i - k):i + k + 1]
-        w = w[~np.isnan(w)]
-        if len(w) < 5:
-            continue
-        med = float(np.median(w))
-        for shift in (12.0, -12.0):
-            if abs(semi[i] + shift - med) < abs(out[i] - med) - 6.0:
-                out[i] = semi[i] + shift
+        while out[i] - center > OCTAVE_SPAN:
+            out[i] -= 12.0
+        while center - out[i] > OCTAVE_SPAN:
+            out[i] += 12.0
     return out
 
 
@@ -91,6 +97,33 @@ def smooth(semi, k=5):
         w = semi[max(0, i - k // 2):i + k // 2 + 1]
         w = w[~np.isnan(w)]
         out[i] = np.median(w) if len(w) else np.nan
+    return out
+
+
+MAX_FILL = 0.12          # これより短い声の切れ目は埋める（秒）
+
+
+def fill_gaps(semi, max_gap=MAX_FILL):
+    """短い「声が出ていない」所を埋める。
+
+    録音によっては歌っている最中も声が途切れて拾えず、1 つの音が細切れになる
+    （実測: 牧秀悟の音源は 81 音のうち 58 が休みに割られた）。前後が同じくらいの
+    高さなら、その間は歌い続けているとみなす。
+    """
+    out = semi.copy()
+    n = int(max_gap / HOP)
+    i = 0
+    while i < len(out):
+        if not np.isnan(out[i]):
+            i += 1
+            continue
+        j = i
+        while j < len(out) and np.isnan(out[j]):
+            j += 1
+        if 0 < i and j < len(out) and (j - i) <= n:
+            if abs(out[i - 1] - out[j]) <= 2.0:
+                out[i:j] = out[i - 1]
+        i = j
     return out
 
 
@@ -160,7 +193,7 @@ def to_name(semi):
 def transcribe(path):
     """音源から (音符の並び, テンポ, 測り具合) を返す。"""
     x = load_audio(path)
-    semi = smooth(fix_octaves(f0_track(x)))
+    semi = fill_gaps(smooth(fix_octaves(f0_track(x))))
     notes = merge_same(segment(semi))
     if not notes:
         raise RuntimeError("音符が見つかりません")

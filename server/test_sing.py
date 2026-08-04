@@ -102,6 +102,18 @@ def align_cost(a, b):
     return d[len(a)][len(b)] / max(len(a), len(b))
 
 
+# 小節をまたぐ長い音（つなぎが要る）。Sinsy は <tie type=...> を受け付けず、
+# ここで落ちていた
+print("小節をまたぐ長い音…")
+# 8 個目から 11 個ぶん伸ばすと小節（16 個）をまたぐ＝つなぎが要る
+long_note = [["ソ4", 8, "あ"], ["ラ4", 11, "い"], ["ソ4", 21, "う"]]
+try:
+    pcm, rate = sing.sing_sync(long_note, tempo=120, title="長い音")
+    check("小節をまたぐ音でも歌える", len(pcm) > rate,
+          "%.1f 秒" % (len(pcm) / 2 / rate))
+except Exception as e:
+    check("小節をまたぐ音でも歌える", False, str(e)[:80])
+
 print("歌わせる…")
 pcm, rate = sing.sing_sync(sing.FURUSATO, tempo=104, title="ふるさと")
 check("音が出ている", len(pcm) > rate, "%.2f 秒" % (len(pcm) / 2 / rate))
