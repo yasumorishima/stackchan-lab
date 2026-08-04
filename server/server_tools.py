@@ -2488,6 +2488,30 @@ def _find_player(songs: dict, who: str):
     return None
 
 
+async def sing_cheer_song(session, args, ctx=None) -> str:
+    """応援歌を旋律つきで歌う。
+
+    音は文字で返せないので、用意した音符を ctx["song"] に載せる。実際に鳴らす
+    のは app.py。旋律は公式に無いので、単旋律の歌唱音源から起こしている
+    （cheer_song.py）。
+    """
+    import cheer_song
+    who = str(args.get("player") or "")[:MAX_PLACE_LEN]
+    if not who and ctx:
+        who = ""
+    try:
+        notes, tempo, name = await cheer_song.prepare(session, who)
+    except LookupError:
+        return ("error: その選手の応援歌は歌えません。"
+                "歌詞だけなら get_cheer_song で調べられます")
+    except Exception as e:
+        log.warning("sing unavailable: %s: %s", type(e).__name__, e)
+        return "error: いま応援歌を歌えませんでした"
+    if ctx is not None:
+        ctx["song"] = {"notes": notes, "tempo": tempo, "name": name}
+    return "%sの応援歌を歌います。" % name
+
+
 async def get_cheer_song(session, args, ctx=None) -> str:
     who = str(args.get("player") or "")[:MAX_PLACE_LEN]
     try:
@@ -2715,6 +2739,23 @@ SPECS = [{
 }, {
     "type": "function",
     "function": {
+        "name": "sing_cheer_song",
+        "description": "横浜DeNAベイスターズの選手応援歌を、旋律つきで実際に"
+                       "歌う。「牧の応援歌を歌って」「宮﨑の応援歌うたってよ」"
+                       "のように歌うことを求められたらこちらを使う。"
+                       "歌詞を読み上げるだけでよい時は get_cheer_song。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "player": {"type": "string",
+                           "description": "選手名。例: 宮﨑敏郎、桑原。"},
+            },
+            "required": ["player"],
+        },
+    },
+}, {
+    "type": "function",
+    "function": {
         "name": "get_cheer_song",
         "description": "横浜DeNAベイスターズの選手応援歌の歌詞を調べる。"
                        "「牧の応援歌うたって」「ベイスターズの応援歌教えて」"
@@ -2746,7 +2787,8 @@ HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy,
             "get_travel_advisory": get_travel_advisory,
             "get_baseball": get_baseball,
             "get_roster_move": get_roster_move,
-            "get_cheer_song": get_cheer_song}
+            "get_cheer_song": get_cheer_song,
+            "sing_cheer_song": sing_cheer_song}
 
 
 def specs():

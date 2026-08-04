@@ -81,6 +81,18 @@ docker run -d --name voicevox --restart unless-stopped -p 127.0.0.1:50021:50021 
 `encoder / decoder / joiner` の `int8.onnx` 3 つと `tokens.txt` を
 `~/models/reazonspeech-k2-v2` に置きます（合計 160MB 程度）。
 
+## 歌う
+
+応援歌は `sing_cheer_song` で旋律つきで歌う（歌詞を読むだけなら `get_cheer_song`）。**音は文字で返せない**ので、道具は音符を `ctx["song"]` に載せ、返事を言い終わってから `sing_song` が歌う。送り方は読み上げと同じ経路（Opus・割り込みの窓つき）。
+
+- 合成は **Sinsy**（Modified BSD）。声は `nitech_jp_song070_f001`（CC BY 3.0・名古屋工業大学）。**Pi では組まず** GitHub Actions で aarch64 向けに作る（`.github/workflows/build-sinsy.yml`）。置き場所は `~/sinsy/`（`SINSY_BIN` / `SINSY_DIC` / `SINSY_VOICE`）
+- 楽譜は `sing.py` が MusicXML で書く。音符は `["ド4", 4, "か"]`＝高さ / 16分音符いくつ分 / その音で歌う一文字
+- **メロディは公式に無い**ので、単旋律の歌唱音源から `transcribe.py` が起こす。**格子（テンポ）は「ずれが最小」で選ぶと必ずいちばん細かい所に張り付く**（実測 242→188）。**十分に割り切れる中でいちばん粗い格子**を採る
+- 音源も起こした音符も `cache/songs/` に置くだけで**リポジトリには入れない**（歌詞と同じ）
+- 歌えるのは音源のある 15 人。無い選手は歌詞の方へ案内する
+
+確かめ方は `test_sing.py`（唱歌「ふるさと」で楽譜との平均 0.85 半音）、`test_transcribe.py`（採譜→歌唱→再測定で元の旋律との平均 0.50 半音）、`test_sing_tool.py`（言い方 2 通りで道具が選ばれるか・歌詞が音符に乗るか）。
+
 ## 聞き取りの下ごしらえ
 
 認識器に渡す前に 3 つのことをする（`local_stt.py`）。実機の話しかけは**最大 rms が 500〜1200**と小さく、本体は一語の返事にも十数秒のバッファを送ってくる（黙っていた分がそのまま前に付く。実測で「よいしょ」に 18.36 秒）ので、そのまま渡すと大きく崩れる。
