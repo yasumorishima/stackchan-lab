@@ -38,6 +38,11 @@ _index = []          # [(取った時刻, {選手名: 音源の URL})]
 _ALIAS = {"右打者汎用": "その他の右打者", "左打者汎用": "その他の左打者",
           "捕手汎用": "捕手のテーマ", "投手汎用": "投手のテーマ（右投手）"}
 
+# 応援歌は前の選手の曲を歌詞替えで使うことがある（音源側の表も「牧秀悟
+# （村田修一流用）」と書いている）。旋律が同じなら、流用元の音源に今の歌詞を
+# 乗せれば歌える。`www.yakyu-ouen.net` の各選手ページに流用の記載がある
+_REUSE = {"梶原昂希": "下園辰哉"}
+
 # 小さい仮名は前の字とひとまとまりで 1 音
 _SMALL = "ゃゅょャュョぁぃぅぇぉァィゥェォ"
 _KANA = re.compile("[ぁ-んァ-ヶー]")
@@ -150,11 +155,14 @@ async def prepare(session, want):
     songs = await server_tools._songs(session)
     table = await audio_index(session)
     name = match_player(table, want)
+    key = server_tools._find_player(songs, name or want)
+    if not name and key in _REUSE:
+        name = match_player(table, _REUSE[key])       # 流用元の旋律を借りる
     if not name:
         raise LookupError("音源が無い")
+    key = key or server_tools._find_player(songs, name)
     # 公式に歌詞が無い選手（もう在籍していない等）は、音だけ鳴らしても
     # 意味が無いので歌わない
-    key = server_tools._find_player(songs, name)
     text = "".join(songs.get(key, [])) if key else ""
     if not text:
         raise LookupError("歌詞が無い")
@@ -172,6 +180,9 @@ async def singable(session):
     for name in table:
         key = server_tools._find_player(songs, name)
         if key and songs.get(key):
+            out.append(key)
+    for key, src in _REUSE.items():
+        if songs.get(key) and match_player(table, src):
             out.append(key)
     return sorted(set(out))
 
