@@ -1,0 +1,69 @@
+name: Build Sinsy for the Pi
+
+# 歌わせるための合成器（Sinsy）を Raspberry Pi 5（aarch64）向けに組む。
+# Pi は別の作業と共有している機械なので、その上で C++ をビルドしない。
+# ここで組んだ実行ファイルと辞書を artifact で受け取り、Pi へ置く。
+#
+# 走らせ方: gh workflow run "Build Sinsy for the Pi" --repo yasumorishima/stackchan-lab -f memo="なぜ回すか"
+
+on:
+  workflow_dispatch:
+    inputs:
+      memo:
+        description: 何のために回すか
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Pi は Debian bookworm（glibc 2.36）。ここを新しい Ubuntu にすると
+    # 新しい glibc を要求する実行ファイルができて Pi で動かない
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install the cross compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++-aarch64-linux-gnu cmake file
+
+      - name: Get Sinsy (hts_engine comes with it as a submodule)
+        run: git clone --depth 1 --recursive https://github.com/r9y9/sinsy
+
+      - name: Let a modern CMake read a 2009 CMakeLists
+        run: |
+          find sinsy -name CMakeLists.txt -exec sed -i -E \
+            's/cmake_minimum_required\(VERSION [0-9.]+\)/cmake_minimum_required(VERSION 3.10)/' {} +
+
+      - name: Build for aarch64
+        run: |
+          cmake -S sinsy/src -B build \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
+          cmake --build build -j"$(nproc)" --target sinsy-bin
+
+      - name: Refuse to ship anything that is not an ARM binary
+        run: |
+          file build/bin/sinsy
+          file build/bin/sinsy | grep -q "ARM aarch64"
+
+      - name: Show which glibc it will ask the Pi for
+        run: |
+          aarch64-linux-gnu-objdump -T build/bin/sinsy | grep -oE "GLIBC_[0-9.]+" | sort -u
+
+      - name: Bundle the binary with the dictionary it needs
+        run: |
+          mkdir -p out
+          aarch64-linux-gnu-strip -o out/sinsy build/bin/sinsy
+          cp -r sinsy/src/dic out/dic
+          rm -f out/dic/Makefile*
+          ls -la out out/dic
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sinsy-aarch64
+          path: out
