@@ -32,6 +32,9 @@ CACHE_DIR = os.environ.get(
     "CHEER_CACHE", os.path.expanduser("~/stackchan-server/cache/songs"))
 UA = {"User-Agent": "Mozilla/5.0"}
 INDEX_TTL = 24 * 3600
+# 起こした音符のうち休みがこれを超える曲は歌わない。歌ではなく短い音の連打に
+# なるため（実測: 宮﨑敏郎 0% / 牧秀悟 33%、後者は実機で「歌えてない」）
+MAX_GAP = float(os.environ.get("CHEER_MAX_GAP", "0.20"))
 _index = []          # [(取った時刻, {選手名: 音源の URL})]
 
 # 音源側の呼び方と、公式の歌詞の見出しの対応
@@ -157,6 +160,12 @@ async def notes_for(session, name, url):
     return await notes_from_file(name, path)
 
 
+def gap_ratio(notes):
+    """音符の並びのうち、休みが占める割合。"""
+    total = sum(n[1] for n in notes) or 1
+    return sum(n[1] for n in notes if not n[0]) / float(total)
+
+
 def put_lyrics(notes, text):
     """音符に歌詞を 1 音ずつ乗せる。足りない分は伸ばす。"""
     ms = moras(text)
@@ -191,9 +200,26 @@ async def prepare(session, want):
         if not name:
             raise LookupError("音源が無い")
         notes, tempo = await notes_for(session, name, table[name])
+    gap = gap_ratio(notes)
+    if gap > MAX_GAP:
+        log.info("%s は休みが %.0f%% で歌にならないので歌わない",
+                 key, gap * 100)
+        raise LookupError("歌にならない")
     notes, n_mora, n_note = put_lyrics(notes, text)
     log.info("%s: 音符 %d に対して歌詞 %d 音", key, n_note, n_mora)
     return notes, tempo, key
+
+
+def _cached_ok(name):
+    """一度起こしてあって、歌になる曲か。まだ起こしていなければ候補に残す。"""
+    js = _cache_path(name, "json")
+    if not os.path.exists(js):
+        return True
+    try:
+        with open(js, encoding="utf-8") as f:
+            return gap_ratio(json.load(f)["notes"]) <= MAX_GAP
+    except Exception:
+        return False
 
 
 async def singable(session):
@@ -203,7 +229,7 @@ async def singable(session):
     out = []
     for name in table:
         key = server_tools._find_player(songs, name)
-        if key and songs.get(key):
+        if key and songs.get(key) and _cached_ok(name):
             out.append(key)
     for key, src in _REUSE.items():
         if songs.get(key) and match_player(table, src):

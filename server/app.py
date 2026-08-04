@@ -30,7 +30,6 @@ import local_stt
 import mcp_client
 import opus_codec
 import server_tools
-import sing
 
 log = logging.getLogger("stackchan")
 
@@ -1393,22 +1392,6 @@ async def ws_handler(request: web.Request):
         """出来上がっている音を、合成と同じ形で渡すための包み。"""
         return pcm
 
-    async def sing_song(song):
-        """応援歌を歌う。合成は重いので別スレッドで回す。"""
-        t0 = time.monotonic()
-        try:
-            pcm, rate = await sing.sing(song["notes"],
-                                        tempo=int(round(song["tempo"])),
-                                        title=song["name"])
-        except Exception:
-            log.exception("歌えなかった: %s", song.get("name"))
-            return
-        pcm = resample_linear(pcm, rate, DOWN_RATE)
-        log.info("%s の応援歌を歌う（%.1f 秒・作るのに %.1f 秒）",
-                 song["name"], len(pcm) / 2 / DOWN_RATE,
-                 time.monotonic() - t0)
-        await speak("%sの応援歌" % song["name"], made=pcm)
-
     async def speak(text: str, made: bytes = b""):
         # 文ごとに合成して送る。次の文は今の文を流している裏で作る（初音までを短く）
         if made:
@@ -1483,9 +1466,6 @@ async def ws_handler(request: web.Request):
             result = await server_tools.call(session, name, args, ctx)
             if ctx.get("resolved_when"):
                 when_store[device_id] = (time.time(), ctx["resolved_when"])
-            if ctx.get("song"):
-                # 音は文字で返せないので、返事を言い終わってから歌う
-                state["song"] = ctx["song"]
             return result
         mcp = state["mcp"]
         if mcp is None:
@@ -1541,9 +1521,6 @@ async def ws_handler(request: web.Request):
             log.info("LLM: %s", reply)
             await send_json({"type": "llm", "emotion": "happy", "text": "😀"})
             await speak(reply)
-            song = state.pop("song", None)
-            if song:
-                await sing_song(song)
             state["last_spoke"] = time.monotonic()
         except asyncio.CancelledError:
             raise

@@ -185,6 +185,35 @@ def best_unit(notes):
     return min(errs, key=lambda t: t[1])
 
 
+MIN_REST_SEC = 0.25      # これより短い休みは前の音の伸ばしにする
+MIN_NOTE_SEC = 0.15      # 歌う音はこれより短くしない（歌詞が 1 文字入る長さ）
+
+
+def tidy(notes, unit):
+    """細切れをまとめる。
+
+    録音から起こすと、息継ぎや子音の所で音が切れて短い休みだらけになる
+    （実測: 牧秀悟の応援歌は 74 音に対して休みが 50 個・全体の 50% が休みで、
+    音の半分近くが 100ms 未満だった）。そのまま歌わせると、歌ではなく短い音の
+    連打になる。短い休みは前の音を伸ばして吸収し、短すぎる音は伸ばす。
+    """
+    min_rest = max(1, int(round(MIN_REST_SEC / unit)))
+    min_note = max(1, int(round(MIN_NOTE_SEC / unit)))
+    out = []
+    for pitch, length in [(n[0], n[1]) for n in notes]:
+        if pitch is None and length < min_rest and out:
+            out[-1][1] += length
+            continue
+        if out and pitch is not None and out[-1][0] == pitch:
+            out[-1][1] += length
+            continue
+        out.append([pitch, length, ""])
+    for n in out:
+        if n[0] is not None and n[1] < min_note:
+            n[1] = min_note
+    return out
+
+
 def to_name(semi):
     n = int(round(semi))
     return "%s%d" % (_STEPS[n % 12], n // 12 - 1)
@@ -208,7 +237,7 @@ def transcribe(path):
                     ""])
         prev_end = b
     tempo = 60.0 / (unit * 4.0)
-    return out, tempo, err
+    return tidy(out, unit), tempo, err
 
 
 if __name__ == "__main__":
