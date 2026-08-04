@@ -117,24 +117,44 @@ def _cache_path(name, ext):
     return os.path.join(CACHE_DIR, "%s.%s" % (safe, ext))
 
 
-async def notes_for(session, name, url):
-    """音源から音符を起こす（一度起こしたら取っておく）。"""
+def local_audio(name):
+    """`cache/songs/<選手名>.<拡張子>` に置いてある音源を探す。
+
+    配布ページに音源が無い選手でも、ここに音を置けば歌える。取得元は問わない
+    （公開されている音源が無いものは、ここに置いてもらう以外に手が無い）。
+    """
+    for ext in ("mp3", "m4a", "wav", "ogg", "flac"):
+        path = _cache_path(name, ext)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+async def notes_from_file(name, path):
+    """手元の音源から音符を起こす（一度起こしたら取っておく）。"""
     js = _cache_path(name, "json")
-    if os.path.exists(js):
+    if os.path.exists(js) and os.path.getmtime(js) >= os.path.getmtime(path):
         with open(js, encoding="utf-8") as f:
             d = json.load(f)
         return d["notes"], d["tempo"]
-    ext = url.rsplit(".", 1)[-1]
-    audio = _cache_path(name, ext)
-    if not os.path.exists(audio):
-        with open(audio, "wb") as f:
-            f.write(await _fetch(session, url, binary=True))
-    notes, tempo, err = await asyncio.to_thread(transcribe.transcribe, audio)
-    log.info("%s の応援歌を採譜した（%d 音・テンポ %.0f・割り切れなさ %.2f）",
-             name, sum(1 for n in notes if n[0]), tempo, err)
+    notes, tempo, err = await asyncio.to_thread(transcribe.transcribe, path)
+    log.info("%s の応援歌を %s から採譜した"
+             "（%d 音・テンポ %.0f・割り切れなさ %.2f）",
+             name, os.path.basename(path),
+             sum(1 for n in notes if n[0]), tempo, err)
     with open(js, "w", encoding="utf-8") as f:
         json.dump({"notes": notes, "tempo": tempo}, f, ensure_ascii=False)
     return notes, tempo
+
+
+async def notes_for(session, name, url):
+    """配布ページの音源から音符を起こす（音は取ってきて置いておく）。"""
+    path = local_audio(name)
+    if path is None:
+        path = _cache_path(name, url.rsplit(".", 1)[-1])
+        with open(path, "wb") as f:
+            f.write(await _fetch(session, url, binary=True))
+    return await notes_from_file(name, path)
 
 
 def put_lyrics(notes, text):
@@ -151,24 +171,28 @@ def put_lyrics(notes, text):
 
 
 async def prepare(session, want):
-    """(音符, テンポ, 選手名) を返す。歌えなければ LookupError。"""
+    """(音符, テンポ, 見出し) を返す。歌えなければ LookupError。"""
     songs = await server_tools._songs(session)
-    table = await audio_index(session)
-    name = match_player(table, want)
-    key = server_tools._find_player(songs, name or want)
-    if not name and key in _REUSE:
-        name = match_player(table, _REUSE[key])       # 流用元の旋律を借りる
-    if not name:
-        raise LookupError("音源が無い")
-    key = key or server_tools._find_player(songs, name)
+    key = server_tools._find_player(songs, want)
     # 公式に歌詞が無い選手（もう在籍していない等）は、音だけ鳴らしても
     # 意味が無いので歌わない
     text = "".join(songs.get(key, [])) if key else ""
     if not text:
         raise LookupError("歌詞が無い")
-    notes, tempo = await notes_for(session, name, table[name])
+
+    # 置いてもらった音源が最優先（配布ページに無い選手はこれしか手が無い）
+    path = local_audio(key)
+    if path:
+        notes, tempo = await notes_from_file(key, path)
+    else:
+        table = await audio_index(session)
+        name = match_player(table, want) or match_player(table,
+                                                         _REUSE.get(key, ""))
+        if not name:
+            raise LookupError("音源が無い")
+        notes, tempo = await notes_for(session, name, table[name])
     notes, n_mora, n_note = put_lyrics(notes, text)
-    log.info("%s: 音符 %d に対して歌詞 %d 音", name, n_note, n_mora)
+    log.info("%s: 音符 %d に対して歌詞 %d 音", key, n_note, n_mora)
     return notes, tempo, key
 
 
@@ -183,6 +207,9 @@ async def singable(session):
             out.append(key)
     for key, src in _REUSE.items():
         if songs.get(key) and match_player(table, src):
+            out.append(key)
+    for key in songs:                       # 手元に置いてもらった音源
+        if songs.get(key) and local_audio(key):
             out.append(key)
     return sorted(set(out))
 
