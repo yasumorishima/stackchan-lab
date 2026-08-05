@@ -24,7 +24,7 @@ AC_GATE = 0.35          # 相関の山がこれ以下なら声と認めない
 # 無音も 17.0→11.0% / 13.7→11.0% に減った（窓 0.04・判定 0.45 との比較）。
 RMS_REL = 0.06          # いちばん大きいフレームに対する割合で無音を切る
 NOTE_TOL = 0.7          # 同じ音とみなす高さの幅（半音）
-VERSION = 4             # 起こし方を変えたら上げる（取ってある結果を捨てるため）
+VERSION = 5             # 起こし方を変えたら上げる（取ってある結果を捨てるため）
 MIN_NOTE = 0.06         # これより短い音は捨てる（秒）
 GAP_UNVOICED = 0.05     # これだけ声が切れたら音の区切りとみなす（秒）
 _STEPS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
@@ -247,9 +247,23 @@ def tidy(notes, unit):
             out[-1][1] += length
             continue
         out.append([pitch, length, ""])
-    for n in out:
-        if n[0] is not None and n[1] < min_note:
-            n[1] = min_note
+    # 🔴 短い音を「伸ばす」と**その分だけ曲が長くなり、拍がずれる**。
+    # 足りない長さは**次の音から借りる**（合計の長さを変えない）。借りられ
+    # なければそのまま短く歌う（無理に伸ばすより崩れない）
+    for i, n in enumerate(out):
+        if n[0] is None or n[1] >= min_note:
+            continue
+        need = min_note - n[1]
+        for j in range(i + 1, len(out)):
+            spare = out[j][1] - (1 if out[j][0] is None else min_note)
+            if spare <= 0:
+                continue
+            take = min(need, spare)
+            out[j][1] -= take
+            n[1] += take
+            need -= take
+            if need <= 0:
+                break
     return out
 
 
@@ -265,15 +279,21 @@ def transcribe(path):
     notes = merge_same(segment(semi))
     if not notes:
         raise RuntimeError("音符が見つかりません")
-    unit, err = best_unit(notes)
+    # 🔴 **テンポの格子に丸めない**（2026-08-05）。格子は推定でしかなく、同じ曲で
+    # 106 とも 176 とも出る。丸めた瞬間に音の長さが全部その誤差ぶん狂い、
+    # 実測で**音の立ち上がりが元音源から 662〜912ms ずれた**（user 様「リズム
+    # 悪すぎ」）。歌わせるのに楽譜の見た目は要らないので、**測った長さ（10ms
+    # 刻み）をそのまま渡す**。単位を 10ms にすると tempo は 1500 になるが、
+    # これは「1 単位 = 10ms」を表すだけの数で、曲の速さではない。
+    _unit, err = best_unit(notes)                 # 記録用（丸めには使わない）
+    unit = HOP
     out = []
     prev_end = notes[0][1]
     for pitch, a, b in notes:
-        gap = (a - prev_end) * HOP
-        if gap >= unit * 0.75:
-            out.append([None, max(1, int(round(gap / unit))), ""])
-        out.append([to_name(pitch), max(1, int(round((b - a) * HOP / unit))),
-                    ""])
+        gap = a - prev_end
+        if gap >= 2:                              # 20ms 以上あいたら休み
+            out.append([None, int(gap), ""])
+        out.append([to_name(pitch), max(1, int(b - a)), ""])
         prev_end = b
     tempo = 60.0 / (unit * 4.0)
     return tidy(out, unit), tempo, err

@@ -2823,7 +2823,7 @@ SPECS = [{
 }, {
     "type": "function",
     "function": {
-        "name": "sing_cheer_song",
+        "name": "_disabled_sing_cheer_song",
         "description": "横浜DeNAベイスターズの選手応援歌を、旋律つきで実際に"
                        "歌う。「牧の応援歌を歌って」「宮﨑の応援歌うたってよ」"
                        "のように歌うことを求められたらこちらを使う。"
@@ -2874,12 +2874,23 @@ HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy,
             "get_travel_advisory": get_travel_advisory,
             "get_baseball": get_baseball,
             "get_roster_move": get_roster_move,
-            "get_cheer_song": get_cheer_song,
-            "sing_cheer_song": sing_cheer_song}
+            "get_cheer_song": get_cheer_song}
+# 🔴 「歌う」は 2026-08-05 に**いったん外した**。リズムが元音源と合っていない
+# （較正済みの物差しで、拍のずれ 中央値 330〜1351ms。同じ音源どうしなら 0ms、
+# 400ms 揺らした対照でも 170ms）。user 様に「リズム悪すぎ」と言われた通りで、
+# 直るまで実機には出さない。合成と採譜の部品（sing_vv / transcribe /
+# cheer_song / prerender / 試験）はそのまま残してある。
+# 戻すときは HANDLERS と SPECS に sing_cheer_song を足すだけ。
 
 
 def specs():
-    return SPECS
+    """受け口（HANDLERS）がある道具だけを渡す。
+
+    外した道具の説明が残っていると、モデルがそれを呼んで失敗する。
+    名前の対応を 1 か所（HANDLERS）だけで決められるようにしておく。
+    """
+    return [s for s in SPECS
+            if (s.get("function") or {}).get("name") in HANDLERS]
 
 
 def has(name: str) -> bool:
