@@ -16,11 +16,15 @@ import numpy as np
 
 RATE = 16000
 HOP = 0.01
-WIN = 0.04
+WIN = 0.06              # 窓（秒）
 F_LO, F_HI = 80.0, 800.0
-AC_GATE = 0.45          # 自己相関の山がこれ以下なら声と認めない
+AC_GATE = 0.35          # 相関の山がこれ以下なら声と認めない
+# 窓 0.06・判定 0.35 は閉ループで選んだ（2026-08-05）。採譜→歌唱→元音源と
+# 照合したときの形のずれ: 宮﨑 2.64→1.49 半音・牧 2.14→2.00 半音、歌の
+# 無音も 17.0→11.0% / 13.7→11.0% に減った（窓 0.04・判定 0.45 との比較）。
 RMS_REL = 0.06          # いちばん大きいフレームに対する割合で無音を切る
 NOTE_TOL = 0.7          # 同じ音とみなす高さの幅（半音）
+VERSION = 4             # 起こし方を変えたら上げる（取ってある結果を捨てるため）
 MIN_NOTE = 0.06         # これより短い音は捨てる（秒）
 GAP_UNVOICED = 0.05     # これだけ声が切れたら音の区切りとみなす（秒）
 _STEPS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
@@ -39,24 +43,36 @@ def load_audio(path, rate=RATE):
 
 
 def f0_track(x, rate=RATE):
-    """10ms ごとの高さ（半音・小数）。声でない所は NaN。"""
+    """10ms ごとの高さ（半音・小数）。声でない所は NaN。
+
+    🔴 相関は**重なった分だけで正規化する**（NCCF）。ずらすほど掛け合わせる
+    サンプルが減るので、`ac/ac[0]` のままだと**低い音ほど山が低く出て**声と
+    認められない。実測（2026-08-05・牧秀悟）: 45.4% が「声でない」とされ、その
+    90% は音が鳴っていた（音量の中央値は声とした所と同じ 0.038）。正規化すると
+    この取りこぼしが消える。
+    """
     n_win, n_hop = int(rate * WIN), int(rate * HOP)
     lo_lag, hi_lag = int(rate / F_HI), int(rate / F_LO)
+    lags = np.arange(lo_lag, hi_lag)
     rms, semi = [], []
     for s in range(0, len(x) - n_win, n_hop):
         seg = x[s:s + n_win]
         rms.append(float(np.sqrt(np.mean(seg * seg))))
         seg = seg - seg.mean()
-        ac = np.correlate(seg, seg, mode="full")[len(seg) - 1:]
-        if ac[0] <= 0:
+        raw = np.correlate(seg, seg, mode="full")[len(seg) - 1:]
+        if raw[0] <= 0:
             semi.append(np.nan)
             continue
-        ac = ac / ac[0]
-        lag = int(np.argmax(ac[lo_lag:hi_lag])) + lo_lag
-        if ac[lag] <= AC_GATE:
+        # 重なりの手前側・奥側それぞれの力（累積和で一度に出す）
+        cs = np.concatenate(([0.0], np.cumsum(seg * seg)))
+        head = cs[len(seg) - lags] - cs[0]
+        tail = cs[len(seg)] - cs[lags]
+        nccf = raw[lags] / np.sqrt(head * tail + 1e-12)
+        k = int(np.argmax(nccf))
+        if nccf[k] <= AC_GATE:
             semi.append(np.nan)
             continue
-        semi.append(69.0 + 12.0 * np.log2((rate / lag) / 440.0))
+        semi.append(69.0 + 12.0 * np.log2((rate / lags[k]) / 440.0))
     rms = np.array(rms)
     semi = np.array(semi)
     semi[rms < RMS_REL * rms.max()] = np.nan
@@ -149,7 +165,30 @@ def segment(semi):
             cur, start = [s], i
     if cur:
         notes.append((float(np.median(cur)), start, len(semi)))
-    return [(p, a, b) for p, a, b in notes if (b - a) * HOP >= MIN_NOTE]
+    return absorb_short(notes)
+
+
+def absorb_short(notes):
+    """短すぎる区切りを**捨てずに**隣へ吸わせる。
+
+    捨てると、その時間がまるごと休みになって歌に穴が開く。実測（2026-08-05・
+    牧秀悟）: 音源は 25.2 秒ずっと鳴っているのに、量子化の段で 33% が休みに
+    なり「休みが多すぎる」で歌えない曲に落ちていた。しゃくり上げや声のゆれで
+    生まれる 60ms 未満の区切りは、前の音（無ければ次の音）に付けて時間を保つ。
+    こうすると休みは**音源が本当に鳴っていない所だけ**になる。
+    """
+    out, pending = [], None
+    for pitch, a, b in notes:
+        if (b - a) * HOP < MIN_NOTE:
+            if out:
+                out[-1][2] = max(out[-1][2], b)
+            elif pending is None:
+                pending = a
+            continue
+        if pending is not None:
+            a, pending = min(a, pending), None
+        out.append([pitch, a, b])
+    return [(p, a, b) for p, a, b in out]
 
 
 def merge_same(notes):

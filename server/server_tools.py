@@ -2485,6 +2485,52 @@ def _norm_name(s: str) -> str:
     return "".join(_SAME_KANJI.get(c, c) for c in s)
 
 
+# 聞き取りは同じ読みの別の字を返す（実測 2026-08-05: 「牧」→「真木」、
+# 「宮﨑」→「宮崎」）。字で引くだけだと当たらないので、**読みでも引く**。
+# 読みは Open JTalk の解析結果から取る（合成に使っているものと同じ辞書。
+# 追加の依存を増やさない）。1 行目の 9 番目がカタカナの読み。
+_OJT_BIN = os.environ.get("OPENJTALK_BIN", "open_jtalk")
+_OJT_DIC = os.environ.get(
+    "OPENJTALK_DIC", "/var/lib/mecab/dic/open-jtalk/naist-jdic")
+_OJT_VOICE = os.environ.get(
+    "OPENJTALK_VOICE",
+    "/usr/share/hts-voice/nitech-jp-atr503-m001/nitech_jp_atr503_m001.htsvoice")
+_READINGS: dict = {}
+
+
+def _yomi(text: str) -> str:
+    """その字の読み（カタカナ）。取れなければ空。"""
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    if text in _READINGS:
+        return _READINGS[text]
+    import subprocess
+    import tempfile
+    out = kana = ""
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = os.path.join(tmp, "t.txt")
+            r = subprocess.run(
+                [_OJT_BIN, "-x", _OJT_DIC, "-m", _OJT_VOICE, "-ot", trace,
+                 "-ow", os.path.join(tmp, "o.wav")],
+                input=text.encode("utf-8"), capture_output=True, timeout=20)
+            if r.returncode == 0 and os.path.exists(trace):
+                out = open(trace, encoding="utf-8", errors="replace").read()
+    except Exception as e:                            # noqa: BLE001
+        log.warning("読みが取れない: %s: %s", type(e).__name__, e)
+    for line in out.splitlines():
+        if not line or line.startswith("["):
+            continue
+        if line.startswith("0 ") or "^" in line:      # ここからは音素の並び
+            break
+        cols = line.split(",")
+        if len(cols) > 8 and cols[8] != "*":
+            kana += cols[8]
+    _READINGS[text] = kana
+    return kana
+
+
 def _find_player(songs: dict, who: str):
     """言われた名前で引く。姓だけ・名だけでも当てる。1 人に絞れなければ None。"""
     q = _norm_name(who)
@@ -2493,13 +2539,57 @@ def _find_player(songs: dict, who: str):
     table = {n: _norm_name(n) for n in songs}
     if q in songs:
         return q
-    hit = [n for n, v in table.items() if q == v]
-    if len(hit) == 1:
-        return hit[0]
-    hit = [n for n, v in table.items() if q in v]
-    if len(hit) == 1:
-        return hit[0]
+    # 姓は名前の**先頭**にある。途中一致より先に前方一致を見ないと、
+    # 「森」が 森敬斗 と 三森大貴 の 2 件に当たって絞れない（実測 2026-08-05）
+    for pick in (lambda q_, v: q_ == v,
+                 lambda q_, v: v.startswith(q_),
+                 lambda q_, v: q_ in v):
+        hit = [n for n, v in table.items() if pick(q, v)]
+        if len(hit) == 1:
+            return hit[0]
+    # 字で当たらなければ読みで引く（「真木」で「牧秀悟」に当てる）
+    qr = _yomi(q)
+    if not qr:
+        return None
+    reads = {n: _yomi(n) for n in songs}
+    for pick in (lambda q_, v: q_ == v,
+                 lambda q_, v: v.startswith(q_),
+                 lambda q_, v: q_ in v):
+        hit = [n for n, v in reads.items() if v and pick(qr, v)]
+        if len(hit) == 1:
+            return hit[0]
     return None
+
+
+async def sing_cheer_song(session, args, ctx=None) -> str:
+    """応援歌を旋律つきで歌う。
+
+    音は文字で返せないので、用意した音符を ctx["song"] に載せる。実際に鳴らす
+    のは app.py。旋律は公式に無いので、単旋律の歌唱音源から起こしている
+    （cheer_song.py）。合成は VOICEVOX の歌唱（sing_vv.py）。
+    """
+    import cheer_song
+    who = str(args.get("player") or "")[:MAX_PLACE_LEN]
+    if ctx is not None and ctx.get("song"):
+        # 同じ往復で二度呼ばれることがある（同じ tool_calls が 2 つ来る実測あり）。
+        # 作り直さず、同じ答えを返す
+        return "ok: %sの応援歌をこれから歌う" % ctx["song"]["name"]
+    try:
+        notes, tempo, name = await cheer_song.prepare(session, who)
+    except LookupError:
+        return ("error: その選手の応援歌は歌えません。"
+                "歌詞だけなら get_cheer_song で調べられます")
+    except Exception as e:
+        log.warning("sing unavailable: %s: %s", type(e).__name__, e)
+        return "error: いま応援歌を歌えませんでした"
+    if ctx is not None:
+        ctx["song"] = {"notes": notes, "tempo": tempo, "name": name}
+    # 🔴 答えは**事実**にする。「歌います」と宣言文で返すと、モデルは仕事が
+    # まだ済んでいないと読んで同じ道具を呼び直し、往復の上限に当たって
+    # 「うまく答えられませんでした」になる（2026-08-05 実測）。
+    # 「ひとこと添えて」の指示は SPECS の description 側に書く（答えに書くと
+    # そのまま読み上げられる）
+    return "ok: %sの応援歌をこれから歌う" % name
 
 
 async def get_cheer_song(session, args, ctx=None) -> str:
@@ -2733,6 +2823,26 @@ SPECS = [{
 }, {
     "type": "function",
     "function": {
+        "name": "sing_cheer_song",
+        "description": "横浜DeNAベイスターズの選手応援歌を、旋律つきで実際に"
+                       "歌う。「牧の応援歌を歌って」「宮﨑の応援歌うたってよ」"
+                       "のように歌うことを求められたらこちらを使う。"
+                       "歌詞を読み上げるだけでよい時は get_cheer_song。"
+                       "この道具が ok を返したら歌は用意できている。"
+                       "同じ選手で呼び直さず、「◯◯の応援歌を歌うね」のように"
+                       "ひとことだけ短く返すこと。歌はその直後に流れる。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "player": {"type": "string",
+                           "description": "選手名。例: 宮﨑敏郎、桑原。"},
+            },
+            "required": ["player"],
+        },
+    },
+}, {
+    "type": "function",
+    "function": {
         "name": "get_cheer_song",
         "description": "横浜DeNAベイスターズの選手応援歌の歌詞を調べる。"
                        "「牧の応援歌うたって」「ベイスターズの応援歌教えて」"
@@ -2764,7 +2874,8 @@ HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy,
             "get_travel_advisory": get_travel_advisory,
             "get_baseball": get_baseball,
             "get_roster_move": get_roster_move,
-            "get_cheer_song": get_cheer_song}
+            "get_cheer_song": get_cheer_song,
+            "sing_cheer_song": sing_cheer_song}
 
 
 def specs():

@@ -139,14 +139,18 @@ async def notes_from_file(name, path):
     if os.path.exists(js) and os.path.getmtime(js) >= os.path.getmtime(path):
         with open(js, encoding="utf-8") as f:
             d = json.load(f)
-        return d["notes"], d["tempo"]
+        # 起こし方を変えたら取ってある結果は使わない（音源の更新時刻だけでは
+        # 気付けない）
+        if d.get("v") == transcribe.VERSION:
+            return d["notes"], d["tempo"]
     notes, tempo, err = await asyncio.to_thread(transcribe.transcribe, path)
     log.info("%s の応援歌を %s から採譜した"
              "（%d 音・テンポ %.0f・割り切れなさ %.2f）",
              name, os.path.basename(path),
              sum(1 for n in notes if n[0]), tempo, err)
     with open(js, "w", encoding="utf-8") as f:
-        json.dump({"notes": notes, "tempo": tempo}, f, ensure_ascii=False)
+        json.dump({"v": transcribe.VERSION, "notes": notes,
+                   "tempo": tempo}, f, ensure_ascii=False)
     return notes, tempo
 
 

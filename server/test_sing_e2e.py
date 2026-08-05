@@ -189,30 +189,26 @@ async def main():
 
     # 楽譜どおりか（起こした音符と、鳴った音の高さを突き合わせる）
     import cheer_song
+    import sing_vv
     import test_transcribe as tt
     async with aiohttp.ClientSession() as s2:
         notes, tempo, name = await cheer_song.prepare(s2, WHO)
+    # 歌う前に、声の出る帯へオクターブ単位で寄せている。楽譜と突き合わせる
+    # ときも同じだけずらす（寄せた量を無視すると、合っていても外れて見える）
+    shift = sing_vv.octave_shift([sing_vv.to_key(n[0]) for n in notes if n[0]])
     want = []
     for n in notes:
         if n[0] is None:
             continue
-        v = tt.transcribe.to_name(0)  # ダミー（下で使わない）
-        break
-    step = {"C": 0, "C#": 1, "D": 2, "D#": 3, "E": 4, "F": 5, "F#": 6,
-            "G": 7, "G#": 8, "A": 9, "A#": 10, "B": 11}
-    for n in notes:
-        if n[0] is None:
-            continue
-        s_, o_ = n[0][:-1], int(n[0][-1])
-        v = 12 * (o_ + 1) + step[s_]
+        v = sing_vv.to_key(n[0]) + shift
         if not want or want[-1] != v:
             want.append(v)
     x = np.frombuffer(pcm, dtype="<i2").astype("float64") / 32768.0
     got = tt.contour(x, app.DOWN_RATE)
     cost = tt.align_cost(got, want) if got and want else 99.0
     check("楽譜どおりの旋律で歌えている（平均 1.5 半音以内）", cost <= 1.5,
-          "平均 %.2f 半音（楽譜 %d 音 / 鳴った %d 音）"
-          % (cost, len(want), len(got)))
+          "平均 %.2f 半音（楽譜 %d 音 / 鳴った %d 音・帯へ %+d 半音）"
+          % (cost, len(want), len(got), shift))
 
     print("\n%d/%d" % (ok, ok + fail))
     return 1 if fail else 0
