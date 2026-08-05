@@ -28,8 +28,13 @@ UP_RATE, FRAME_MS = 16000, 60
 DEVICE_ID = os.environ.get("DEVICE_ID", "aa:bb:cc:dd:ee:02")
 BODY_DELAY = float(os.environ.get("BODY_DELAY", "0.7"))
 LOG = os.environ.get("LOG", "/home/yasu/stackchan-server/server.log")
-# 長い返事になる問いを選ぶ（窓は 6 秒ぶん送ってから開くので短い返事では開かない）
-ASK = os.environ.get("ASK", "燃油サーチャージを教えて")
+# 長い返事になる問いを選ぶ（窓は 6 秒ぶん送ってから開くので短い返事では開かない）。
+# ⚠️ 2026-08-06 に「燃油サーチャージを教えて」で FAIL した。道具は 6 方面すべてを
+# 返したのに、モデルが読まずに「どこの燃油サーチャージが知りたいか」と聞き返し、
+# 返事が 4.6 秒＝窓の条件（6 秒）に届かなかった＝**割り込みの機構ではなく、
+# 問いの選び方の失敗**。応援歌の歌詞は VERBATIM_TOOLS でそのまま読ませるので
+# 長さが決まる（実測 11.9 秒）
+ASK = os.environ.get("ASK", "宮﨑の応援歌を教えて")
 BARGE = os.environ.get("BARGE", "ねえ、ちょっと待って")
 ABORT_LINE = "読み上げ中に話しかけられたので残りをやめる"
 
@@ -133,6 +138,18 @@ async def main() -> int:
                 task.cancel()
 
     tail = log_since(log_from)
+    # 窓が開く前提（返事が 6 秒以上）を満たしたかを先に見る。満たしていない
+    # のに FAIL と言うと、機構が壊れたのか問いが短かっただけなのか読めない
+    spoke = [ln for ln in tail.splitlines() if "spoke " in ln]
+    secs = 0.0
+    for ln in spoke:
+        try:
+            secs = max(secs, float(ln.split("(")[1].split("s)")[0]))
+        except (IndexError, ValueError):
+            pass
+    if secs and secs < 6.0:
+        print("前提を満たしていない: 返事が %.1f 秒しかなく窓が開かない"
+              "（6 秒以上の返事になる問いを ASK= で渡す）" % secs)
     aborted = ABORT_LINE in tail
     for line in tail.splitlines():
         if "文の切れ目で" in line or ABORT_LINE in line:

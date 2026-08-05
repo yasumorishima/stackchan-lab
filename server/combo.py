@@ -52,11 +52,12 @@ def build(path, morae, ref_pitch="A4", passes=1):
         align_sung.REF_PITCH = old_pitch
 
     edges = bounds + [hi]
-    notes = []
+    notes, kept = [], []
     for k, mora in enumerate(morae):
         a, b = edges[k], edges[k + 1]
         if b - a < 2:
             continue
+        kept.append((a, b))
         m = int((b - a) * 0.2)
         core = semi[a + m:b - m] if (b - a) - 2 * m >= 2 else semi[a:b]
         core = core[~np.isnan(core)]
@@ -69,4 +70,4 @@ def build(path, morae, ref_pitch="A4", passes=1):
                       int(b - a), mora])
     if not notes:
         raise RuntimeError("音符が取れない")
-    return notes, 1500.0
+    return notes, 1500.0, kept

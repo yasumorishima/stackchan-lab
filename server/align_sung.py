@@ -101,12 +101,13 @@ def build(path, morae):
         cells = [max(4, edges[k + 1] - edges[k])
                  for k in range(len(morae))]
     bounds.append(hi)
-    notes = []
+    notes, kept = [], []
     for k, mora in enumerate(morae):
         a = bounds[k]
         b = min(max(bounds[k + 1], a + 2), len(semi))
         if b - a < 2:
             continue
+        kept.append((a, b))
         p = _pitch(semi, a, b)
         if p is None:
             notes.append([None, int(b - a), ""])
@@ -114,4 +115,4 @@ def build(path, morae):
         notes.append([transcribe.to_name(p), int(b - a), mora])
     if not notes:
         raise RuntimeError("音符が取れない")
-    return notes, 1500.0
+    return notes, 1500.0, kept

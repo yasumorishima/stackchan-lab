@@ -2827,7 +2827,7 @@ SPECS = [{
 }, {
     "type": "function",
     "function": {
-        "name": "_disabled_sing_cheer_song",
+        "name": "sing_cheer_song",
         "description": "横浜DeNAベイスターズの選手応援歌を、旋律つきで実際に"
                        "歌う。「牧の応援歌を歌って」「宮﨑の応援歌うたってよ」"
                        "のように歌うことを求められたらこちらを使う。"
@@ -2839,7 +2839,11 @@ SPECS = [{
             "type": "object",
             "properties": {
                 "player": {"type": "string",
-                           "description": "選手名。例: 宮﨑敏郎、桑原。"},
+                           "description": "選手名。**言われたとおりの字を"
+                                          "そのまま写す**（漢字を別の字に"
+                                          "置き換えたり、読みから当て字を"
+                                          "作ったりしない）。姓だけでよい。"
+                                          "例: 牧、宮﨑敏郎、桑原。"},
             },
             "required": ["player"],
         },
@@ -2878,15 +2882,17 @@ HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy,
             "get_travel_advisory": get_travel_advisory,
             "get_baseball": get_baseball,
             "get_roster_move": get_roster_move,
-            "get_cheer_song": get_cheer_song}
-# 🔴 「歌う」は 2026-08-05 に**いったん外した**。リズムが元音源と合っていない
-# （較正済みの物差しで、拍のずれ 中央値 330〜1351ms。同じ音源どうしなら 0ms、
-# 400ms 揺らした対照でも 170ms）。user 様に「リズム悪すぎ」と言われた通りで、
-# 直るまで実機には出さない。合成と採譜の部品（sing_vv / transcribe /
-# cheer_song / prerender / 試験）はそのまま残してある。
-# 戻すときは **HANDLERS に足す＋SPECS の名前を `_disabled_sing_cheer_song`
-# から `sing_cheer_song` に戻す**（specs() は名前で突き合わせるので、
-# HANDLERS だけ足しても道具は渡らず、無言で使えないままになる）。
+            "get_cheer_song": get_cheer_song,
+            "sing_cheer_song": sing_cheer_song}
+# 🔴 「歌う」は 2026-08-05 にリズム破綻でいったん外し、**2026-08-06 に採譜を
+# 入れ替えて戻した**。音符の切れ目を「音の高さが変わった所」で決めるのをやめ、
+# **歌詞のモーラ数に固定して DP で区切る**（cheer_song.notes_by_morae →
+# segment_dp）。実曲 5 曲で、音符の始まりが音源の立ち上がりに乗る度合いが
+# 20〜60ms（でたらめに置いた対照は 54.8〜105.1ms、等間隔は 65.3〜133.1ms）。
+# 歌詞合わせの DTW は実音源では対照と同等以下だったので使わない（参照を
+# 男声にしても変わらず＝合唱＋ブラスに独唱の参照は当たらない）。
+# ⚠️ 外すときは **HANDLERS から消す**だけでよい（specs() は名前で突き合わせ、
+# 受け口の無い道具は渡さない）。戻すときは HANDLERS と SPECS の両方を見る。
 
 
 def specs():

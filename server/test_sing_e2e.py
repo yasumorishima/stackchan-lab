@@ -149,8 +149,9 @@ async def main():
                     pass                # 窓のたびに来るので数えない
 
     tail = log_since(log_from)
-    # 実際に用意した回数（呼ばれても 2 回目は作り直さない）
-    made = tail.count("に対して歌詞")
+    # 実際に用意した回数（呼ばれても 2 回目は作り直さない）。
+    # ⚠️ 数えているのは cheer_song.prepare が出すログ。文言を変えたらここも変える
+    made = tail.count("モーラに対して音符")
     calls = tail.count("tool sing_cheer_song(")
     check("歌を用意するのは 1 回だけ", made == 1,
           "用意 %d 回 / 呼ばれ %d 回" % (made, calls))

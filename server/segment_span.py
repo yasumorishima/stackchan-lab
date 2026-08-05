@@ -126,11 +126,12 @@ def build(path, morae):
     if best is None:
         raise RuntimeError("区切れない")
     _score, bounds, cell = best
-    notes = []
+    notes, kept = [], []
     for k, mora in enumerate(morae):
         a, b = bounds[k], bounds[k + 1]
         if b - a < 2:
             continue
+        kept.append((a, b))
         m = int((b - a) * 0.2)
         core = semi[a + m:b - m] if (b - a) - 2 * m >= 2 else semi[a:b]
         core = core[~np.isnan(core)]
@@ -143,4 +144,6 @@ def build(path, morae):
                       int(b - a), mora])
     if not notes:
         raise RuntimeError("音符が取れない")
-    return notes, 1500.0
+    # 切れ目も返す（10ms 単位の絶対位置）。物差しはここと比べる＝音源ぜんぶと
+    # 比べると、歌詞が一部しか覆わないのが正しい曲で正しい答えを不正解にする
+    return notes, 1500.0, kept

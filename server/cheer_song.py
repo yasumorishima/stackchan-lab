@@ -21,6 +21,7 @@ import os
 import re
 import time
 
+import segment_dp
 import server_tools
 import transcribe
 
@@ -135,6 +136,36 @@ def local_audio(name):
     return None
 
 
+# 採譜のやり方を変えたら上げる（取ってある音符を捨てるため）。
+# 1 = 高さの変わり目で切る（〜2026-08-05・リズムが合わず外した）
+# 2 = DP でモーラ数に区切る（2026-08-06〜）
+SEG_VERSION = 2
+# 1 音がこれより長い曲は、音源が歌詞を覆っていない＝歌わない（秒）
+MAX_SEC_PER_MORA = float(os.environ.get("SING_MAX_SEC_PER_MORA", "0.8"))
+
+
+async def notes_by_morae(name, path, morae):
+    """歌詞のモーラ数に合わせて音源を区切る（DP）。
+
+    ⚠️ 高さの変わり目で切る旧方式は、同じ高さで続く歌詞が 1 音に潰れて
+    以降が全部ずれる。**音符の数を歌詞のモーラ数に固定する**のが要点。
+    """
+    js = _cache_path(name, "seg%d.json" % SEG_VERSION)
+    if os.path.exists(js) and os.path.getmtime(js) >= os.path.getmtime(path):
+        with open(js, encoding="utf-8") as f:
+            d = json.load(f)
+        if d.get("v") == SEG_VERSION and d.get("morae") == len(morae):
+            return d["notes"], d["tempo"]
+    notes, tempo, _edges = await asyncio.to_thread(
+        segment_dp.build, path, morae)
+    log.info("%s の応援歌を %s から採譜した（%d 音・歌詞 %d モーラ）",
+             name, os.path.basename(path), len(notes), len(morae))
+    with open(js, "w", encoding="utf-8") as f:
+        json.dump({"v": SEG_VERSION, "morae": len(morae),
+                   "notes": notes, "tempo": tempo}, f, ensure_ascii=False)
+    return notes, tempo
+
+
 async def notes_from_file(name, path):
     """手元の音源から音符を起こす（一度起こしたら取っておく）。"""
     js = _cache_path(name, "json")
@@ -157,32 +188,23 @@ async def notes_from_file(name, path):
 
 
 async def notes_for(session, name, url):
-    """配布ページの音源から音符を起こす（音は取ってきて置いておく）。"""
+    """配布ページの音源から音符を起こす（音は取ってきて置いておく）。
+
+    音源のパスも返す（DP はあとで音源を読み直すため）。
+    """
     path = local_audio(name)
     if path is None:
         path = _cache_path(name, url.rsplit(".", 1)[-1])
         with open(path, "wb") as f:
             f.write(await _fetch(session, url, binary=True))
-    return await notes_from_file(name, path)
+    notes, tempo = await notes_from_file(name, path)
+    return notes, tempo, path
 
 
 def gap_ratio(notes):
     """音符の並びのうち、休みが占める割合。"""
     total = sum(n[1] for n in notes) or 1
     return sum(n[1] for n in notes if not n[0]) / float(total)
-
-
-def put_lyrics(notes, text):
-    """音符に歌詞を 1 音ずつ乗せる。足りない分は伸ばす。"""
-    ms = moras(text)
-    out, i = [], 0
-    for pitch, length in [(n[0], n[1]) for n in notes]:
-        if pitch is None:
-            out.append([None, length, ""])
-            continue
-        out.append([pitch, length, ms[i] if i < len(ms) else "ー"])
-        i += 1
-    return out, len(ms), sum(1 for n in notes if n[0])
 
 
 async def prepare(session, want):
@@ -206,14 +228,30 @@ async def prepare(session, want):
                                                          _REUSE.get(key, ""))
         if not name:
             raise LookupError("音源が無い")
-        notes, tempo = await notes_for(session, name, table[name])
+        notes, tempo, path = await notes_for(session, name, table[name])
+    # 休みだらけの音源（歌が入っていない）はここで外す。判定は旧採譜の
+    # 音符の並びで見る＝DP は必ずモーラ数だけ音符を作るので休みが出ない
     gap = gap_ratio(notes)
     if gap > MAX_GAP:
         log.info("%s は休みが %.0f%% で歌にならないので歌わない",
                  key, gap * 100)
         raise LookupError("歌にならない")
-    notes, n_mora, n_note = put_lyrics(notes, text)
-    log.info("%s: 音符 %d に対して歌詞 %d 音", key, n_note, n_mora)
+    morae = moras(text)
+    if not morae:
+        raise LookupError("歌詞が読めない")
+    notes, tempo = await notes_by_morae(key, path, morae)
+    # 🔴 音源が歌詞を 1 対 1 で覆っていない曲は歌わない。DP は必ずモーラ数だけ
+    # 音符を作るので、覆っていない曲では 1 音が異様に伸びて歌にならない。
+    # 実測（2026-08-06・13 曲）: 12 曲は 0.22〜0.58 秒/モーラに固まり、
+    # 「その他の右打者」だけ 1.59 秒（歌詞 14 モーラに対し 22.2 秒鳴っている）。
+    # その曲は楽譜との差 3.17 半音・最長無音 1.46 秒で、聴ける歌になっていない
+    spm = sum(n[1] for n in notes) * 0.01 / max(len(morae), 1)
+    if spm > MAX_SEC_PER_MORA:
+        log.info("%s は 1 音 %.2f 秒＝歌詞と音源が対応していないので歌わない",
+                 key, spm)
+        raise LookupError("歌詞と音源が合っていない")
+    log.info("%s: 歌詞 %d モーラに対して音符 %d（1 音 %.2f 秒）",
+             key, len(morae), len(notes), spm)
     return notes, tempo, key
 
 

@@ -21,7 +21,7 @@ import sing_vv
 # 「歌う」道具は外してあることがある（リズムが直るまで）。その間この試験は
 # 走らせない＝走らせると HANDLERS の KeyError で一式が異常終了する
 if "sing_cheer_song" not in server_tools.HANDLERS:
-    print("skip: sing_cheer_song は今 外してあります（リズムが直るまで）")
+    print("skip: sing_cheer_song は今 外してあります")
     raise SystemExit(0)
 
 ok = fail = 0
@@ -66,9 +66,9 @@ async def main():
               "%d 音・最初の 6 つ %s"
               % (len(sung), [n[2] for n in sung[:6]]))
 
-        # ③ その音符で歌えるか
-        pcm, rate = await sing.sing(notes, tempo=int(round(song["tempo"])),
-                                    title=song["name"])
+        # ③ その音符で歌えるか（合成は sing_vv。取ってある歌があればそれ）
+        pcm, rate = await asyncio.to_thread(
+            sing_vv.sung, song["name"], notes, song["tempo"])
         secs = len(pcm) / 2 / rate
         peak = max(abs(int.from_bytes(pcm[i:i + 2], "little", signed=True))
                    for i in range(0, len(pcm), 2))

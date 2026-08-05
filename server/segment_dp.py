@@ -120,11 +120,12 @@ def build(path, morae):
     lo, hi = int(voiced[0]), min(int(voiced[-1]) + 1, len(semi))
     f = flux(x, rate)
     bounds = segment(semi, f, len(morae), lo, hi)
-    notes = []
+    notes, edges = [], []
     for k, mora in enumerate(morae):
         a, b = bounds[k], bounds[k + 1]
         if b - a < 2:
             continue
+        edges.append((a, b))
         seg = semi[a:b]
         m = int((b - a) * 0.2)
         core = semi[a + m:b - m] if (b - a) - 2 * m >= 2 else seg
@@ -138,4 +139,4 @@ def build(path, morae):
                       int(b - a), mora])
     if not notes:
         raise RuntimeError("音符が取れない")
-    return notes, 1500.0
+    return notes, 1500.0, edges
