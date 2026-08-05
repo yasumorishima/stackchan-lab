@@ -23,7 +23,7 @@
 
 **応援歌を歌えるようにした（2026-08-04）**: 「歌わせる」。前に「メロディの数値データが要る」で止めていた所です。
 
-歌声の合成は **Sinsy**（名古屋工業大学の HMM 歌声合成・Modified BSD）を使います。声は同じ所の `nitech_jp_song070_f001`（Creative Commons Attribution 3.0）。**Raspberry Pi では C++ を組まない**ので、GitHub Actions で aarch64 向けにクロスビルドし、出来た実行ファイルと辞書だけを Pi へ置きました（`.github/workflows/build-sinsy.yml`）。Pi は Debian bookworm なので、走らせる側の Ubuntu を古い方に留めています（新しい glibc を要求する実行ファイルは Pi で動かない）。**Codespace を使わなかったのは、起動に事前の承認が要る取り決めだからです。** public リポジトリの Actions なら無料で無制限です。
+歌声の合成は **Sinsy**（名古屋工業大学の HMM 歌声合成・Modified BSD）を使います。声は同じ所の `nitech_jp_song070_f001`（Creative Commons Attribution 3.0）。**Raspberry Pi では C++ を組まない**ので、GitHub Actions で aarch64 向けにクロスビルドし、出来た実行ファイルと辞書だけを Pi へ置きました（`.github/workflows/build-sinsy.yml`。**2026-08-06 に Sinsy の合成器ごと削除しました**＝歌は VOICEVOX に替わり、このビルドを使う所が無くなったためです）。Pi は Debian bookworm なので、走らせる側の Ubuntu を古い方に留めています（新しい glibc を要求する実行ファイルは Pi で動かない）。**Codespace を使わなかったのは、起動に事前の承認が要る取り決めだからです。** public リポジトリの Actions なら無料で無制限です。
 
 **メロディをどこから取るかが本題でした。** 公式にあるのは歌詞とふりがなだけです。ドレミ表記を載せている個人サイトは横浜の分を持っておらず（sitemap を全部見て 0 件）、載っている球団の分も**画像**でした。ゲームの応援歌パスワードは**ひらがなで符号化されたメロディそのもの**ですが、復号の仕様は公開されておらず、変換器も見つかりません。
 
