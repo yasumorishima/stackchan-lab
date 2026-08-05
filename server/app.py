@@ -1545,10 +1545,12 @@ async def ws_handler(request: web.Request):
                 log.info("本文が無いので歌の一言に差し替えた")
             log.info("LLM: %s", reply)
             await send_json({"type": "llm", "emotion": "happy", "text": "😀"})
-            await speak(reply)
-            song = state.pop("song", None)
-            if song:
-                await sing_song(song)
+            song = state.pop("song", None)   # 先に降ろす。読み上げが例外で
+            try:                                  # 落ちても次の発話に持ち越さない
+                await speak(reply)
+            finally:
+                if song:
+                    await sing_song(song)
             state["last_spoke"] = time.monotonic()
         except asyncio.CancelledError:
             raise

@@ -111,7 +111,9 @@ def match_player(table, want):
     if want in table:
         return want
     hit = [n for n in table if want in n or n in want]
-    return hit[0] if len(hit) == 1 else (hit[0] if hit else None)
+    # 1 人に絞れないなら**当てない**（「森」で 2 人当たるのに先頭を返すと、
+    # 別人の旋律で歌ってしまう）
+    return hit[0] if len(hit) == 1 else None
 
 
 def _cache_path(name, ext):
@@ -186,7 +188,8 @@ def put_lyrics(notes, text):
 async def prepare(session, want):
     """(音符, テンポ, 見出し) を返す。歌えなければ LookupError。"""
     songs = await server_tools._songs(session)
-    key = server_tools._find_player(songs, want)
+    key = await asyncio.to_thread(server_tools._find_player,
+                                  songs, want)
     # 公式に歌詞が無い選手（もう在籍していない等）は、音だけ鳴らしても
     # 意味が無いので歌わない
     text = "".join(songs.get(key, [])) if key else ""
@@ -221,7 +224,10 @@ def _cached_ok(name):
         return True
     try:
         with open(js, encoding="utf-8") as f:
-            return gap_ratio(json.load(f)["notes"]) <= MAX_GAP
+            d = json.load(f)
+        if d.get("v") != transcribe.VERSION:
+            return True          # 起こし直せば歌えるかもしれない
+        return gap_ratio(d["notes"]) <= MAX_GAP
     except Exception:
         return False
 
@@ -232,7 +238,8 @@ async def singable(session):
     table = await audio_index(session)
     out = []
     for name in table:
-        key = server_tools._find_player(songs, name)
+        key = await asyncio.to_thread(server_tools._find_player,
+                                      songs, name)
         if key and songs.get(key) and _cached_ok(name):
             out.append(key)
     for key, src in _REUSE.items():

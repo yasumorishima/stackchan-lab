@@ -197,7 +197,7 @@ MAX_REST_SEC = float(os.environ.get("SING_MAX_REST", "0.8"))
 
 
 def trim_rests(notes):
-    """頭と終わりの休みを落とし、間の休みを頭打ちにする。"""
+    """頭と終わりの休みを落とす（間の休みの頭打ちは to_score でやる）。"""
     out = list(notes)
     while out and out[0][0] is None:
         out.pop(0)
@@ -248,16 +248,27 @@ def to_score(notes, tempo, frame_rate=FRAME_RATE):
 SUNG_VERSION = 2
 
 
-def sung_path(name):
+def sung_path(name, notes=None, tempo=None):
+    """取っておく先。**楽譜そのものを鍵に混ぜる**。
+
+    名前と版だけだと、音源を差し替えて採譜し直しても古い歌が鳴る
+    （歌詞の更新や FIT_LO / MAX_REST_SEC の変更でも同じ）。
+    """
+    import hashlib
     import transcribe
     safe = re.sub(r"[^\w぀-ヿ一-鿿]", "_", name)
-    return os.path.join(CACHE_DIR, "%s.sung.t%ds%d.wav"
-                        % (safe, transcribe.VERSION, SUNG_VERSION))
+    tag = ""
+    if notes is not None:
+        key = repr([list(n) for n in notes]) + repr(tempo) + repr(
+            (SINGER, SCORER, FIT_LO, FIT_HI, MAX_REST_SEC))
+        tag = "." + hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+    return os.path.join(CACHE_DIR, "%s.sung.t%ds%d%s.wav"
+                        % (safe, transcribe.VERSION, SUNG_VERSION, tag))
 
 
 def sung(name, notes, tempo):
     """取ってあればそれを、無ければ作って取っておく。(pcm, 周波数) を返す。"""
-    path = sung_path(name)
+    path = sung_path(name, notes, tempo)
     if os.path.exists(path):
         with wave.open(path, "rb") as w:
             return w.readframes(w.getnframes()), w.getframerate()

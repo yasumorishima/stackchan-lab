@@ -16,7 +16,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import app
 import server_tools
-import sing
+import sing_vv
+
+# 「歌う」道具は外してあることがある（リズムが直るまで）。その間この試験は
+# 走らせない＝走らせると HANDLERS の KeyError で一式が異常終了する
+if "sing_cheer_song" not in server_tools.HANDLERS:
+    print("skip: sing_cheer_song は今 外してあります（リズムが直るまで）")
+    raise SystemExit(0)
 
 ok = fail = 0
 

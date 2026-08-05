@@ -2527,7 +2527,8 @@ def _yomi(text: str) -> str:
         cols = line.split(",")
         if len(cols) > 8 and cols[8] != "*":
             kana += cols[8]
-    _READINGS[text] = kana
+    if kana:                 # 失敗（timeout 等）を覚え込まない
+        _READINGS[text] = kana
     return kana
 
 
@@ -2604,7 +2605,10 @@ async def get_cheer_song(session, args, ctx=None) -> str:
         few = [n for n in songs if "テーマ" not in n and "その他" not in n]
         return ("%s など %d 人の応援歌が分かります。誰の応援歌にしますか。"
                 % ("、".join(few[:4]), len(few)))
-    name = _find_player(songs, who)
+    # 🔴 読みを引くのに Open JTalk を起こす（1 回 0.14 秒 × 選手数）。
+    # そのまま呼ぶと**イベントループが数秒止まり**、音声の往復も
+    # 割り込みも固まる。別スレッドへ逃がす
+    name = await asyncio.to_thread(_find_player, songs, who)
     if name is None:
         # 25 件を読み上げると 1 分近くかかる。数人だけ挙げる
         few = [n for n in songs if "テーマ" not in n and "その他" not in n]
@@ -2880,7 +2884,9 @@ HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy,
 # 400ms 揺らした対照でも 170ms）。user 様に「リズム悪すぎ」と言われた通りで、
 # 直るまで実機には出さない。合成と採譜の部品（sing_vv / transcribe /
 # cheer_song / prerender / 試験）はそのまま残してある。
-# 戻すときは HANDLERS と SPECS に sing_cheer_song を足すだけ。
+# 戻すときは **HANDLERS に足す＋SPECS の名前を `_disabled_sing_cheer_song`
+# から `sing_cheer_song` に戻す**（specs() は名前で突き合わせるので、
+# HANDLERS だけ足しても道具は渡らず、無言で使えないままになる）。
 
 
 def specs():
