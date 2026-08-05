@@ -32,16 +32,24 @@ REF_PITCH = os.environ.get("ALIGN_REF_PITCH", "A4")
 CORE = 0.6                                                 # 高さを見る真ん中の割合
 
 
-def _ref(morae):
+def _ref(morae, cells=None):
     """同じ声で、一定の高さ・長さで歌わせた参照と、各モーラの開始秒。"""
-    notes = [[REF_PITCH, REF_CELL, m] for m in morae]
+    # cells を渡すとモーラごとに長さを変えられる（合わせ直し用）
+    if cells is None:
+        cells = [REF_CELL] * len(morae)
+    notes = [[REF_PITCH, max(4, int(c)), m]
+             for c, m in zip(cells, morae)]
     pcm, rate = sing_vv.sing_sync(notes, 1500.0)
     x = np.frombuffer(pcm, dtype="<i2").astype("float64") / 32768.0
     if rate != al.RATE:
         x = np.interp(np.arange(0, len(x), rate / al.RATE),
                       np.arange(len(x)), x)
     lead = 0.5                       # sing_vv が前に置く休み
-    return x, [lead + k * REF_CELL * HOP for k in range(len(morae))]
+    starts, t = [], lead
+    for c in cells:
+        starts.append(t)
+        t += max(4, int(c)) * HOP
+    return x, starts
 
 
 def _pitch(semi, a, b):
@@ -65,12 +73,34 @@ def build(path, morae):
     if not morae:
         raise RuntimeError("歌詞が無い")
     x = transcribe.load_audio(path)
-    ref, starts = _ref(morae)
-    warp = al.dtw_map(al.mfcc(ref), al.mfcc(x))
     semi = transcribe.fill_gaps(transcribe.smooth(
         transcribe.fix_octaves(transcribe.f0_track(x))))
-    bounds = [int(warp[min(int(t / HOP), len(warp) - 1)]) for t in starts]
-    bounds.append(len(semi))
+    # 歌っている所だけを相手にする（前奏・後奏を歌詞へ割り当てない）
+    voiced = np.where(~np.isnan(semi))[0]
+    if len(voiced) < 10:
+        raise RuntimeError("声が取れない")
+    pad = int(0.15 / HOP)
+    lo = max(0, int(voiced[0]) - pad)
+    hi = min(len(semi), int(voiced[-1]) + pad)
+    n_lo = int(lo * HOP * transcribe.RATE)
+    n_hi = int(hi * HOP * transcribe.RATE)
+    # DTW は 2 つの時間軸の縮尺が近いほど当たる。参照を 250ms 固定に
+    # していたので曲によっては 2 倍近く伸ばす必要があり、そこで外れて
+    # いた。1 回目は「声のある長さ ÷ モーラ数」、2 回目は 1 回目で
+    # 分かったモーラごとの長さで参照を作り直す
+    span = hi - lo
+    cells = [max(4, int(round(span / float(len(morae)))))] * len(morae)
+    target = al.mfcc(x[n_lo:n_hi])
+    bounds = None
+    for _pass in range(2):
+        ref, starts = _ref(morae, cells)
+        warp = al.dtw_map(al.mfcc(ref), target)
+        bounds = [lo + int(warp[min(int(t / HOP), len(warp) - 1)])
+                  for t in starts]
+        edges = bounds + [hi]
+        cells = [max(4, edges[k + 1] - edges[k])
+                 for k in range(len(morae))]
+    bounds.append(hi)
     notes = []
     for k, mora in enumerate(morae):
         a = bounds[k]

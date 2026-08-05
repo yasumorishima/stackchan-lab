@@ -110,7 +110,8 @@ def mfcc(x, rate=RATE):
     for s in range(0, len(x) - n_win, n_hop):
         spec = np.abs(np.fft.rfft(x[s:s + n_win] * win, n_fft)) ** 2
         e = np.log(fb.dot(spec) + 1e-10)
-        c = np.fft.rfft(e).real[:N_MFCC]
+        # 0 番目は全体の音量。合唱と単声で大きく違うので使わない
+        c = np.fft.rfft(e).real[1:N_MFCC + 1]
         out.append(c)
     m = np.array(out)
     m = (m - m.mean(axis=0)) / (m.std(axis=0) + 1e-9)   # 音色の差を均す
