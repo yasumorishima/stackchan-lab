@@ -23,6 +23,7 @@ import time
 
 import segment_dp
 import server_tools
+import sheet_song
 import transcribe
 
 log = logging.getLogger("stackchan.song")
@@ -31,6 +32,8 @@ AUDIO_INDEX_URL = os.environ.get(
     "CHEER_AUDIO_URL", "https://vocalo-oenka.com/purosupi-baystars/")
 CACHE_DIR = os.environ.get(
     "CHEER_CACHE", os.path.expanduser("~/stackchan-server/cache/songs"))
+SHEET_DIR = os.environ.get(
+    "CHEER_SHEET_DIR", os.path.expanduser("~/stackchan-server/cache/sheets"))
 UA = {"User-Agent": "Mozilla/5.0"}
 INDEX_TTL = 24 * 3600
 # 起こした音符のうち休みがこれを超える曲は歌わない。歌ではなく短い音の連打に
@@ -136,6 +139,13 @@ def local_audio(name):
     return None
 
 
+def sheet_source(name):
+    """譜面から起こした旋律（JSON、sheet_song 参照）。音源が無い選手用。"""
+    path = os.path.join(SHEET_DIR,
+                        "%s.json" % re.sub(r"[^\w぀-ヿ一-鿿]", "_", name))
+    return path if os.path.exists(path) else None
+
+
 # 採譜のやり方を変えたら上げる（取ってある音符を捨てるため）。
 # 1 = 高さの変わり目で切る（〜2026-08-05・リズムが合わず外した）
 # 2 = DP でモーラ数に区切る（2026-08-06〜）
@@ -207,6 +217,20 @@ def gap_ratio(notes):
     return sum(n[1] for n in notes if not n[0]) / float(total)
 
 
+async def _prepare_sheet(key, songs):
+    """譜面 JSON から歌う。音源と違い休符も長さも譜面どおりなので、
+    休み割合や 秒/モーラ の門番（音源と歌詞の対応の検査）は通さない。"""
+    path = sheet_source(key)
+    if path is None:
+        raise LookupError("音源が無い")
+    with open(path, encoding="utf-8") as f:
+        sheet = json.load(f)
+    notes, tempo, nm, _call = sheet_song.build(sheet, songs[key], moras)
+    log.info("%s: 譜面から歌う（音符 %d・歌詞 %d モーラ・テンポ %.0f）",
+             key, len(notes), nm, tempo)
+    return notes, tempo, key
+
+
 async def prepare(session, want):
     """(音符, テンポ, 見出し) を返す。歌えなければ LookupError。"""
     songs = await server_tools._songs(session)
@@ -227,7 +251,8 @@ async def prepare(session, want):
         name = match_player(table, want) or match_player(table,
                                                          _REUSE.get(key, ""))
         if not name:
-            raise LookupError("音源が無い")
+            # 配布ページに音源が無い選手は、譜面から起こした旋律で歌う
+            return await _prepare_sheet(key, songs)
         notes, tempo, path = await notes_for(session, name, table[name])
     # 休みだらけの音源（歌が入っていない）はここで外す。判定は旧採譜の
     # 音符の並びで見る＝DP は必ずモーラ数だけ音符を作るので休みが出ない
@@ -285,6 +310,9 @@ async def singable(session):
             out.append(key)
     for key in songs:                       # 手元に置いてもらった音源
         if songs.get(key) and local_audio(key):
+            out.append(key)
+    for key in songs:                       # 譜面から起こした旋律
+        if songs.get(key) and sheet_source(key):
             out.append(key)
     return sorted(set(out))
 
