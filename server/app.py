@@ -120,13 +120,14 @@ FILLER_FOLLOWUP_SEC = float(os.environ.get("FILLER_FOLLOWUP_SEC", "15"))
 FILLER_WORDS = frozenset((
     "うん", "ううん", "うーん", "んー", "はい", "はあ", "はぁ", "ええ", "えー",
     "ええと", "えっと", "あー", "ああ", "あっ", "えっ", "おっ", "おお", "ふう",
-    "ふぅ", "ふん", "へえ", "へー", "ほう", "そう", "よし", "よいしょ",
+    "ふぅ", "ふん", "へえ", "へー", "ほう", "そう", "よい", "よし", "よいしょ",
     "どっこいしょ", "あれ", "おっと",
 ))
 _FILLER_PUNCT = re.compile(r"[、。！？!?.,・…〜\s]+")
 
 
-def worth_answering(text: str, last_spoke_age: float) -> bool:
+def worth_answering(text: str, last_spoke_age: float,
+                    filler_streak: int = 0) -> bool:
     """認識結果に返事をすべきか。
 
     実機のマイクは常時開いていて、環境音や独り言が「うん」「はあ」のような
@@ -138,9 +139,20 @@ def worth_answering(text: str, last_spoke_age: float) -> bool:
     t = _FILLER_PUNCT.sub("", text or "")
     if not t:
         return False
-    if last_spoke_age <= FILLER_FOLLOWUP_SEC:
-        return True
-    return t not in FILLER_WORDS and len(t) > 1
+    if t in FILLER_WORDS or len(t) <= 1:
+        # 相槌に返事できるのは、こちらが話した直後の 1 回だけ。猶予窓だけ
+        # だと返事のたびに窓が開き直り、環境音の相槌へ際限なく返事し続ける
+        # （2026-08-08 実機: テレビの音が「うん」「よし」「えっ」になり
+        # 07:02〜07:04 に 8 連続の独り言。認識は毎回こちらの発話の
+        # 5〜10 秒後＝窓が閉じる暇が無い）
+        return last_spoke_age <= FILLER_FOLLOWUP_SEC and filler_streak < 1
+    return True
+
+
+def _is_filler(text: str) -> bool:
+    """相槌（または 1 字だけの認識）か。連続カウンタの判定に使う。"""
+    t = _FILLER_PUNCT.sub("", text or "")
+    return (not t) or t in FILLER_WORDS or len(t) <= 1
 
 
 def frame_rms(pcm: bytes) -> float:
@@ -1005,7 +1017,8 @@ DECL_END_RE = re.compile("(?:です|ます|でした|ました|だった|であ�
 # 生成が固有名詞を書き崩すことがある（2026-08-03 実機の
 # 「ナスディック総合指数」「カンボジ国」）。読みでなく綴りの取り違えで、
 # 声にすると別の語に聞こえるので、聞いて分かる形に戻す
-MISWRITTEN = (("ナスディック", "ナスダック"), ("カンボジ国", "カンボジア"))
+MISWRITTEN = (("ナスディック", "ナスダック"), ("カンボジ国", "カンボジア"),
+              ("応歌", "応援歌"))
 
 
 def _colon_to_pause(m) -> str:
@@ -1024,6 +1037,19 @@ READ_AS = [
     ("Open JTalk", "オープンジェイトーク"),
     ("Raspberry Pi", "ラズベリーパイ"),
     ("Wi-Fi", "ワイファイ"),
+    # 選手名の「名」は Open JTalk が誤読する（実測 2026-08-08:
+    # 隆輝→タカテル・泰輝→ヤスシテル・琢真→ミガクシン・敬斗→タカシト・
+    # 竜拓→リュウタク・敏郎→トシオ・昂希→ノボルノゾミ・神里→カミサト。
+    # user 様が実機で「読み方」と指摘）。読みは npb.jp 選手ページの
+    # 公式ふりがな（石上は「いしかみ」が公式）
+    ("度会隆輝", "わたらいりゅうき"),
+    ("石上泰輝", "いしかみたいき"),
+    ("林琢真", "はやしたくま"),
+    ("森敬斗", "もりけいと"),
+    ("柴田竜拓", "しばたたつひろ"),
+    ("宮﨑敏郎", "みやざきとしろう"),
+    ("梶原昂希", "かじわらこうき"),
+    ("神里和毅", "かみざとかずき"),
 ]
 
 
@@ -1505,7 +1531,9 @@ async def ws_handler(request: web.Request):
                 text = await transcribe(session, pcm)
             log.info("STT: %s", text)
             age = time.monotonic() - state["last_spoke"]
-            if not worth_answering(text, age):
+            streak = state.get("filler_streak", 0)
+            state["filler_streak"] = streak + 1 if _is_filler(text) else 0
+            if not worth_answering(text, age, streak):
                 log.info("相槌・空認識には返答しない（前回の発話から %.0f 秒）: %r",
                          age, text)
                 return
