@@ -517,6 +517,10 @@ OJT_TRIM_LEVEL = int(os.environ.get("OJT_TRIM_LEVEL", "60"))
 OJT_KEEP_HEAD = float(os.environ.get("OJT_KEEP_HEAD", "0.02"))
 OJT_KEEP_TAIL = float(os.environ.get("OJT_KEEP_TAIL", "0.08"))
 OJT_END_PAUSE = float(os.environ.get("OJT_END_PAUSE", "0.12"))
+# 会話の声を歌にそろえる目標（有声部の実効値）。歌（VOICEVOX の作り置き）
+# は 3265〜3495、会話（Open JTalk）は 2376〜2384 で、user 様に「歌は
+# 聞きやすいけど会話の声は小さい」と指摘された（2026-08-08 実測）。0 で無効
+OJT_TARGET_RMS = float(os.environ.get("OJT_TARGET_RMS", "3400"))
 # 読みが遅くないかを毎回ログに出す（診断用。既定は出さない）。
 OJT_LOG_PACE = os.environ.get("OJT_LOG_PACE", "") not in ("", "0")
 OJT_SMALL_KANA = "ぁぃぅぇぉゃゅょゎヵヶァィゥェォャュョヮっッ"
@@ -720,6 +724,35 @@ async def _synth_checked(text: str, rounds: int = OJT_RESPLIT_ROUNDS):
     return out
 
 
+def _match_song_loudness(pcm: bytes) -> bytes:
+    """会話の声を歌の音量にそろえる（有声部の実効値を OJT_TARGET_RMS へ）。
+
+    枠 20ms の実効値が 200 を超える所だけを「声」として測る（前後の無音や
+    句読点の間を混ぜると、間の多い返事ほど過剰に持ち上がる）。返事 1 回に
+    一様なゲインを掛ける（片ごとに掛けると片どうしで音量が揺れる）。
+    割れないようピークが 31000 を超えない範囲で頭打ち。小さくする方向には
+    使わない（元から大きい声はそのまま）。
+    """
+    if OJT_TARGET_RMS <= 0 or len(pcm) < 4 or len(pcm) % 2:
+        return pcm
+    import numpy as np
+    a = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+    frame = max(1, int(DOWN_RATE * 0.02))
+    n = len(a) // frame
+    if n == 0:
+        return pcm
+    rms = np.sqrt((a[: n * frame].reshape(n, frame) ** 2).mean(axis=1))
+    voiced = rms[rms > 200]
+    if not len(voiced):
+        return pcm
+    cur = float(np.sqrt((voiced ** 2).mean()))
+    peak = float(np.abs(a).max())
+    gain = min(OJT_TARGET_RMS / max(cur, 1.0), 31000.0 / max(peak, 1.0))
+    if gain <= 1.02:
+        return pcm
+    return np.clip(a * gain, -32768.0, 32767.0).astype(np.int16).tobytes()
+
+
 async def openjtalk_tts(text: str) -> bytes:
     """長い呼気段落を分けて合成し、間に短い無音を挟んで繋ぐ（スローモーション対策）。
 
@@ -732,6 +765,7 @@ async def openjtalk_tts(text: str) -> bytes:
         parts.extend(await _synth_checked(seg))
     gap = bytes(2 * int(DOWN_RATE * 0.12))
     joined = gap.join(_trim_silence(p) for p in parts)
+    joined = _match_song_loudness(joined)
     return joined + bytes(2 * int(DOWN_RATE * OJT_END_PAUSE))
 
 

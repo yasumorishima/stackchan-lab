@@ -16,6 +16,8 @@ CASES = [
     ("度会の歌歌って", "sing_cheer_song"),
     ("度会の応援歌歌って", "sing_cheer_song"),
     ("宮崎の応援歌を歌って", "sing_cheer_song"),
+    ("京田の応援歌", "sing_cheer_song"),
+    ("京田の応援歌の歌詞教えて", "get_cheer_song"),
 ]
 
 async def main():

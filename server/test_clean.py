@@ -335,6 +335,26 @@ for _t, _want, _memo in _VERBATIM:
     ng += not _ok
     print("%s 既定では畳む: %r" % ("OK" if _ok else "NG", _folded))
 
+# 会話の声を歌の音量へそろえる（2026-08-08 user 指摘「会話の声が小さい」）
+import math as _math
+_rate = app.DOWN_RATE
+_sine = bytes()
+_arr2 = _arr.array("h", (int(2400 * _math.sqrt(2) * _math.sin(2 * _math.pi * 220 * i / _rate))
+                        for i in range(_rate)))
+_soft = _arr2.tobytes()
+_loud = _arr.array("h", (min(32767, v * 2) for v in _arr2)).tobytes()
+for _pcm, _memo, _lo, _hi in [
+        (_soft, "小さい声は目標へ持ち上がる", 3100, 3700),
+        (_loud, "元から大きい声は触らない", 4500, 99999)]:
+    n_split += 1
+    _out = app._match_song_loudness(_pcm)
+    _a = _arr.array("h")
+    _a.frombytes(_out)
+    _got = _math.sqrt(sum(v * v for v in _a) / len(_a))
+    _good = _lo <= _got <= _hi
+    ng += not _good
+    print("%s %s: rms %.0f" % ("OK" if _good else "NG", _memo, _got))
+
 # 相槌に返事するのは直後の 1 回だけ（環境音との無限おしゃべり防止・
 # 2026-08-08 実機で 8 連続の独り言）
 _AIZUCHI = [
