@@ -223,9 +223,19 @@ async def _prepare_sheet(key, songs):
     path = sheet_source(key)
     if path is None:
         raise LookupError("音源が無い")
-    with open(path, encoding="utf-8") as f:
-        sheet = json.load(f)
-    notes, tempo, nm, _call = sheet_song.build(sheet, songs[key], moras)
+    # 譜面 JSON の破損・欠落・歌詞との不整合は**恒久的なデータ不良**。
+    # 汎用の except に落とすと「いま歌えませんでした」（一時エラー風の
+    # 返事）になり何度でも呼ばれるので、LookupError（「その選手の応援歌
+    # は歌えません」側）に写像する（監査指摘 3）
+    try:
+        with open(path, encoding="utf-8") as f:
+            sheet = json.load(f)
+        notes, tempo, nm, _call = sheet_song.build(sheet, songs[key], moras)
+    except LookupError:
+        raise
+    except Exception as e:
+        log.warning("%s の譜面が読めない: %s: %s", key, type(e).__name__, e)
+        raise LookupError("譜面が読めない")
     log.info("%s: 譜面から歌う（音符 %d・歌詞 %d モーラ・テンポ %.0f）",
              key, len(notes), nm, tempo)
     return notes, tempo, key

@@ -50,6 +50,12 @@ def share_morae(notes, morae):
             break
         per[i] += 1
         extra -= 1
+    if extra > 0:
+        # 1 音は最大 2 モーラ。それでも配りきれないのは譜面の読み落としが
+        # 大きい（歌詞がモーラ数で音符の 2 倍超）ということ＝黙って歌詞の
+        # 末尾を捨てると気付けないので、歌わない側に倒す（監査指摘 1a）
+        raise ValueError("歌詞が音符に乗り切らない（モーラ %d / 音符 %d）"
+                         % (len(morae), len(notes)))
     out, k = [], 0
     for n, c in zip(notes, per):
         out.append("".join(morae[k:k + c]))
