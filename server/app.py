@@ -2037,6 +2037,11 @@ async def ws_handler(request: web.Request):
     try:
         async for msg in ws:
             if msg.type == aiohttp.WSMsgType.BINARY:
+                # 本体が音を送っているかは切り分けの一次情報。届いた事実を
+                # 1 回だけ残す（毎フレーム出すとログが埋まる）
+                state["audio_frames"] = state.get("audio_frames", 0) + 1
+                if state["audio_frames"] == 1:
+                    log.info("音声が届き始めた（%s）", session_id)
                 if state["listening"]:
                     try:
                         chunk = decoder.decode(msg.data)
@@ -2116,8 +2121,11 @@ async def ws_handler(request: web.Request):
         for t in (state["task"], state["mcp_task"], state["hello_task"]):
             if t is not None and not t.done():
                 t.cancel()
-        log.info("WS closed device=%s session=%s (hello_done=%s)",
-                 device_id, session_id, state["hello_done"])
+        frames = state.get("audio_frames", 0)
+        log.info("WS closed device=%s session=%s (hello_done=%s・"
+                 "届いた音声 %d フレーム%s)",
+                 device_id, session_id, state["hello_done"], frames,
+                 "＝本体が音を送っていない" if frames == 0 else "")
     return ws
 
 
