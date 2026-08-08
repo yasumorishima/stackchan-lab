@@ -57,14 +57,15 @@ jobs:
 
       - name: 出来たものを確認
         working-directory: src/firmware
+        shell: bash
         run: |
           ls -la build/*.bin
-          # 0x0 から書けるマージ済みイメージを作る（公式配布と同じ形）
           . $IDF_PATH/export.sh
-          esptool.py --chip esp32s3 merge_bin -o build/stackchan-nowake.bin \
-            @build/flash_args || esptool.py --chip esp32s3 merge-bin \
-            -o build/stackchan-nowake.bin @build/flash_args
-          ls -la build/stackchan-nowake.bin
+          # 0x0 から書けるマージ済みイメージを作る（公式配布と同じ形）。
+          # flash_args の中のパスは build/ からの相対なのでそこで実行する
+          cd build
+          esptool.py --chip esp32s3 merge_bin --output stackchan-nowake.bin @flash_args
+          ls -la stackchan-nowake.bin
 
       - uses: actions/upload-artifact@v4
         with:
