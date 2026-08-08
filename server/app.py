@@ -99,6 +99,25 @@ VAD_RMS = float(os.environ.get("VAD_RMS", "500"))
 VAD_SILENCE_MS = float(os.environ.get("VAD_SILENCE_MS", "800"))
 VAD_MIN_SPEECH_MS = float(os.environ.get("VAD_MIN_SPEECH_MS", "300"))
 VAD_MAX_MS = float(os.environ.get("VAD_MAX_MS", "15000"))
+# 声とみなす敷居を部屋の静けさに合わせる（2026-08-08・user「反応しないことが
+# 多い」）。実測では捨てた 3,290 件の中央 rms が 296 で、固定 500 のすぐ下に
+# 声が埋もれていた。固定値を下げるだけだと うるさい部屋で環境音を拾うので、
+# 静かなときの水準の何倍か、で決める
+VAD_ADAPT = os.environ.get("VAD_ADAPT", "1") not in ("0", "false", "no")
+VAD_RMS_MULT = float(os.environ.get("VAD_RMS_MULT", "3.0"))
+VAD_RMS_MIN = float(os.environ.get("VAD_RMS_MIN", "200"))
+VAD_RMS_MAX = float(os.environ.get("VAD_RMS_MAX", "1500"))
+VAD_FLOOR_RISE = float(os.environ.get("VAD_FLOOR_RISE", "0.02"))
+
+
+def vad_threshold(state) -> float:
+    """いま声とみなす下限。静かな部屋では下がり、うるさい部屋では上がる。"""
+    if not VAD_ADAPT:
+        return VAD_RMS
+    floor = state.get("floor")
+    if floor is None:
+        return VAD_RMS
+    return min(VAD_RMS_MAX, max(VAD_RMS_MIN, floor * VAD_RMS_MULT))
 # 受信バッファの絶対上限（フレーム数）。VAD が効かない手動モードの保険
 MAX_BUFFER_FRAMES = int(float(os.environ.get("MAX_BUFFER_MS", "120000")) / 60.0)
 # 読み上げが本体で鳴り終わるまでの余裕。短いと自分の声を拾って再認識する
@@ -187,7 +206,14 @@ def vad_step(state, ms: float, rms: float) -> bool:
     state["buffered_ms"] += ms
     if rms > state["max_rms"]:
         state["max_rms"] = rms
-    if rms >= VAD_RMS:
+    limit = vad_threshold(state)
+    # 静かなときの水準は「敷居を下回ったフレーム」だけでゆっくり追う。
+    # 声そのもので上がると自分の首を絞める
+    if rms < limit:
+        floor = state.get("floor")
+        state["floor"] = (rms if floor is None
+                          else floor + (rms - floor) * VAD_FLOOR_RISE)
+    if rms >= limit:
         state["speech_ms"] += ms
         state["silence_ms"] = 0.0
     elif state["speech_ms"] > 0.0:
@@ -1309,9 +1335,34 @@ def fix_reading(text: str) -> str:
     text = NUM_SPACE_RE.sub("", text)
     text = JA_SPACE_RE.sub("", text)
     text = EMOJI_RE.sub("", text)
+    text = MARKUP_RE.sub("", text)
+    text = drop_latin_heavy(text)
     for wrong, right in MISWRITTEN:
         text = text.replace(wrong, right)
     return LIST_COLON_RE.sub(_colon_to_pause, text)
+
+
+# 生成が下書き（英語の思考メモ）を本文に出すことがある（実機 2026-08-08
+# 15:33 に 32.2 秒ぶん）。読み上げは英字を 1 文字ずつ読むので実害が大きい。
+# **閾値は実データで決めた**: 過去の返事を文に割った 2,065 件のうち英字が
+# 30% 以上なのは 2 件だけで、どちらもこの暴走。まともな文の最大は 0.27
+LATIN_HEAVY = 0.30
+LATIN_MIN_CHARS = 12                      # 短い相づち（OK! 等）は巻き込まない
+_LATIN_RE = re.compile(r"[A-Za-z]")
+# 下書きに混じる飾り（コード柵・区切り線・引用記号）は読み上げても意味が無い
+MARKUP_RE = re.compile(r"(?m)^\s*(?:```.*|-{3,}|={3,}|>+\s?)\s*$|```")
+
+
+def drop_latin_heavy(text: str) -> str:
+    """英字ばかりの文を落とす（日本語で話す前提の道具なので下書きと見なす）。"""
+    out = []
+    for part in re.findall(r"[^。！？!?\n]+[。！？!?]?", text or ""):
+        body = re.sub(r"\s", "", part)
+        if len(body) >= LATIN_MIN_CHARS and body:
+            if len(_LATIN_RE.findall(body)) / len(body) >= LATIN_HEAVY:
+                continue
+        out.append(part)
+    return "".join(out).strip()
 
 
 # 生成が壊れると省略記号などの羅列を返す（実機 2026-08-02 10:29、gpt-oss が

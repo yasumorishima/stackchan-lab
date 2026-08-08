@@ -85,6 +85,24 @@ def main():
     check("その時 speech_ms は min 未満",
           st["speech_ms"] < app.VAD_MIN_SPEECH_MS, True)
 
+    # 敷居を部屋の静けさに合わせる（user 実機 2026-08-08「なかなか反応しない」）。
+    # 実測: 捨てた 3,290 件の中央 rms は 296 で、固定 500 のすぐ下に声が埋もれる
+    st = fresh()
+    run(st, [(60.0, 50)])                     # 静かな部屋を聞かせる
+    check("静かな部屋では敷居が下がる", app.vad_threshold(st) <= 250.0, True)
+    got = run(st, [(400.0, 10), (60.0, 20)])  # 小さい声（旧 500 では無視された）
+    check("静かな部屋なら小さい声も発話になる", got is not None, True)
+    check("その時 speech_ms が立つ", st["speech_ms"] >= app.VAD_MIN_SPEECH_MS, True)
+
+    st = fresh()
+    run(st, [(400.0, 200)])                   # うるさい部屋（テレビ等）
+    check("うるさい部屋では敷居が上がる", app.vad_threshold(st) >= 1000.0, True)
+    st2 = fresh()
+    st2["floor"] = 400.0
+    run(st2, [(900.0, 10), (400.0, 20)])
+    check("うるさい部屋の中くらいの音は発話にしない",
+          st2["speech_ms"] < app.VAD_MIN_SPEECH_MS, True)
+
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
