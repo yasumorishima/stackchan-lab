@@ -2559,6 +2559,19 @@ def _find_player(songs: dict, who: str):
         hit = [n for n, v in reads.items() if v and pick(qr, v)]
         if len(hit) == 1:
             return hit[0]
+    # 聞き取りは助詞を名前にくっつける（「牧の応援歌」→「牧野応援歌」→
+    # 名前「牧野」）。姓は先頭にあるので、**末尾を削って引き直す**。
+    # 1 文字まで削るが、**1 人に絞れた時だけ**採るので取り違えない
+    for n in range(len(q) - 1, 0, -1):
+        head = q[:n]
+        hit = [x for x, v in table.items() if v.startswith(head)]
+        if len(hit) == 1:
+            return hit[0]
+        hr = _yomi(head)
+        if hr:
+            hit = [x for x, v in reads.items() if v and v.startswith(hr)]
+            if len(hit) == 1:
+                return hit[0]
     return None
 
 

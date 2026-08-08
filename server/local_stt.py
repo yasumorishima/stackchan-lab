@@ -160,9 +160,13 @@ SHERPA_TRIM = float(os.environ.get("SHERPA_TRIM", "0.4"))
 # これ以上の間が空いたら「別の発話」とみなす秒数（0 で無効）。**app.py の
 # VAD が発話の終わりとみなす無音（VAD_SILENCE_MS）より必ず長くする**＝
 # 短いと、VAD がまだ続きとみなしている間で切って前半を捨ててしまう
-SHERPA_SPLIT_GAP = float(os.environ.get(
-    "SHERPA_SPLIT_GAP",
-    str(float(os.environ.get("VAD_SILENCE_MS", "600")) / 1000.0 + 0.1)))
+# 🔴 実機で 0.7 秒は短すぎた（人は文の途中で 0.7 秒くらい平気で黙る）。
+# 実測 2026-08-08: 12.24 秒の発話から 0.98 秒だけ渡して「屋内でジャージに
+# やって」になっていた。息継ぎでは切らない長さにする
+SHERPA_SPLIT_GAP = float(os.environ.get("SHERPA_SPLIT_GAP", "1.6"))
+# ⚠️ 「切りすぎたら丸ごと渡す」割合の規則は入れて取り下げた。4.0 秒の間が
+# 空いた別発話まで残してしまい、前の生活音を捨てる狙いを壊した（試験で検出）。
+# 判断は切れ目の長さ一本にする
 _sherpa = None
 
 

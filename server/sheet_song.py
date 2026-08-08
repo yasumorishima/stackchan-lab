@@ -19,6 +19,8 @@
 歌じゃないし」）。歌わせるのも読み上げるのも無し。歌い終わりで終わる。
 """
 
+import re
+
 CELLS_PER_BAR = 16
 NAMES = "C C# D D# E F F# G G# A A# B".split()
 BASE_KEY = 60                 # 相対の高さ 0 をここに置く（後で自動移調される）
@@ -86,6 +88,32 @@ def _extension(mora):
     return _VOWEL.get(c, c)
 
 
+MIN_PHRASE_NOTES = 3      # これ未満のフレーズは歌詞 1 行が乗らないので併合する
+
+
+def _merge_short(out):
+    """音符が少なすぎるフレーズを隣へくっつける。
+
+    休符で切ると音符 1〜2 個の塊ができることがある（実測 柴田 [9,1,1,29] /
+    石上 [2,2,9,10,6]）。歌詞 1 行ぶんが乗らない大きさなので、そこへ配ると
+    「ミー / トと」のように語の途中で割れる。**短い方の隣へ寄せる**。
+    譜面の音そのものは触らない（配り方だけの話）。
+    """
+    while len(out) > 1:
+        i = min(range(len(out)), key=lambda k: len(out[k]))
+        if len(out[i]) >= MIN_PHRASE_NOTES:
+            break
+        if i == 0:
+            j = 1
+        elif i == len(out) - 1:
+            j = i - 1
+        else:
+            j = i - 1 if len(out[i - 1]) <= len(out[i + 1]) else i + 1
+        lo, hi = min(i, j), max(i, j)
+        out[lo:hi + 1] = [out[lo] + out[hi]]
+    return out
+
+
 def _phrases(notes):
     """休符（t16 の切れ目）で音符の並びをフレーズに分ける。"""
     out, cur, end = [], [], None
@@ -97,7 +125,7 @@ def _phrases(notes):
         end = n["t16"] + n["len16"]
     if cur:
         out.append(cur)
-    return out
+    return _merge_short(out)
 
 
 def _fit_words(words, phrases):
@@ -117,6 +145,17 @@ def _fit_words(words, phrases):
     m_n, p_n = len(morae), len(phrases)
     if m_n == 0 or p_n == 0:
         return None
+    # 🔴 まず「語の切れ目でしか切らない」で解く。語の途中で切ると
+    # 「と / た / くみな」のような中途半端な歌になる（user 指摘 2026-08-08）
+    got = _solve_fit(morae, phrases, bounds, only_bounds=True)
+    if got is not None:
+        return got
+    return _solve_fit(morae, phrases, bounds, only_bounds=False)
+
+
+def _solve_fit(morae, phrases, bounds, only_bounds):
+    """`only_bounds` なら語の切れ目だけで切る。解けなければ None。"""
+    m_n, p_n = len(morae), len(phrases)
     inf = float("inf")
     cost = [[inf] * (p_n + 1) for _ in range(m_n + 1)]
     back = [[0] * (p_n + 1) for _ in range(m_n + 1)]
@@ -130,8 +169,13 @@ def _fit_words(words, phrases):
                 m = e - s
                 if m > 2 * n_p:
                     continue
+                at_bound = e in bounds or e == m_n
+                if only_bounds and not at_bound:
+                    continue
+                # 語境界を外す罰は大きくする（0.3 ではモーラ数のずれの
+                # 二乗に負けて、語の途中で平気で切っていた）
                 c = (cost[s][p - 1] + (m - n_p) ** 2
-                     + (0.0 if e in bounds else 0.3))
+                     + (0.0 if at_bound else 6.0))
                 if c < cost[e][p]:
                     cost[e][p] = c
                     back[e][p] = s
@@ -170,6 +214,36 @@ def _share_phrase(notes, morae):
     return [[x] for x in morae] + [[_extension(morae[-1])]] * (n - m)
 
 
+# 掛け声だけの行（「オオオオー」等）。音程を持たないので旋律に乗せない
+_CHANT_RE = re.compile(r"^[オぉおー\s！!・]*$")
+# 🔴 歌の前の掛け声が「普通の歌詞に見える」曲がある。文字では判別できないので
+# **曲ごとの事実として持つ**（値 = 歌が始まる行番号）。user 様の指摘で埋める。
+# 牧: 「オオオオー」3 行に加えて「とどけ われらのこえ」も掛け声（2026-08-08）
+LEAD_CHANT = {"牧秀悟": 4}
+
+
+def drop_chant(lines, name=""):
+    """先頭に続く掛け声の行を落とす。
+
+    公式歌詞の先頭に観客の掛け声が入ることがある（牧: 「オオオオー オオオオー」
+    「オオオオーオオ マキシュウゴ！」「オオオオオ オオオオオ」＝29 モーラ）。
+    ここに旋律を割り当てると歌にならない（実機 2026-08-08「めちゃくちゃ」）。
+
+    **先頭から続く分だけ**落とす（曲中の「オオオオ」は歌詞の一部なので残す）。
+    選手名がカタカナで混ざる行も掛け声とみなす。
+    """
+    lead = LEAD_CHANT.get(name)
+    if lead:
+        return list(lines[lead:]) or list(lines)
+    out = list(lines)
+    while out:
+        t = re.sub(r"[ァ-ヿ]{3,}", "", out[0])
+        if not _CHANT_RE.match(t):
+            break
+        out.pop(0)
+    return out if out else list(lines)
+
+
 def split_call(lines):
     """歌う行と、最後のコール（叫び）を分ける。
 
@@ -198,7 +272,7 @@ def drop_strays(notes):
     return notes
 
 
-def build(sheet, lines, moras):
+def build(sheet, lines, moras, name=""):
     """(音符, テンポ, モーラ数, コール行) を返す。
 
     sheet=譜面 JSON の dict / lines=公式歌詞の行 / moras=モーラ分割の関数
@@ -212,6 +286,8 @@ def build(sheet, lines, moras):
     1:1 で自動的に合う）。
     """
     sung_lines, call = split_call(list(lines))
+    # 先頭の掛け声（オオオオー…）は音程を持たないので歌わない
+    sung_lines = drop_chant(sung_lines, name)
     morae = moras("".join(sung_lines))
     notes = sorted(sheet["notes"], key=lambda n: n["t16"])
     notes = drop_strays(notes)

@@ -110,6 +110,10 @@ VAD_ADAPT = os.environ.get("VAD_ADAPT", "1") not in ("0", "false", "no")
 WAKE_NUDGE_SEC = float(os.environ.get("WAKE_NUDGE_SEC", "6"))
 WAKE_NUDGE_FRAMES = int(os.environ.get("WAKE_NUDGE_FRAMES", "40"))
 WAKE_GREETING = os.environ.get("WAKE_GREETING", "はい、聞いてるよ。")
+# 🔴 こちらが点けた LED を消し忘れると電池が減る（2026-08-08: 13:23 に白で
+# 点灯させたまま放置し、夕方に残量 0% になった）。つなぐたびに消す
+LED_OFF_ON_CONNECT = os.environ.get("LED_OFF_ON_CONNECT", "1") not in (
+    "0", "false", "no")
 VAD_RMS_MULT = float(os.environ.get("VAD_RMS_MULT", "2.0"))
 VAD_RMS_MIN = float(os.environ.get("VAD_RMS_MIN", "120"))
 VAD_RMS_MAX = float(os.environ.get("VAD_RMS_MAX", "600"))
@@ -150,8 +154,11 @@ FILLER_WORDS = frozenset((
 ))
 _FILLER_PUNCT = re.compile(r"[、。！？!?.,・…〜\s]+")
 # 名前を呼ばれたら相槌扱いしない。聞き取りが崩れやすいので短い形も入れる
-WAKE_WORDS = ("スタックちゃん", "すたっくちゃん", "スタックチャン",
-              "スタック", "すたっく")
+# 短い呼びかけで反応する（user 指示 2026-08-08「スタックちゃん が長い」）。
+# 短い語は聞き取りが崩れやすいので、崩れた形も入れて広めに拾う。
+# 取りこぼすより拾う方を採る方針なので「スタッフ」等の巻き込みは許容する
+WAKE_WORDS = ("スタック", "すたっく", "スタッグ", "すたっぐ", "スダック",
+              "ステック", "スタッ", "すたっ", "スタッくん", "スタックン")
 
 
 def worth_answering(text: str, last_spoke_age: float,
@@ -1605,7 +1612,11 @@ async def ota_handler(request: web.Request):
 async def ws_handler(request: web.Request):
     # compress=False: 組込みの WebSocket クライアントと permessage-deflate の
     # 折衝が食い違うと受信フレームを取り落とすため、圧縮は使わない
-    ws = web.WebSocketResponse(heartbeat=30, max_msg_size=0, compress=False)
+    # 🔴 本体は PING に応答しない（WS を自前実装している）。heartbeat=30 だと
+    # 15 秒 PONG が無いだけで**こちらから健全な接続を切っていた**（実測
+    # 2026-08-08 に 13 回。うち 1 回は音声 4,807 フレームが届いていた最中）。
+    # 見張りは切り、切断は本体か TCP に任せる
+    ws = web.WebSocketResponse(heartbeat=None, max_msg_size=0, compress=False)
     await ws.prepare(request)
     session: aiohttp.ClientSession = request.app["http"]
 
@@ -1633,7 +1644,11 @@ async def ws_handler(request: web.Request):
              "listen_evt": asyncio.Event()}
 
     async def send_json(obj):
-        await ws.send_str(json.dumps(obj, ensure_ascii=False))
+        body = json.dumps(obj, ensure_ascii=False)
+        # 送った内容を残す（本体が切る直前に何を送ったかの切り分け用）。
+        # 音声は別経路（バイナリ）なのでここには出ない
+        log.info("-> %s", body[:300])
+        await ws.send_str(body)
 
     async def open_channel(features_mcp: bool):
         """本体へ server hello を返してチャネルを開く。二重には送らない。"""
@@ -1658,6 +1673,24 @@ async def ws_handler(request: web.Request):
             except Exception:
                 log.exception("mcp handshake failed")
                 state["mcp"] = None
+                return
+            # 本体の言い分を残す（電池の残量表示が 0% になる件の一次情報。
+            # こちらは電源管理チップにも残量計にも書き込んでいない）
+            try:
+                st = await mcp.call("self.get_device_status", {})
+                log.info("本体の状態: %s", str(st)[:400])
+            except Exception as e:
+                log.info("本体の状態を聞けなかった: %s: %s",
+                         type(e).__name__, e)
+            # 点けっぱなしの LED を消す。こちらが点けたものはこちらで消す
+            if LED_OFF_ON_CONNECT:
+                try:
+                    await mcp.call("self.robot.set_led_color",
+                                   {"red": 0, "green": 0, "blue": 0})
+                    log.info("LED を消した（電池を減らさないため）")
+                except Exception as e:
+                    log.info("LED を消せなかった: %s: %s",
+                             type(e).__name__, e)
 
         state["mcp_task"] = asyncio.create_task(_handshake())
 

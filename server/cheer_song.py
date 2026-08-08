@@ -230,7 +230,7 @@ async def _prepare_sheet(key, songs):
     try:
         with open(path, encoding="utf-8") as f:
             sheet = json.load(f)
-        notes, tempo, nm, _call = sheet_song.build(sheet, songs[key], moras)
+        notes, tempo, nm, _call = sheet_song.build(sheet, songs[key], moras, key)
     except LookupError:
         raise
     except Exception as e:
@@ -254,6 +254,9 @@ async def prepare(session, want):
     # 最後の「かっとばせー！○○！」はコール＝歌ではないので歌わない。
     # 譜面から歌う経路（sheet_song.build）と同じ判定を使う
     sung_lines, _call = sheet_song.split_call(list(songs.get(key, [])))
+    # 先頭の掛け声（オオオオー…）も歌わない。音程を持たないので旋律に
+    # 乗せると歌にならない（実機 2026-08-08「牧の応援歌、めちゃくちゃ」）
+    sung_lines = sheet_song.drop_chant(sung_lines, key)
     text = "".join(sung_lines) or text
 
     # 譜面（ゲームの応援歌エディタ）から起こした旋律があるならそれを使う。
