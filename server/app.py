@@ -361,10 +361,13 @@ def should_fall_back(e) -> bool:
 
 async def chat_once(session: aiohttp.ClientSession, history, tools,
                     base: str, model: str, token: str,
-                    timeout: float = None) -> dict:
+                    timeout: float = None, on_delta=None) -> dict:
     """OpenAI 互換の chat completions を 1 回叩き、assistant メッセージを返す。
 
     tool_calls を落とさないよう、本文の文字列ではなく message 辞書を返す。
+
+    on_delta を渡すと**流しながら**受け取る（本文の欠片が届くたびに呼ぶ）。
+    返す形は流さない時と同じなので、呼び出し側の作りは変わらない。
     """
     payload = {
         "model": model,
@@ -376,7 +379,7 @@ async def chat_once(session: aiohttp.ClientSession, history, tools,
         # 「…天気：晴れ時々くもり 最高気温」で終わってそのまま読み上げた。
         # さくらはリクエスト数課金なので上げてもコストは変わらない。
         "max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "800")),
-        "stream": False,
+        "stream": on_delta is not None,
     }
     if tools:
         payload["tools"] = tools
@@ -387,14 +390,141 @@ async def chat_once(session: aiohttp.ClientSession, history, tools,
                             headers=headers,
                             timeout=aiohttp.ClientTimeout(
                                 total=timeout or LLM_TIMEOUT)) as r:
-        body = await r.json()
+        if on_delta is None:
+            body = await r.json()
+            if r.status != 200:
+                raise ChatHTTPError(r.status, body)
+            choice = body["choices"][0]
+            msg = choice["message"]
+            if choice.get("finish_reason") == "length" and msg.get("content"):
+                msg["content"] = trim_incomplete_tail(msg["content"])
+            return msg
         if r.status != 200:
-            raise ChatHTTPError(r.status, body)
-        choice = body["choices"][0]
-        msg = choice["message"]
-        if choice.get("finish_reason") == "length" and msg.get("content"):
+            raise ChatHTTPError(r.status, await r.json())
+        msg, finish = await _read_stream(r, on_delta)
+        if finish == "length" and msg.get("content"):
             msg["content"] = trim_incomplete_tail(msg["content"])
         return msg
+
+
+async def _read_stream(r, on_delta):
+    """server-sent events を読んで (assistant メッセージ, 終わり方) を返す。
+
+    本文は欠片が届くたびに on_delta へ渡す。道具呼び出しは欠片で届くので
+    番号ごとに継ぎ足す（名前は 1 回、引数は少しずつ来る）。
+    """
+    msg = {"role": "assistant", "content": "", "tool_calls": []}
+    finish = None
+    async for raw in r.content:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            obj = json.loads(data)
+        except ValueError:
+            log.warning("読めない欠片: %r", data[:120])
+            continue
+        ch = (obj.get("choices") or [{}])[0]
+        delta = ch.get("delta") or {}
+        if ch.get("finish_reason"):
+            finish = ch["finish_reason"]
+        text = delta.get("content") or ""
+        if text:
+            msg["content"] += text
+            await on_delta(text)
+        for tc in delta.get("tool_calls") or []:
+            i = int(tc.get("index") or 0)
+            while len(msg["tool_calls"]) <= i:
+                msg["tool_calls"].append(
+                    {"id": "", "type": "function",
+                     "function": {"name": "", "arguments": ""}})
+            slot = msg["tool_calls"][i]
+            if tc.get("id"):
+                slot["id"] = tc["id"]
+            fn = tc.get("function") or {}
+            if fn.get("name"):
+                slot["function"]["name"] = fn["name"]
+            if fn.get("arguments"):
+                slot["function"]["arguments"] += fn["arguments"]
+    if not msg["tool_calls"]:
+        msg.pop("tool_calls")
+    return msg, finish
+
+
+class SentenceFeed:
+    """流れてくる本文を、読み上げられる文に切って渡す。
+
+    生成の**途中で**読み上げを始めるための係。全部そろってから
+    shorten_reply で削るのと同じ形になるよう、ここでも
+      * 言い直しを畳む（dedupe_sentences。応援歌など verbatim は畳まない）
+      * 文の数（MAX_SENTENCES）と字数（MAX_REPLY_CHARS）で打ち切る
+      * 最初のかたまりだけ読点で割る（quicken_first）
+    を通す。完結していない末尾は、**1 文も出していない時だけ**出す
+    （trim_incomplete_tail と同じ考え＝答えが丸ごと消えるのを避ける）。
+    """
+
+    def __init__(self, queue):
+        self.q = queue
+        self.buf = ""
+        self.said = []
+        self.chars = 0
+        self.verbatim = False
+        self.closed = False
+
+    async def add(self, delta: str):
+        self.buf += delta
+        while not self.closed:
+            m = re.search("[。．！？!?]", self.buf)
+            if not m:
+                return
+            s, self.buf = self.buf[:m.end()], self.buf[m.end():]
+            await self._emit(s)
+
+    async def _emit(self, s: str):
+        s = clean_reply(s)
+        if not s or not SPEAKABLE_RE.search(s):
+            return
+        if (len(self.said) >= MAX_SENTENCES
+                or self.chars >= MAX_REPLY_CHARS):
+            self.closed = True
+            return
+        if not self.verbatim and len(dedupe_sentences(
+                self.said + [s])) == len(self.said):
+            return                        # 前に言ったのと同じ
+        self.said.append(s)
+        self.chars += len(s)
+        parts = quicken_first([s]) if len(self.said) == 1 else [s]
+        for p in parts:
+            await self.q.put(p)
+
+    async def close(self):
+        """流し終わり。言いかけの末尾を必要なら出して、終わりを知らせる。"""
+        tail = self.buf.strip()
+        self.buf = ""
+        if tail and not self.said and not self.closed:
+            await self._emit(tail)
+        elif tail:
+            log.info("言いかけの %d 字は読まない: %r", len(tail), tail[:40])
+        await self.q.put(None)
+
+
+async def _aiter(items):
+    for x in items:
+        yield x
+
+
+async def _aiter_queue(q, first=None):
+    """待ち行列から文を取り出す。None が来たら終わり。"""
+    if first is not None:
+        yield first
+    while True:
+        s = await q.get()
+        if s is None:
+            return
+        yield s
 
 
 def trim_incomplete_tail(text: str) -> str:
@@ -417,7 +547,8 @@ def trim_incomplete_tail(text: str) -> str:
     return text[:cut + 1]
 
 
-async def sakura_chat(session: aiohttp.ClientSession, history, tools=None) -> dict:
+async def sakura_chat(session: aiohttp.ClientSession, history, tools=None,
+                      on_delta=None) -> dict:
     """まず本番へ。向こうの都合で駄目ならローカルの小さいモデルへ落ちる。
 
     ネットが切れても・トークンが切れても黙り込まないようにするための保険。
@@ -428,11 +559,13 @@ async def sakura_chat(session: aiohttp.ClientSession, history, tools=None) -> di
     if usable and time.time() < _primary_down_until:
         # 直前に駄目だったので本番は試さない（待ち時間ぶん黙るのを避ける）
         return await chat_once(session, history, tools, FALLBACK_LLM_BASE,
-                               FALLBACK_LLM_MODEL, FALLBACK_LLM_TOKEN)
+                               FALLBACK_LLM_MODEL, FALLBACK_LLM_TOKEN,
+                               on_delta=on_delta)
     try:
         msg = await chat_once(session, history, tools,
                               SAKURA_BASE, SAKURA_MODEL, SAKURA_TOKEN,
-                              PRIMARY_LLM_TIMEOUT if usable else LLM_TIMEOUT)
+                              PRIMARY_LLM_TIMEOUT if usable else LLM_TIMEOUT,
+                              on_delta=on_delta)
         server_tools.count_llm_request()
         if _primary_down_until:
             log.info("本番 LLM (%s) が戻りました", SAKURA_MODEL)
@@ -446,7 +579,8 @@ async def sakura_chat(session: aiohttp.ClientSession, history, tools=None) -> di
                     "（%.0f 秒は本番を試しません）: %s",
                     SAKURA_MODEL, FALLBACK_LLM_MODEL, PRIMARY_COOLDOWN, e)
         msg = await chat_once(session, history, tools, FALLBACK_LLM_BASE,
-                              FALLBACK_LLM_MODEL, FALLBACK_LLM_TOKEN)
+                              FALLBACK_LLM_MODEL, FALLBACK_LLM_TOKEN,
+                              on_delta=on_delta)
         log.info("ローカル LLM (%s) で応答しました", FALLBACK_LLM_MODEL)
         return msg
 
@@ -1252,7 +1386,19 @@ def shorten_reply(text: str, verbatim: bool = False) -> str:
     return text.strip()
 
 
-async def respond(session, history, tools=None, call_tool=None):
+async def respond_feeding(session, history, tools, call_tool, feed):
+    """respond を包み、**どう終わっても**待ち行列に終わりを知らせる。
+
+    知らせ忘れると、読み上げ側が次の文を待ったまま止まる。
+    """
+    try:
+        return await respond(session, history, tools=tools,
+                             call_tool=call_tool, feed=feed)
+    finally:
+        await feed.close()
+
+
+async def respond(session, history, tools=None, call_tool=None, feed=None):
     """LLM に投げる。tool_calls が返ったら本体の MCP ツールを実行して結果を戻す。
 
     返り値は (最終文, 途中のツール往復)。ツール往復を履歴へ残さないと、
@@ -1266,7 +1412,9 @@ async def respond(session, history, tools=None, call_tool=None):
     trace = []
     verbatim = False
     for _ in range(MAX_TOOL_ROUNDS):
-        msg = await sakura_chat(session, msgs, tools)
+        # feed があれば流しながら受け取る（1 文できた時点で読み上げが始まる）
+        msg = await sakura_chat(session, msgs, tools,
+                                on_delta=feed.add if feed else None)
         calls = msg.get("tool_calls") or []
         if not calls or call_tool is None:
             reply = shorten_reply(clean_reply(msg.get("content")),
@@ -1310,6 +1458,8 @@ async def respond(session, history, tools=None, call_tool=None):
                     result = "error: %s" % e
             if name in VERBATIM_TOOLS:
                 verbatim = True
+                if feed is not None:
+                    feed.verbatim = True   # 応援歌は繰り返しも読む
             log.info("tool %s(%s) -> %s", name, args, str(result)[:200])
             out = {"role": "tool", "tool_call_id": c["id"],
                    "content": str(result)}
@@ -1522,33 +1672,50 @@ async def ws_handler(request: web.Request):
                  time.monotonic() - t0)
         await speak("%sの応援歌" % song["name"], made=pcm)
 
-    async def speak(text: str, made: bytes = b""):
+    async def speak(text: str = "", made: bytes = b"", source=None):
         # 文ごとに合成して送る。次の文は今の文を流している裏で作る（初音までを短く）
         if made:
             # 歌のように先に出来ている音は、文に割らずそのまま流す
-            sentences = [text]
+            todo = _aiter([text])
+        elif source is not None:
+            # 生成が流れてくるのに合わせて読む（1 文目が出来た時点で鳴らす）
+            todo = source
         else:
             sentences = quicken_first(split_sentences(text))
             # 絵文字・記号だけのかたまりは音にならないので渡さない
             sentences = [s for s in sentences
                          if SPEAKABLE_RE.search(s)] or sentences[:1]
+            todo = _aiter(sentences)
         t0 = time.monotonic()
         await send_json({"type": "tts", "state": "start"})
         state["phase"] = "speak"
-        nxt = asyncio.create_task(ready(made) if made
-                                  else synthesize(session, sentences[0]))
-        sent = 0
-        gap_at = 0      # 最後に窓を開いた時点の送出フレーム数
-        first = None
-        for i, s in enumerate(sentences):
+
+        async def _next():
+            """次の文を待って合成する。もう無ければ (None, b"")。"""
             try:
-                pcm = await nxt
+                s = await todo.__anext__()
+            except StopAsyncIteration:
+                return None, b""
+            try:
+                return s, (await ready(made) if made
+                           else await synthesize(session, s))
             except Exception:
                 # 1 文の合成失敗で残りの読み上げまで道連れにしない
                 log.exception("合成に失敗したのでこの文を飛ばす: %s", s[:40])
-                pcm = b""
-            if i + 1 < len(sentences):
-                nxt = asyncio.create_task(synthesize(session, sentences[i + 1]))
+                return s, b""
+
+        nxt = asyncio.create_task(_next())
+        sent = 0
+        gap_at = 0      # 最後に窓を開いた時点の送出フレーム数
+        first = None
+        spoken = []
+        while True:
+            s, pcm = await nxt
+            if s is None:
+                break
+            # 次の文は今の文を流している裏で用意する（待ちを重ねない）
+            nxt = asyncio.create_task(_next())
+            spoken.append(s)
             if not pcm:
                 continue
             chunks = split_for_barge(pcm)
@@ -1574,7 +1741,8 @@ async def ws_handler(request: web.Request):
         await send_json({"type": "tts", "state": "stop"})
         state["phase"] = "tail"
         log.info("spoke %d frames (%.1fs) in %d sentences, first audio %.2fs: %s",
-                 sent, sent * FRAME_MS / 1000, len(sentences), first or -1, text)
+                 sent, sent * FRAME_MS / 1000, len(spoken), first or -1,
+                 "".join(spoken))
 
         # 送り終えても本体はまだ鳴らしている。ここで待たずに聞き直すと
         # 自分の声を拾ってそのまま次の発話として認識してしまう
@@ -1647,29 +1815,53 @@ async def ws_handler(request: web.Request):
                     continue
                 device_tools.append(t)
             tools = server_tools.specs() + device_tools
-            reply, trace = await respond(session, state["history"], tools=tools,
-                                         call_tool=call_tool)
+            # 生成を待ち切らずに読み始める。1 文できた時点で合成へ回すので、
+            # 残りを書いている時間ぶん待たなくてよい（実測 2026-08-08:
+            # 1 文目 1.21 秒 / 全部 1.82 秒＝0.6 秒ぶん早く鳴り出す）。
+            # 道具を使う番は本文が出ないので、その間は 1 文目を待つだけ
+            queue = asyncio.Queue()
+            feed = SentenceFeed(queue)
+            task = asyncio.create_task(respond_feeding(
+                session, state["history"], tools, call_tool, feed))
+            first = await queue.get()
+            if first is not None:
+                await send_json({"type": "llm", "emotion": "happy",
+                                 "text": "😀"})
+                try:
+                    await speak(source=_aiter_queue(queue, first))
+                finally:
+                    # 歌は読み上げのあと。ここで降ろす（読み上げが例外で
+                    # 落ちても次の発話に持ち越さない）
+                    song = state.pop("song", None)
+                    if song:
+                        await sing_song(song)
+                reply, trace = await task
+                log.info("LLM: %s", reply)
+            else:
+                # 本文が 1 文も出なかった（モデルが黙った・道具だけで終わった）
+                reply, trace = await task
+                queued = state.get("song")
+                if queued and reply.startswith("うまく答えられませんでした"):
+                    # 歌は用意できているのに「答えられません」と言わせない。
+                    # モデルが本文を返さず往復の上限に当たった時に起きる
+                    # 差し替えは clean_reply の後なので、読みの置換だけ改めて
+                    # 通す（実測 2026-08-08 07:52: 差し替え文の「度会隆輝」が
+                    # 素通りして「タカテル」と読まれた）
+                    reply = fix_reading("%sの応援歌を歌うね。" % queued["name"])
+                    log.info("本文が無いので歌の一言に差し替えた")
+                log.info("LLM: %s", reply)
+                await send_json({"type": "llm", "emotion": "happy",
+                                 "text": "😀"})
+                song = state.pop("song", None)
+                try:
+                    await speak(reply)
+                finally:
+                    if song:
+                        await sing_song(song)
             state["history"].extend(trace)
             state["history"].append({"role": "assistant", "content": reply})
             state["history"] = trim_history(state["history"])
             hist_store[device_id] = (time.time(), list(state["history"]))
-            queued = state.get("song")
-            if queued and reply.startswith("うまく答えられませんでした"):
-                # 歌は用意できているのに「答えられません」と言わせない。
-                # モデルが本文を返さず往復の上限に当たった時に起きる
-                # 差し替えは clean_reply の後なので、読みの置換だけ改めて
-                # 通す（実測 2026-08-08 07:52: 差し替え文の「度会隆輝」が
-                # 素通りして「タカテル」と読まれた）
-                reply = fix_reading("%sの応援歌を歌うね。" % queued["name"])
-                log.info("本文が無いので歌の一言に差し替えた")
-            log.info("LLM: %s", reply)
-            await send_json({"type": "llm", "emotion": "happy", "text": "😀"})
-            song = state.pop("song", None)   # 先に降ろす。読み上げが例外で
-            try:                                  # 落ちても次の発話に持ち越さない
-                await speak(reply)
-            finally:
-                if song:
-                    await sing_song(song)
             state["last_spoke"] = time.monotonic()
         except asyncio.CancelledError:
             raise
