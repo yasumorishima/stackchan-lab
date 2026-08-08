@@ -256,7 +256,9 @@ async def prepare(session, want):
     sung_lines, _call = sheet_song.split_call(list(songs.get(key, [])))
     # 先頭の掛け声（オオオオー…）も歌わない。音程を持たないので旋律に
     # 乗せると歌にならない（実機 2026-08-08「牧の応援歌、めちゃくちゃ」）
-    sung_lines = sheet_song.drop_chant(sung_lines, key)
+    sung_lines = (sheet_song.SUNG_LINES.get(key)
+                  or sheet_song.drop_chant(sung_lines, key))
+    sung_lines = [sheet_song.read_particles(x) for x in sung_lines]
     text = "".join(sung_lines) or text
 
     # 譜面（ゲームの応援歌エディタ）から起こした旋律があるならそれを使う。
@@ -286,10 +288,32 @@ async def prepare(session, want):
         log.info("%s は休みが %.0f%% で歌にならないので歌わない",
                  key, gap * 100)
         raise LookupError("歌にならない")
+    # 🔴 音源は掛け声込みの全曲ぶんある。**全歌詞で対応付けてから歌う範囲だけ
+    # 切り出す**（歌詞だけ減らすと 1 音が伸びて「対応していない」で弾かれる。
+    # 実測 2026-08-08: 筒香が 39 モーラ / 32 秒 = 0.83 秒で歌えなくなった）
+    all_lines = list(songs.get(key, []))
+    all_morae = moras("".join(all_lines))
     morae = moras(text)
     if not morae:
         raise LookupError("歌詞が読めない")
-    notes, tempo = await notes_by_morae(key, path, morae)
+    head = 0
+    for ln in all_lines:
+        if ln in sung_lines:
+            break
+        head += len(moras(ln))
+    tail = 0
+    for ln in reversed(all_lines):
+        if ln in sung_lines:
+            break
+        tail += len(moras(ln))
+    if head or tail:
+        notes, tempo = await notes_by_morae(key, path, all_morae)
+        end = len(notes) - tail if tail else len(notes)
+        notes = notes[head:end]
+        log.info("%s: 掛け声を除いて %d〜%d 音を歌う（全 %d モーラ）",
+                 key, head, end, len(all_morae))
+    else:
+        notes, tempo = await notes_by_morae(key, path, morae)
     # 🔴 音源が歌詞を 1 対 1 で覆っていない曲は歌わない。DP は必ずモーラ数だけ
     # 音符を作るので、覆っていない曲では 1 音が異様に伸びて歌にならない。
     # 実測（2026-08-06・13 曲）: 12 曲は 0.22〜0.58 秒/モーラに固まり、

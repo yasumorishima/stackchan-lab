@@ -114,6 +114,29 @@ def _merge_short(out):
     return out
 
 
+GLUE_GAP = 1              # この長さ以下の休みなら、同じ高さの音を繋ぐ
+
+
+def glue_split(notes):
+    """読み取りで割れた同じ高さの音を 1 つに戻す。
+
+    1 マスの休みを挟んで同じ高さが並ぶのは、譜面の帯を横切る線で切れただけ
+    のことが多い（実測 柴田: `G#4 len=1` 休み1 `G#4 len=1` ＝本来 `len=3`）。
+    そこへ歌詞の余りが配られて「とお」のような音が生まれていた。
+    """
+    out = []
+    for n in notes:
+        if out:
+            prev = out[-1]
+            gap = n["t16"] - (prev["t16"] + prev["len16"])
+            if (prev["semi"] == n["semi"] and 0 < gap <= GLUE_GAP
+                    and (prev["len16"] <= 1 or n["len16"] <= 1)):
+                prev["len16"] = n["t16"] + n["len16"] - prev["t16"]
+                continue
+        out.append(dict(n))
+    return out
+
+
 def _phrases(notes):
     """休符（t16 の切れ目）で音符の並びをフレーズに分ける。"""
     out, cur, end = [], [], None
@@ -219,7 +242,31 @@ _CHANT_RE = re.compile(r"^[オぉおー\s！!・]*$")
 # 🔴 歌の前の掛け声が「普通の歌詞に見える」曲がある。文字では判別できないので
 # **曲ごとの事実として持つ**（値 = 歌が始まる行番号）。user 様の指摘で埋める。
 # 牧: 「オオオオー」3 行に加えて「とどけ われらのこえ」も掛け声（2026-08-08）
-LEAD_CHANT = {"牧秀悟": 4}
+# 歌が始まる行番号（user 様の指摘で埋める。文字からは判別できない）
+# 牧: 「オオオオー」3 行＋「とどけ われらのこえ」＝先頭 4 行が掛け声
+# 筒香: 「よこはまのそらたかく」〜「つつごうー」＝先頭 3 行が掛け声（歌は
+#       「さあ うてつつごう」から。user 指摘 2026-08-08）
+LEAD_CHANT = {"牧秀悟": 4, "筒香嘉智": 3}
+# 末尾の掛け声を落とす行数（「かっとばせー！○○！」以外の形。split_call が
+# 落としたあとの行数で数える）。筒香: 「ゴー！ゴー！つつごう！」
+TAIL_CHANT = {"筒香嘉智": 1}
+# 🔴 実際の歌い方は公式歌詞の表記と違う（長音の位置など）。文字からは導けない
+# ので、教えていただいた歌い方をそのまま持つ。指定があれば歌詞を置き換える。
+# 柴田: 公式は「ねらいすました ミートと」だが、歌は「ねらーいすましたミートと」
+SUNG_LINES = {
+    "柴田竜拓": ["ねらーいすましたミートと", "たくみな グラブさばきは",
+                 "どりょくという かけらの", "けっしょうの あかしだ"],
+}
+
+
+# 助詞の「は」「へ」は「わ」「え」と歌う。語中の「は」（はしる 等）は触らない
+_PARTICLE_RE = re.compile(r"は(?=\s|$)")
+_PARTICLE_HE_RE = re.compile(r"へ(?=\s|$)")
+
+
+def read_particles(line):
+    """歌うときの読みに直す。語末・行末の「は」→「わ」、「へ」→「え」。"""
+    return _PARTICLE_HE_RE.sub("え", _PARTICLE_RE.sub("わ", line))
 
 
 def drop_chant(lines, name=""):
@@ -233,8 +280,10 @@ def drop_chant(lines, name=""):
     選手名がカタカナで混ざる行も掛け声とみなす。
     """
     lead = LEAD_CHANT.get(name)
-    if lead:
-        return list(lines[lead:]) or list(lines)
+    tail = TAIL_CHANT.get(name, 0)
+    if lead or tail:
+        got = list(lines[lead or 0:len(lines) - tail if tail else None])
+        return got or list(lines)
     out = list(lines)
     while out:
         t = re.sub(r"[ァ-ヿ]{3,}", "", out[0])
@@ -287,9 +336,11 @@ def build(sheet, lines, moras, name=""):
     """
     sung_lines, call = split_call(list(lines))
     # 先頭の掛け声（オオオオー…）は音程を持たないので歌わない
-    sung_lines = drop_chant(sung_lines, name)
+    sung_lines = SUNG_LINES.get(name) or drop_chant(sung_lines, name)
+    # 助詞の「は」「へ」は「わ」「え」と歌う（user 指摘 2026-08-08）
+    sung_lines = [read_particles(x) for x in sung_lines]
     morae = moras("".join(sung_lines))
-    notes = sorted(sheet["notes"], key=lambda n: n["t16"])
+    notes = glue_split(sorted(sheet["notes"], key=lambda n: n["t16"]))
     notes = drop_strays(notes)
     if not notes or not morae:
         raise ValueError("譜面か歌詞が空")

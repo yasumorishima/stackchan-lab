@@ -1198,6 +1198,8 @@ async def transcribe(session, pcm: bytes) -> str:
 
 # 「◯◯の応援歌を歌って」と頼まれたか。道具が呼ばれなかった時の保険に使う
 SING_ASK_RE = re.compile(r"(.{1,12}?)\s*の\s*(?:応援歌|おうえんか|応歌)")
+# 歌を用意できているのに「歌えない」と言う矛盾（実機 2026-08-08 22:00）
+NEGATIVE_SONG_RE = re.compile(r"見つから|歌えな|ありません|見つけられ")
 SING_VERB_RE = re.compile(r"歌|うた|唄")
 
 
@@ -1962,11 +1964,25 @@ async def ws_handler(request: web.Request):
             task = asyncio.create_task(respond_feeding(
                 session, state["history"], tools, call_tool, feed))
             first = await queue.get()
+
+            async def _no_deny(src):
+                """歌を用意できている間は否定的な文を読まない。"""
+                async for line in src:
+                    if state.get("song") and NEGATIVE_SONG_RE.search(line or ""):
+                        log.info("歌は用意できているので否定の文は読まない: %r",
+                                 line)
+                        continue
+                    yield line
+
+            if first is not None and state.get("song") and                     NEGATIVE_SONG_RE.search(first):
+                log.info("歌は用意できているので最初の文を差し替えた: %r", first)
+                first = fix_reading("%sの応援歌を歌うね。"
+                                    % state["song"]["name"])
             if first is not None:
                 await send_json({"type": "llm", "emotion": "happy",
                                  "text": "😀"})
                 try:
-                    await speak(source=_aiter_queue(queue, first))
+                    await speak(source=_no_deny(_aiter_queue(queue, first)))
                 finally:
                     # 歌は読み上げのあと。ここで降ろす（読み上げが例外で
                     # 落ちても次の発話に持ち越さない）
@@ -1995,7 +2011,8 @@ async def ws_handler(request: web.Request):
                 # 本文が 1 文も出なかった（モデルが黙った・道具だけで終わった）
                 reply, trace = await task
                 queued = state.get("song")
-                if queued and reply.startswith("うまく答えられませんでした"):
+                if queued and (reply.startswith("うまく答えられませんでした")
+                               or NEGATIVE_SONG_RE.search(reply or "")):
                     # 歌は用意できているのに「答えられません」と言わせない。
                     # モデルが本文を返さず往復の上限に当たった時に起きる
                     # 差し替えは clean_reply の後なので、読みの置換だけ改めて
