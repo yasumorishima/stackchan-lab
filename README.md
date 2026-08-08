@@ -12,9 +12,9 @@ M5 スタックちゃん（**M5STACK-K151** / M5Stack CoreS3）の開発記録�
 
 **応援歌を歌っているところ**
 
-<img src="docs/media/kyoda-cheer-song.gif" width="240" alt="京田陽太の応援歌を歌うスタックちゃん">
+https://github.com/user-attachments/assets/c8362b72-3d51-4fe3-9bae-85891034855b
 
-（音つきの動画（17 秒）は [docs/media/kyoda-cheer-song.mp4](docs/media/kyoda-cheer-song.mp4)。**GitHub は README に手で書いた `<video>` タグを消す**ので、ここは GIF にしてあります）
+（17 秒・音あり。ファイル本体は [docs/media/kyoda-cheer-song.mp4](docs/media/kyoda-cheer-song.mp4)、音なしの [GIF](docs/media/kyoda-cheer-song.gif) もあります）
 
 「京田陽太さんの応援歌を歌いますね」と言ってから、ゲームの譜面から起こした旋律で歌います（歌詞は公式のもの、掛け声は歌いません）。
 
