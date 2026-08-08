@@ -30,7 +30,13 @@ def to_pitch(semi):
 
 
 def share_morae(notes, morae):
-    """モーラを音符に配る。まず 1 つずつ、余りは長い音符から 2 つ目を足す。"""
+    """モーラを音符に配る（全体一括の後詰め。フレーズ対応が取れない時の控え）。
+
+    まず 1 つずつ、余りは長い音符から 2 つ目を足す。音符の方が多ければ
+    短い音符から前の音とつなげる。**併合した音符の並びも返す**（返さないと
+    呼び出し側が元の並びと zip して、末尾の音符が黙って落ちる＝実測 京田の
+    最終音が消えていた）。
+    """
     if len(morae) < len(notes):
         # 音符の方が多いぶんは、**短い音符から順に前の音とつなげる**（同じ高さの
         # 打ち直しを 1 つに戻す）。読み違いで切れ目が増えたぶんを吸収する
@@ -60,7 +66,108 @@ def share_morae(notes, morae):
     for n, c in zip(notes, per):
         out.append("".join(morae[k:k + c]))
         k += c
+    return notes, out
+
+
+# 伸ばし用の母音（「つないでー」の ー を歌わせるための、直前のモーラの母音）
+_VOWEL_ROWS = (("あ", "あかさたなはまやらわがざだばぱぁゃ"),
+               ("い", "いきしちにひみりぎじぢびぴぃ"),
+               ("う", "うくすつぬふむゆるぐずづぶぷゔぅゅ"),
+               ("え", "えけせてねへめれげぜでべぺぇ"),
+               ("お", "おこそとのほもよろをごぞどぼぽぉょ"))
+_VOWEL = {k: v for v, ks in _VOWEL_ROWS for k in ks}
+
+
+def _extension(mora):
+    """モーラの伸ばし（母音）。カタカナは平仮名に寄せてから引く。"""
+    c = mora[-1]
+    if "ァ" <= c <= "ヶ":
+        c = chr(ord(c) - 0x60)
+    return _VOWEL.get(c, c)
+
+
+def _phrases(notes):
+    """休符（t16 の切れ目）で音符の並びをフレーズに分ける。"""
+    out, cur, end = [], [], None
+    for n in notes:
+        if cur and n["t16"] > end:
+            out.append(cur)
+            cur = []
+        cur.append(n)
+        end = n["t16"] + n["len16"]
+    if cur:
+        out.append(cur)
     return out
+
+
+def _fit_words(words, phrases):
+    """歌詞のモーラ列をフレーズへ配る切り方を DP で選ぶ。
+
+    切り口はモーラ単位（歌詞の行に空白が無い曲もある＝実測 石上は行内
+    無空白で、語単位の DP だと語 4 に対しフレーズ 5 で不成立だった）。
+    語（空白・行の区切り）の境目で切れる分け方を少し好む。採点は
+    「フレーズのモーラ数と音符数のずれの二乗和＋語境界ペナルティ」。
+    1 音に 3 モーラ以上は歌えないので、そうなる分け方は選ばない。
+    """
+    morae = [m for w in words for m in w]
+    bounds, acc = set(), 0
+    for w in words:
+        acc += len(w)
+        bounds.add(acc)
+    m_n, p_n = len(morae), len(phrases)
+    if m_n == 0 or p_n == 0:
+        return None
+    inf = float("inf")
+    cost = [[inf] * (p_n + 1) for _ in range(m_n + 1)]
+    back = [[0] * (p_n + 1) for _ in range(m_n + 1)]
+    cost[0][0] = 0.0
+    for p in range(1, p_n + 1):
+        n_p = len(phrases[p - 1])
+        for e in range(1, m_n + 1):
+            for s in range(0, e):
+                if cost[s][p - 1] == inf:
+                    continue
+                m = e - s
+                if m > 2 * n_p:
+                    continue
+                c = (cost[s][p - 1] + (m - n_p) ** 2
+                     + (0.0 if e in bounds else 0.3))
+                if c < cost[e][p]:
+                    cost[e][p] = c
+                    back[e][p] = s
+    if cost[m_n][p_n] == inf:
+        return None
+    cuts, e = [], m_n
+    for p in range(p_n, 0, -1):
+        cuts.append((back[e][p], e))
+        e = back[e][p]
+    return [morae[a:b] for a, b in reversed(cuts)]
+
+
+def _share_phrase(notes, morae):
+    """1 フレーズぶんの配り（音符ごとのモーラの列を返す）。
+
+    1 音 1 モーラが基本、足りなければ長い音符に 2 つ、音符が余れば
+    **末尾の音符は直前のモーラの母音で伸ばす**（「つないでー」の ー。
+    途中の音符を勝手に併合しない）。"""
+    n, m = len(notes), len(morae)
+    if m > n:
+        per = [1] * n
+        extra = m - n
+        for i in sorted(range(n), key=lambda i: -notes[i]["len16"]):
+            if extra <= 0:
+                break
+            per[i] += 1
+            extra -= 1
+        if extra > 0:
+            raise ValueError("歌詞が音符に乗り切らない（モーラ %d / 音符 %d）"
+                             % (m, n))
+        out, k = [], 0
+        for c in per:
+            out.append(morae[k:k + c])
+            k += c
+        return out
+    return [[x] for x in morae] + [[_extension(morae[-1])]] * (n - m)
 
 
 def split_call(lines):
@@ -96,6 +203,13 @@ def build(sheet, lines, moras):
 
     sheet=譜面 JSON の dict / lines=公式歌詞の行 / moras=モーラ分割の関数
     （cheer_song.moras。ここで import すると循環になるので渡してもらう）。
+
+    配りは**フレーズ単位**が基本: 旋律を休符で区切り、歌詞を空白区切りの
+    語で区切り、語の組をフレーズへ DP で対応付ける。全体一括の後詰めだと
+    余り・不足の調整が曲のどこで起きるか制御できず、離れた場所の 1 音の
+    ずれが伸ばす音節を狂わせる（実測 度会: 最後の「ためにー」が
+    「ためーに」になり user 指摘。フレーズ単位なら 18 音 18 モーラの
+    1:1 で自動的に合う）。
     """
     sung_lines, call = split_call(list(lines))
     morae = moras("".join(sung_lines))
@@ -103,14 +217,35 @@ def build(sheet, lines, moras):
     notes = drop_strays(notes)
     if not notes or not morae:
         raise ValueError("譜面か歌詞が空")
-    lyrics = share_morae(notes, morae)
+    words = [moras(w) for ln in sung_lines for w in ln.split()]
+    words = [w for w in words if w]
+    phrases = _phrases(notes)
+    groups = _fit_words(words, phrases) if len(phrases) >= 2 else None
+    if groups is not None:
+        lyrics = []
+        for ph, gm in zip(phrases, groups):
+            lyrics.extend(_share_phrase(ph, gm))
+    else:
+        notes, joined = share_morae(notes, morae)
+        lyrics = [[x] for x in joined]
     # 16 分音符 1 つの長さ = sec_per_bar/16。to_score は「長さ×60/tempo/4 秒」
     # なので tempo をそこから逆算する（1 小節 = 4 拍）
     tempo = 240.0 / sheet["sec_per_bar"]
     out, t = [], notes[0]["t16"]
-    for n, ly in zip(notes, lyrics):
+    for n, ms in zip(notes, lyrics):
         if n["t16"] > t:
             out.append([None, n["t16"] - t, ""])          # 休み
-        out.append([to_pitch(n["semi"]), n["len16"], ly])
+        pitch = to_pitch(n["semi"])
+        if len(ms) > 1 and n["len16"] >= len(ms) + 1:
+            # 詰め込みの 2 モーラは「先を短く・後を残り全部で伸ばす」。
+            # 1 音のまま渡すと均等割り（sing_vv._spread）になり、
+            # 「ためにー」が「ためー・にー」に化ける（user 指摘 2026-08-08）
+            lead = 1 if n["len16"] < 4 else 2
+            rest = n["len16"] - lead * (len(ms) - 1)
+            for m in ms[:-1]:
+                out.append([pitch, lead, m])
+            out.append([pitch, rest, ms[-1]])
+        else:
+            out.append([pitch, n["len16"], "".join(ms)])
         t = n["t16"] + n["len16"]
     return out, tempo, len(morae), call
