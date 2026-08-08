@@ -10,7 +10,11 @@ M5 スタックちゃん（**M5STACK-K151** / M5Stack CoreS3）の開発記録�
 
 <img src="docs/media/stackchan.jpg" width="320" alt="M5 スタックちゃん（M5STACK-K151）">
 
-**応援歌を歌っているところ**（17 秒・音あり）: [docs/media/kyoda-cheer-song.mp4](docs/media/kyoda-cheer-song.mp4)
+**応援歌を歌っているところ**
+
+<video src="https://github.com/yasumorishima/stackchan-lab/raw/main/docs/media/kyoda-cheer-song.mp4" controls muted playsinline width="240"></video>
+
+（再生できないときは [動画ファイル](docs/media/kyoda-cheer-song.mp4) か [GIF](docs/media/kyoda-cheer-song.gif) をどうぞ）
 
 「京田陽太さんの応援歌を歌いますね」と言ってから、ゲームの譜面から起こした旋律で歌います（歌詞は公式のもの、掛け声は歌いません）。
 
