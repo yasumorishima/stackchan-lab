@@ -104,6 +104,12 @@ VAD_MAX_MS = float(os.environ.get("VAD_MAX_MS", "15000"))
 # 声が埋もれていた。固定値を下げるだけだと うるさい部屋で環境音を拾うので、
 # 静かなときの水準の何倍か、で決める
 VAD_ADAPT = os.environ.get("VAD_ADAPT", "1") not in ("0", "false", "no")
+# つないでも本体が音を送ってこないことがある（実機 2026-08-08: 32 秒で 21
+# フレームだけ）。読み上げが終わると本体は自分から listen start を送るので、
+# 短く声をかけて聞き取りを起こす
+WAKE_NUDGE_SEC = float(os.environ.get("WAKE_NUDGE_SEC", "6"))
+WAKE_NUDGE_FRAMES = int(os.environ.get("WAKE_NUDGE_FRAMES", "40"))
+WAKE_GREETING = os.environ.get("WAKE_GREETING", "はい、聞いてるよ。")
 VAD_RMS_MULT = float(os.environ.get("VAD_RMS_MULT", "2.0"))
 VAD_RMS_MIN = float(os.environ.get("VAD_RMS_MIN", "120"))
 VAD_RMS_MAX = float(os.environ.get("VAD_RMS_MAX", "600"))
@@ -1655,6 +1661,24 @@ async def ws_handler(request: web.Request):
 
         state["mcp_task"] = asyncio.create_task(_handshake())
 
+        async def _nudge():
+            # 本体が音を送ってこないまま黙る接続がある。読み上げを 1 回鳴らすと
+            # 本体は自分から listen start を送ってくるので、それで起こす
+            try:
+                await asyncio.sleep(WAKE_NUDGE_SEC)
+                got = state.get("audio_frames", 0)
+                if (WAKE_GREETING and not state.get("heard_any")
+                        and got < WAKE_NUDGE_FRAMES and not ws.closed):
+                    log.info("音がほとんど来ないので声をかけて起こす"
+                             "（届いた %d フレーム）", got)
+                    await speak(WAKE_GREETING)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("起こしの声かけに失敗")
+
+        state["nudge_task"] = asyncio.create_task(_nudge())
+
     async def hello_grace():
         """本体の hello が届かないまま黙って切られるのを防ぐ保険。
 
@@ -2121,6 +2145,9 @@ async def ws_handler(request: web.Request):
         for t in (state["task"], state["mcp_task"], state["hello_task"]):
             if t is not None and not t.done():
                 t.cancel()
+        t = state.get("nudge_task")
+        if t is not None and not t.done():
+            t.cancel()
         frames = state.get("audio_frames", 0)
         log.info("WS closed device=%s session=%s (hello_done=%s・"
                  "届いた音声 %d フレーム%s)",
@@ -2160,7 +2187,9 @@ def main():
     log.info("listening on 0.0.0.0:%d  ota=http://%s:%d/xiaozhi/ota/  ws=ws://%s:%d/ws",
              PORT, PUBLIC_HOST, PORT, PUBLIC_HOST, PORT)
     log.info("backends: stt=%s llm=%s tts=%s", STT_BACKEND, LLM_BACKEND, TTS_BACKEND)
-    web.run_app(app, host="0.0.0.0", port=PORT, access_log=None)
+    # 本体が接続を試みたかを見るため、要求そのものを記録する（2026-08-08:
+    # OTA は届くのに WS 接続が来ない件の切り分け。うるさければ None に戻す）
+    web.run_app(app, host="0.0.0.0", port=PORT, access_log=log)
 
 
 if __name__ == "__main__":
