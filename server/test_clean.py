@@ -400,6 +400,22 @@ _AIZUCHI = [
     ("はい", 999.0, 0, False, False, "会話の途中の「はい」は従来どおり止める"),
     ("うん", 5.0, 3, True, True, "最初の一言なら連続数に関係なく通す"),
 ]
+# 「歌って」と頼まれたのに道具が呼ばれなかった時の保険（実機 2026-08-08:
+# 通し試験 8 回中 2 回、モデルが「歌うね」と言って呼ばなかった）
+_SING_ASK = [
+    ("宮崎の応援歌を歌って", "宮崎"),
+    ("度会の応援歌うたって", "度会"),
+    ("京田の応援歌歌ってよ", "京田"),
+    ("宮崎の応援歌を教えて", None),      # 歌詞を読む依頼は拾わない
+    ("京田の応援歌", None),              # 動詞が無ければ拾わない
+    ("今日の天気", None),
+]
+for _t, _want in _SING_ASK:
+    n_split += 1
+    _got = app.sing_request_name(_t)
+    ng += _got != _want
+    print("%s 歌の依頼判定 %r: %r" % ("OK" if _got == _want else "NG", _t, _got))
+
 for _t, _age, _streak, _first, _want, _memo in _AIZUCHI:
     n_split += 1
     _got = app.worth_answering(_t, _age, _streak, _first)

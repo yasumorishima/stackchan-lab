@@ -1183,6 +1183,20 @@ async def transcribe(session, pcm: bytes) -> str:
     return "（ドライラン: 音声 %.1f 秒を受信しました）" % (len(pcm) / 2 / UP_RATE)
 
 
+# 「◯◯の応援歌を歌って」と頼まれたか。道具が呼ばれなかった時の保険に使う
+SING_ASK_RE = re.compile(r"(.{1,12}?)\s*の\s*(?:応援歌|おうえんか|応歌)")
+SING_VERB_RE = re.compile(r"歌|うた|唄")
+
+
+def sing_request_name(text: str):
+    """「◯◯の応援歌 …歌って」なら選手名らしき部分を返す。違えば None。"""
+    m = SING_ASK_RE.search(text or "")
+    if not m:
+        return None
+    rest = text[m.end():]
+    return m.group(1).strip() if SING_VERB_RE.search(rest) else None
+
+
 TOOL_TAG_RE = re.compile(r"</?tool_call>|</?function_call>|</?tool_response>",
                          re.IGNORECASE)
 TOOL_KEY_RE = re.compile(r"\"(?:name|arguments|parameters)\"\s*:")
@@ -1904,6 +1918,22 @@ async def ws_handler(request: web.Request):
                         await sing_song(song)
                 reply, trace = await task
                 log.info("LLM: %s", reply)
+                # モデルが「歌うね」と言いながら道具を呼ばないことがある
+                # （実測 16:14 / 16:28）。頼まれていたらこちらで呼ぶ
+                if song is None:
+                    asked = sing_request_name(text)
+                    if asked:
+                        ctx2 = {}
+                        try:
+                            await server_tools.sing_cheer_song(
+                                session, {"player": asked}, ctx2)
+                        except Exception as e:
+                            log.warning("頼まれた歌を用意できなかった: %s: %s",
+                                        type(e).__name__, e)
+                        if ctx2.get("song"):
+                            log.info("道具が呼ばれなかったので %s の歌を"
+                                     "こちらで用意した", asked)
+                            await sing_song(ctx2["song"])
             else:
                 # 本文が 1 文も出なかった（モデルが黙った・道具だけで終わった）
                 reply, trace = await task
