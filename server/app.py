@@ -124,10 +124,14 @@ FILLER_WORDS = frozenset((
     "どっこいしょ", "あれ", "おっと",
 ))
 _FILLER_PUNCT = re.compile(r"[、。！？!?.,・…〜\s]+")
+# 名前を呼ばれたら相槌扱いしない。聞き取りが崩れやすいので短い形も入れる
+WAKE_WORDS = ("スタックちゃん", "すたっくちゃん", "スタックチャン",
+              "スタック", "すたっく")
 
 
 def worth_answering(text: str, last_spoke_age: float,
-                    filler_streak: int = 0) -> bool:
+                    filler_streak: int = 0, first_of_session: bool = False
+                    ) -> bool:
     """認識結果に返事をすべきか。
 
     実機のマイクは常時開いていて、環境音や独り言が「うん」「はあ」のような
@@ -139,7 +143,14 @@ def worth_answering(text: str, last_spoke_age: float,
     t = _FILLER_PUNCT.sub("", text or "")
     if not t:
         return False
+    if any(w in t for w in WAKE_WORDS):
+        return True                       # 名前を呼ばれた＝話しかけ
     if t in FILLER_WORDS or len(t) <= 1:
+        # その接続で最初の一言なら、まだ会話が無い＝相槌ではありえない。
+        # 実ログで止めた 162 件は全部 会話の途中＝ここを通しても取りこぼしは
+        # 増えない（2026-08-08 実測）
+        if first_of_session:
+            return True
         # 相槌に返事できるのは、こちらが話した直後の 1 回だけ。猶予窓だけ
         # だと返事のたびに窓が開き直り、環境音の相槌へ際限なく返事し続ける
         # （2026-08-08 実機: テレビの音が「うん」「よし」「えっ」になり
@@ -1792,7 +1803,9 @@ async def ws_handler(request: web.Request):
             age = time.monotonic() - state["last_spoke"]
             streak = state.get("filler_streak", 0)
             state["filler_streak"] = streak + 1 if _is_filler(text) else 0
-            if not worth_answering(text, age, streak):
+            first = not state.get("heard_any")
+            state["heard_any"] = True
+            if not worth_answering(text, age, streak, first):
                 log.info("相槌・空認識には返答しない（前回の発話から %.0f 秒）: %r",
                          age, text)
                 return

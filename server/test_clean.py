@@ -379,15 +379,21 @@ for _pcm, _memo, _lo, _hi, _peak in _SPK:
 # 相槌に返事するのは直後の 1 回だけ（環境音との無限おしゃべり防止・
 # 2026-08-08 実機で 8 連続の独り言）
 _AIZUCHI = [
-    ("うん", 5.0, 0, True, "発話直後の相槌 1 回目は返事する"),
-    ("うん", 5.0, 1, False, "2 連続めからは返事しない"),
-    ("よい", 5.0, 1, False, "「よい」も相槌扱い"),
-    ("うん", 30.0, 0, False, "窓の外の相槌は従来どおり返事しない"),
-    ("京田の応援歌", 30.0, 3, True, "普通の話しかけは連続後でも通す"),
+    ("うん", 5.0, 0, False, True, "発話直後の相槌 1 回目は返事する"),
+    ("うん", 5.0, 1, False, False, "2 連続めからは返事しない"),
+    ("よい", 5.0, 1, False, False, "「よい」も相槌扱い"),
+    ("うん", 30.0, 0, False, False, "窓の外の相槌は従来どおり返事しない"),
+    ("京田の応援歌", 30.0, 3, False, True, "普通の話しかけは連続後でも通す"),
+    # 話しかけ始め（user 実機指摘 2026-08-08「はい、スタックちゃんに反応しない」）
+    ("はい、スタックちゃん", 999.0, 3, False, True, "名前を呼ばれたら必ず返事する"),
+    ("スタックちゃん", 999.0, 3, False, True, "名前だけでも返事する"),
+    ("はい", 999.0, 0, True, True, "接続後の最初の一言は相槌でも返事する"),
+    ("はい", 999.0, 0, False, False, "会話の途中の「はい」は従来どおり止める"),
+    ("うん", 5.0, 3, True, True, "最初の一言なら連続数に関係なく通す"),
 ]
-for _t, _age, _streak, _want, _memo in _AIZUCHI:
+for _t, _age, _streak, _first, _want, _memo in _AIZUCHI:
     n_split += 1
-    _got = app.worth_answering(_t, _age, _streak)
+    _got = app.worth_answering(_t, _age, _streak, _first)
     ng += _got != _want
     print("%s %s: %s" % ("OK" if _got == _want else "NG", _memo, _got))
 
