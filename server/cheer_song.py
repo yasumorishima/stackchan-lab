@@ -251,8 +251,20 @@ async def prepare(session, want):
     text = "".join(songs.get(key, [])) if key else ""
     if not text:
         raise LookupError("歌詞が無い")
+    # 最後の「かっとばせー！○○！」はコール＝歌ではないので歌わない。
+    # 譜面から歌う経路（sheet_song.build）と同じ判定を使う
+    sung_lines, _call = sheet_song.split_call(list(songs.get(key, [])))
+    text = "".join(sung_lines) or text
 
-    # 置いてもらった音源が最優先（配布ページに無い選手はこれしか手が無い）
+    # 譜面（ゲームの応援歌エディタ）から起こした旋律があるならそれを使う。
+    # 音源からの採譜は自前の音高追跡が入るぶん誤差が残る（実測 宮﨑: 楽譜に
+    # オクターブの飛び値／楽譜 43 音に対し鳴った音 62）のに対し、譜面は高さと
+    # 長さが離散値で書いてある。**ここに置いてあること自体が「読めた」の印**で、
+    # 繰り返しの見立てが怪しい曲は置かない（判定を置き場で表す）
+    if sheet_source(key):
+        return await _prepare_sheet(key, songs)
+
+    # 置いてもらった音源（配布ページに無い選手はこれしか手が無い）
     path = local_audio(key)
     if path:
         notes, tempo = await notes_from_file(key, path)
