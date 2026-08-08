@@ -94,14 +94,22 @@ def main():
     check("静かな部屋なら小さい声も発話になる", got is not None, True)
     check("その時 speech_ms が立つ", st["speech_ms"] >= app.VAD_MIN_SPEECH_MS, True)
 
+    # うるさい部屋では敷居が上がるが、**上限で頭打ちにして拾う側に倒す**
+    # （user 指示「うるさい部屋で拾ったっていいでしょ、会話できないほうが
+    # ストレス」）。環境音への返事は相槌の門番が止める
     st = fresh()
     run(st, [(400.0, 200)])                   # うるさい部屋（テレビ等）
-    check("うるさい部屋では敷居が上がる", app.vad_threshold(st) >= 1000.0, True)
+    check("うるさい部屋でも敷居は上限で頭打ち",
+          app.vad_threshold(st) <= app.VAD_RMS_MAX, True)
     st2 = fresh()
     st2["floor"] = 400.0
     run(st2, [(900.0, 10), (400.0, 20)])
-    check("うるさい部屋の中くらいの音は発話にしない",
-          st2["speech_ms"] < app.VAD_MIN_SPEECH_MS, True)
+    check("うるさい部屋でも はっきりした声は拾う",
+          st2["speech_ms"] >= app.VAD_MIN_SPEECH_MS, True)
+    st3 = fresh()
+    n3 = run(st3, [(400.0, 200)])
+    check("環境音そのものは発話にしない",
+          st3["speech_ms"] < app.VAD_MIN_SPEECH_MS, True)
 
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

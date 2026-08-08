@@ -104,9 +104,9 @@ VAD_MAX_MS = float(os.environ.get("VAD_MAX_MS", "15000"))
 # 声が埋もれていた。固定値を下げるだけだと うるさい部屋で環境音を拾うので、
 # 静かなときの水準の何倍か、で決める
 VAD_ADAPT = os.environ.get("VAD_ADAPT", "1") not in ("0", "false", "no")
-VAD_RMS_MULT = float(os.environ.get("VAD_RMS_MULT", "3.0"))
-VAD_RMS_MIN = float(os.environ.get("VAD_RMS_MIN", "200"))
-VAD_RMS_MAX = float(os.environ.get("VAD_RMS_MAX", "1500"))
+VAD_RMS_MULT = float(os.environ.get("VAD_RMS_MULT", "2.0"))
+VAD_RMS_MIN = float(os.environ.get("VAD_RMS_MIN", "120"))
+VAD_RMS_MAX = float(os.environ.get("VAD_RMS_MAX", "600"))
 VAD_FLOOR_RISE = float(os.environ.get("VAD_FLOOR_RISE", "0.02"))
 
 
