@@ -105,5 +105,32 @@ check("既定 音量3000", local_stt.SHERPA_NORM_RMS == 3000.0,
 check("既定 切り出し0.4秒", local_stt.SHERPA_TRIM == 0.4,
       str(local_stt.SHERPA_TRIM))
 
+
+# 実機のバッファは十数秒あり、前の方に生活音が入っていることがある。答える
+# べきなのは VAD が終わりを見つけた**最後のかたまり**なので、そこだけ渡す
+# （2026-08-08 user「反応が遅い」→ 渡す長さを短くした）
+def _burst(sec, amp, freq=300.0):
+    t = np.arange(int(RATE * sec)) / RATE
+    return (amp * np.sin(2 * np.pi * freq * t)).astype("float32")
+
+
+def _silence(sec):
+    return np.zeros(int(RATE * sec), dtype="float32")
+
+
+_buf = np.concatenate([_silence(0.5), _burst(0.6, 0.30), _silence(4.0),
+                       _burst(1.2, 0.35), _silence(0.3)])
+_kept = local_stt._trim_to_speech(_buf, RATE, 0.4)
+check("前の生活音を捨てて最後の発話だけ渡す",
+      1.6 <= len(_kept) / RATE <= 2.6, "%.2f 秒（元 %.2f 秒）"
+      % (len(_kept) / RATE, len(_buf) / RATE))
+
+_one = np.concatenate([_silence(0.5), _burst(0.5, 0.30), _silence(0.3),
+                       _burst(0.5, 0.30), _silence(0.5)])
+_kept1 = local_stt._trim_to_speech(_one, RATE, 0.4)
+check("短い間（0.3秒）は同じ発話として残す",
+      1.8 <= len(_kept1) / RATE <= 2.4, "%.2f 秒（元 %.2f 秒）"
+      % (len(_kept1) / RATE, len(_one) / RATE))
+
 print("\n%d/%d" % (ok, ok + fail))
 sys.exit(1 if fail else 0)

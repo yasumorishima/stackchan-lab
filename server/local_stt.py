@@ -3,7 +3,7 @@
 さくらの AI Engine は STT が月 50 回しかないので、常用は RPi5 上のローカル認識に寄せる。
 どちらもモデルは初回のみダウンロードし、以後はオフラインで動く。
 
-  STT_BACKEND=vosk     VOSK_MODEL=~/models/vosk-model-small-ja-0.22
+  STT_BACKEND=vosk     VOSK_MODEL=/home/yasu/models/vosk-model-small-ja-0.22
   STT_BACKEND=whisper  WHISPER_MODEL=small  WHISPER_COMPUTE=int8
 
 いずれもブロッキング API なので、呼び出しは asyncio.to_thread 経由にしてある。
@@ -157,6 +157,12 @@ SHERPA_NORM_CLIP = float(os.environ.get("SHERPA_NORM_CLIP", "0.95"))
 SHERPA_NORM_MIN_LEVEL = float(os.environ.get("SHERPA_NORM_MIN_LEVEL", "200"))
 # 声の前後の黙っている所を切り落とす（0 で無効）。前後に残す秒数
 SHERPA_TRIM = float(os.environ.get("SHERPA_TRIM", "0.4"))
+# これ以上の間が空いたら「別の発話」とみなす秒数（0 で無効）。**app.py の
+# VAD が発話の終わりとみなす無音（VAD_SILENCE_MS）より必ず長くする**＝
+# 短いと、VAD がまだ続きとみなしている間で切って前半を捨ててしまう
+SHERPA_SPLIT_GAP = float(os.environ.get(
+    "SHERPA_SPLIT_GAP",
+    str(float(os.environ.get("VAD_SILENCE_MS", "600")) / 1000.0 + 0.1)))
 _sherpa = None
 
 
@@ -234,6 +240,19 @@ def _trim_to_speech(audio, rate, margin: float):
     loud = np.nonzero(_loud_frames(rms))[0]
     if len(loud) == 0:
         return audio
+    # **いま終わった 1 回ぶんだけ**を残す。実機のバッファは十数秒あり、
+    # 前の方に生活音や自分の声の残りが入っていると、そこから末尾までが
+    # まるごと認識器に渡って遅くなる（実測 2026-08-08: 生 13.68 秒に
+    # 1.5 秒／短い返事でも 0.33〜1.98 秒かかっていた）。答えるべきなのは
+    # VAD が終わりを見つけた最後のかたまりなので、**VAD と同じ間**
+    # （SHERPA_SPLIT_GAP）で切って最後だけ採る
+    if SHERPA_SPLIT_GAP > 0.0:
+        gap = max(1, int(round(SHERPA_SPLIT_GAP * rate / step)))
+        cut = int(loud[0])
+        for prev, cur in zip(loud, loud[1:]):
+            if int(cur) - int(prev) > gap:
+                cut = int(cur)
+        loud = loud[loud >= cut]
     m = int(rate * margin)
     a = max(0, int(loud[0]) * step - m)
     b = min(len(audio), (int(loud[-1]) + 1) * step + m)
@@ -276,6 +295,14 @@ def _normalize(audio, rate):
     return np.clip(audio * gain, -1.0, 1.0).astype("float32")
 
 
+_last_kept = 0.0
+
+
+def last_kept_sec() -> float:
+    """最後に認識器へ渡した音の長さ（秒）。ログの切り分け用。"""
+    return _last_kept
+
+
 def _sherpa_sync(pcm: bytes, rate: int) -> str:
     import numpy as np
     rec = _load_sherpa()
@@ -285,6 +312,8 @@ def _sherpa_sync(pcm: bytes, rate: int) -> str:
     if SHERPA_NORM_RMS > 0.0:
         audio = _normalize(audio, rate)
     # 先頭・末尾に無音を足す（padding が無いと冒頭の一語を落とすことがある）
+    global _last_kept
+    _last_kept = len(audio) / float(rate)
     pad = np.zeros(int(rate * SHERPA_PAD), dtype="float32")
     audio = np.concatenate([pad, audio, pad])
     s = rec.create_stream()

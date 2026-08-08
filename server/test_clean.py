@@ -335,25 +335,41 @@ for _t, _want, _memo in _VERBATIM:
     ng += not _ok
     print("%s 既定では畳む: %r" % ("OK" if _ok else "NG", _folded))
 
-# 会話の声を歌の音量へそろえる（2026-08-08 user 指摘「会話の声が小さい」）
+# 会話の声を、本体のスピーカーで歌と同じ大きさに聞こえるよう整える
+# （2026-08-08 user 指摘「歌に比べて会話の声が小さい」）。物差しは
+# 全体の実効値ではなく**可聴帯（500〜4000Hz）の実効値**
 import math as _math
 _rate = app.DOWN_RATE
-_sine = bytes()
-_arr2 = _arr.array("h", (int(2400 * _math.sqrt(2) * _math.sin(2 * _math.pi * 220 * i / _rate))
-                        for i in range(_rate)))
-_soft = _arr2.tobytes()
-_loud = _arr.array("h", (min(32767, v * 2) for v in _arr2)).tobytes()
-for _pcm, _memo, _lo, _hi in [
-        (_soft, "小さい声は目標へ持ち上がる", 3100, 3700),
-        (_loud, "元から大きい声は触らない", 4500, 99999)]:
+
+
+def _tone(freq, amp, sec=1.0):
+    n = int(_rate * sec)
+    return _arr.array("h", (int(max(-32768, min(32767,
+                            amp * _math.sin(2 * _math.pi * freq * i / _rate))))
+                            for i in range(n))).tobytes()
+
+
+def _aud(pcm):
+    import numpy as _np
+    return app._audible_rms(_np.frombuffer(pcm, dtype=_np.int16).astype(float))
+
+
+_SPK = [
+    (_tone(1000, 1500), "小さい声は歌と同じ聞こえの大きさへ", 2600, 3600, None),
+    (_tone(1000, 20000), "元から大きい声は割らない", 1000, 99999, 31000),
+    (_tone(120, 8000), "スピーカーが鳴らせない低音は持ち上げない", 0, 400, 31000),
+]
+for _pcm, _memo, _lo, _hi, _peak in _SPK:
     n_split += 1
-    _out = app._match_song_loudness(_pcm)
+    _out = app._shape_for_speaker(_pcm)
     _a = _arr.array("h")
     _a.frombytes(_out)
-    _got = _math.sqrt(sum(v * v for v in _a) / len(_a))
-    _good = _lo <= _got <= _hi
+    _got = _aud(_out)
+    _pk = max(abs(v) for v in _a)
+    _good = _lo <= _got <= _hi and (_peak is None or _pk <= _peak)
     ng += not _good
-    print("%s %s: rms %.0f" % ("OK" if _good else "NG", _memo, _got))
+    print("%s %s: 可聴帯 %.0f peak %d" % ("OK" if _good else "NG", _memo,
+                                          _got, _pk))
 
 # 相槌に返事するのは直後の 1 回だけ（環境音との無限おしゃべり防止・
 # 2026-08-08 実機で 8 連続の独り言）

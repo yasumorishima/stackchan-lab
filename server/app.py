@@ -517,10 +517,13 @@ OJT_TRIM_LEVEL = int(os.environ.get("OJT_TRIM_LEVEL", "60"))
 OJT_KEEP_HEAD = float(os.environ.get("OJT_KEEP_HEAD", "0.02"))
 OJT_KEEP_TAIL = float(os.environ.get("OJT_KEEP_TAIL", "0.08"))
 OJT_END_PAUSE = float(os.environ.get("OJT_END_PAUSE", "0.12"))
-# 会話の声を歌にそろえる目標（有声部の実効値）。歌（VOICEVOX の作り置き）
-# は 3265〜3495、会話（Open JTalk）は 2376〜2384 で、user 様に「歌は
-# 聞きやすいけど会話の声は小さい」と指摘された（2026-08-08 実測）。0 で無効
-OJT_TARGET_RMS = float(os.environ.get("OJT_TARGET_RMS", "3400"))
+# 会話の声を、本体のスピーカーで歌と同じ大きさに聞かせるための整形
+# （_shape_for_speaker）。実測値の根拠はその関数の説明を見る
+OJT_SPK_HPF = float(os.environ.get("OJT_SPK_HPF", "400"))    # ここ以下を落とす
+OJT_SPK_TARGET = float(os.environ.get("OJT_SPK_TARGET", "3200"))  # 可聴帯の目標
+OJT_SPK_PEAK = float(os.environ.get("OJT_SPK_PEAK", "30000"))     # 割れない上限
+OJT_COMP_TARGET = float(os.environ.get("OJT_COMP_TARGET", "6000"))
+OJT_COMP_MAX = float(os.environ.get("OJT_COMP_MAX", "3.0"))
 # 読みが遅くないかを毎回ログに出す（診断用。既定は出さない）。
 OJT_LOG_PACE = os.environ.get("OJT_LOG_PACE", "") not in ("", "0")
 OJT_SMALL_KANA = "ぁぃぅぇぉゃゅょゎヵヶァィゥェォャュョヮっッ"
@@ -724,32 +727,80 @@ async def _synth_checked(text: str, rounds: int = OJT_RESPLIT_ROUNDS):
     return out
 
 
-def _match_song_loudness(pcm: bytes) -> bytes:
-    """会話の声を歌の音量にそろえる（有声部の実効値を OJT_TARGET_RMS へ）。
+def _hipass(a, fc, order=2):
+    """fc 以下を落とす（周波数側で掛ける。scipy を入れずに済ませる）。"""
+    import numpy as np
+    n = len(a)
+    f = np.fft.rfftfreq(n, 1.0 / DOWN_RATE)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        h = (f ** order) / (f ** order + float(fc) ** order)
+    h[0] = 0.0
+    return np.fft.irfft(np.fft.rfft(a) * h, n)
 
-    枠 20ms の実効値が 200 を超える所だけを「声」として測る（前後の無音や
-    句読点の間を混ぜると、間の多い返事ほど過剰に持ち上がる）。返事 1 回に
-    一様なゲインを掛ける（片ごとに掛けると片どうしで音量が揺れる）。
-    割れないようピークが 31000 を超えない範囲で頭打ち。小さくする方向には
-    使わない（元から大きい声はそのまま）。
+
+def _audible_rms(a):
+    """スピーカーが鳴らせる帯（500〜4000Hz）の実効値。聞こえの大きさの物差し。"""
+    import numpy as np
+    n = len(a)
+    f = np.fft.rfftfreq(n, 1.0 / DOWN_RATE)
+    band = np.fft.rfft(a) * ((f >= 500) & (f < 4000))
+    return float(np.sqrt((np.fft.irfft(band, n) ** 2).mean()))
+
+
+def _autolevel(a):
+    """ゆっくりした自動音量。小さい所だけ持ち上げ、大きい所は 1 倍のまま。
+
+    枠 20ms の実効値を 150ms でならしてから掛ける（速く掛けると 1 語ごとに
+    音量が波打つ）。無音を持ち上げて雑音を出さないよう、静かすぎる枠は
+    さわらない。
     """
-    if OJT_TARGET_RMS <= 0 or len(pcm) < 4 or len(pcm) % 2:
+    import numpy as np
+    f = max(1, int(DOWN_RATE * 0.02))
+    n = len(a) // f
+    if n < 2:
+        return a
+    env = np.sqrt((a[: n * f].reshape(n, f) ** 2).mean(axis=1))
+    w = max(1, int(0.15 / 0.02))
+    k = np.ones(w) / w
+    sm = np.convolve(np.maximum(env, 1.0), k, mode="same")
+    g = np.where(sm < 300.0, 1.0,
+                 np.clip(OJT_COMP_TARGET / sm, 1.0, OJT_COMP_MAX))
+    g = np.convolve(g, k, mode="same")
+    gg = np.repeat(g, f)
+    if len(gg) < len(a):
+        gg = np.concatenate([gg, np.full(len(a) - len(gg), gg[-1])])
+    return a * gg[:len(a)]
+
+
+def _shape_for_speaker(pcm: bytes) -> bytes:
+    """本体の小さいスピーカーで、歌と同じ大きさに聞こえるように整える。
+
+    user 様に「歌は大きくて聞きやすいのに会話の声は小さい」と 2 度言われた
+    （2026-08-08）。実効値をそろえても直らなかったので中身を測ったところ、
+    **鳴っている帯がまるで違った**:
+      歌（VOICEVOX 女声）  … 500Hz 以上に 90% 以上
+      会話（Open JTalk 男声）… 500Hz 未満に 73〜84%（1.5kHz 以上はほぼ皆無）
+    本体のスピーカーは小さく低音を鳴らせないので、同じ実効値でも会話だけ
+    聞こえない。そこで
+      1. 400Hz 以下を落とす（鳴らない音でピーク（=上げられる余地）を埋めない）
+      2. ゆっくりした自動音量で小さい所を持ち上げる
+      3. 歌と同じ**可聴帯（500〜4000Hz）の実効値**になるまで上げる（割れない
+         ようピークで頭打ち）
+    実測: 可聴帯 964〜1467 → 2484〜3020（歌は 2946〜3192）。
+    OJT_SPK_HPF=0 で無効。
+    """
+    if OJT_SPK_HPF <= 0 or len(pcm) < 4 or len(pcm) % 2:
         return pcm
     import numpy as np
-    a = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
-    frame = max(1, int(DOWN_RATE * 0.02))
-    n = len(a) // frame
-    if n == 0:
-        return pcm
-    rms = np.sqrt((a[: n * frame].reshape(n, frame) ** 2).mean(axis=1))
-    voiced = rms[rms > 200]
-    if not len(voiced):
-        return pcm
-    cur = float(np.sqrt((voiced ** 2).mean()))
+    a = np.frombuffer(pcm, dtype=np.int16).astype(np.float64)
+    if _audible_rms(a) < 50.0:
+        return pcm                       # 無音・雑音だけの断片はさわらない
+    a = _autolevel(_hipass(a, OJT_SPK_HPF))
+    cur = _audible_rms(a)
     peak = float(np.abs(a).max())
-    gain = min(OJT_TARGET_RMS / max(cur, 1.0), 31000.0 / max(peak, 1.0))
-    if gain <= 1.02:
+    if cur < 1.0 or peak < 1.0:
         return pcm
+    gain = min(OJT_SPK_TARGET / cur, OJT_SPK_PEAK / peak)
     return np.clip(a * gain, -32768.0, 32767.0).astype(np.int16).tobytes()
 
 
@@ -765,7 +816,7 @@ async def openjtalk_tts(text: str) -> bytes:
         parts.extend(await _synth_checked(seg))
     gap = bytes(2 * int(DOWN_RATE * 0.12))
     joined = gap.join(_trim_silence(p) for p in parts)
-    joined = _match_song_loudness(joined)
+    joined = _shape_for_speaker(joined)
     return joined + bytes(2 * int(DOWN_RATE * OJT_END_PAUSE))
 
 
@@ -950,8 +1001,11 @@ async def transcribe(session, pcm: bytes) -> str:
         text = await local_stt.transcribe(STT_BACKEND, pcm, UP_RATE)
         secs = len(pcm) / 2 / UP_RATE
         took = time.monotonic() - t0
-        log.info("stt(%s) %.2fs audio in %.2fs (rtf %.2f): %s",
-                 STT_BACKEND, secs, took, took / max(secs, 1e-6), text)
+        # 渡した長さ（切り出したあと）も出す。遅いときに「認識器が遅い」のか
+        # 「無駄に長いものを渡している」のかを、後からログで切り分けるため
+        kept = local_stt.last_kept_sec()
+        log.info("stt(%s) %.2fs audio (渡した %.2fs) in %.2fs (rtf %.2f): %s",
+                 STT_BACKEND, secs, kept, took, took / max(secs, 1e-6), text)
         return text
     if STT_BACKEND == "sakura":
         return await sakura_stt(session, pcm)
@@ -1603,7 +1657,10 @@ async def ws_handler(request: web.Request):
             if queued and reply.startswith("うまく答えられませんでした"):
                 # 歌は用意できているのに「答えられません」と言わせない。
                 # モデルが本文を返さず往復の上限に当たった時に起きる
-                reply = "%sの応援歌を歌うね。" % queued["name"]
+                # 差し替えは clean_reply の後なので、読みの置換だけ改めて
+                # 通す（実測 2026-08-08 07:52: 差し替え文の「度会隆輝」が
+                # 素通りして「タカテル」と読まれた）
+                reply = fix_reading("%sの応援歌を歌うね。" % queued["name"])
                 log.info("本文が無いので歌の一言に差し替えた")
             log.info("LLM: %s", reply)
             await send_json({"type": "llm", "emotion": "happy", "text": "😀"})
