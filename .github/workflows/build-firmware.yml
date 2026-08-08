@@ -1,0 +1,76 @@
+name: Build Stack-chan firmware (wake word disabled)
+
+# 本体は既定で「Hi, StackChan」と聞こえるまで音声を送らない
+# （sdkconfig.defaults の CONFIG_SR_WN_WN9_HISTACKCHAN_TTS3 / SEND_WAKE_WORD_DATA=n）。
+# 呼びかけずに話しかけるだけで会話を始めたいので、起動語を切ったファームを作る。
+# ⚠️ 出来たバイナリは書き込まない。書き込みは user 様の明示指示があってから。
+on:
+  workflow_dispatch:
+    inputs:
+      memo:
+        description: 実行の意図
+        required: true
+      wake_word:
+        description: 起動語の扱い（disabled = 常時サーバーへ送る / keep = 既定のまま）
+        required: true
+        default: disabled
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.5.4
+    steps:
+      - name: 上流のファームを取得
+        run: |
+          git clone --depth 1 https://github.com/m5stack/StackChan.git src
+          cd src && git log -1 --format='%H %s'
+
+      - name: 依存を取得（patch もここで当たる）
+        working-directory: src/firmware
+        run: python3 ./fetch_repos.py
+
+      - name: 起動語を切る
+        if: ${{ github.event.inputs.wake_word == 'disabled' }}
+        working-directory: src/firmware
+        run: |
+          echo '--- 変更前 ---'
+          grep -nE 'WAKE|SR_WN' sdkconfig.defaults || true
+          # 起動語モデルを外し、常に音声を送る
+          sed -i '/CONFIG_SR_WN_WN9_HISTACKCHAN_TTS3=y/d' sdkconfig.defaults
+          sed -i '/CONFIG_SEND_WAKE_WORD_DATA=/d' sdkconfig.defaults
+          {
+            echo 'CONFIG_WAKE_WORD_DISABLED=y'
+            echo 'CONFIG_USE_AFE_WAKE_WORD=n'
+            echo 'CONFIG_USE_ESP_WAKE_WORD=n'
+            echo 'CONFIG_USE_CUSTOM_WAKE_WORD=n'
+          } >> sdkconfig.defaults
+          echo '--- 変更後 ---'
+          grep -nE 'WAKE|SR_WN' sdkconfig.defaults || true
+
+      - name: ビルド
+        working-directory: src/firmware
+        shell: bash
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py set-target esp32s3
+          idf.py build
+
+      - name: 出来たものを確認
+        working-directory: src/firmware
+        run: |
+          ls -la build/*.bin
+          # 0x0 から書けるマージ済みイメージを作る（公式配布と同じ形）
+          . $IDF_PATH/export.sh
+          esptool.py --chip esp32s3 merge_bin -o build/stackchan-nowake.bin \
+            @build/flash_args || esptool.py --chip esp32s3 merge-bin \
+            -o build/stackchan-nowake.bin @build/flash_args
+          ls -la build/stackchan-nowake.bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stackchan-firmware
+          path: |
+            src/firmware/build/stackchan-nowake.bin
+            src/firmware/build/*.bin
+            src/firmware/sdkconfig
+          retention-days: 7
