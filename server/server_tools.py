@@ -2532,6 +2532,9 @@ def _yomi(text: str) -> str:
     return kana
 
 
+_NOT_A_NAME_RE = re.compile(r"テーマ|その他")
+
+
 def _find_player(songs: dict, who: str):
     """言われた名前で引く。姓だけ・名だけでも当てる。1 人に絞れなければ None。"""
     q = _norm_name(who)
@@ -2562,14 +2565,18 @@ def _find_player(songs: dict, who: str):
     # 聞き取りは助詞を名前にくっつける（「牧の応援歌」→「牧野応援歌」→
     # 名前「牧野」）。姓は先頭にあるので、**末尾を削って引き直す**。
     # 1 文字まで削るが、**1 人に絞れた時だけ**採るので取り違えない
+    # ⚠️ 救済の対象は**人名の見出しだけ**。テーマ系・その他系を混ぜると、
+    # 「大谷翔平」が 1 文字「大」まで削られ読み ダイ で「代打のテーマ」
+    # （ダイダノテーマ）に前方一致してしまう（2026-08-09 実測）
+    persons = [x for x in table if not _NOT_A_NAME_RE.search(x)]
     for n in range(len(q) - 1, 0, -1):
         head = q[:n]
-        hit = [x for x, v in table.items() if v.startswith(head)]
+        hit = [x for x in persons if table[x].startswith(head)]
         if len(hit) == 1:
             return hit[0]
         hr = _yomi(head)
         if hr:
-            hit = [x for x, v in reads.items() if v and v.startswith(hr)]
+            hit = [x for x in persons if reads.get(x) and reads[x].startswith(hr)]
             if len(hit) == 1:
                 return hit[0]
     return None
