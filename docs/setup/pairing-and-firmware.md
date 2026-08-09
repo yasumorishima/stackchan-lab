@@ -40,7 +40,7 @@ I (112440) NimBLE: Config notification sent
 - 本体は応答も返している（`Config notification sent`）
 - **その直後、アプリからは何も来ない**（切断ログすら出ない）
 
-つまり `No devices found` は実態と違う表示で、**止まっていたのは探索ではなく「本体が返した応答の検証」**でした。
+つまり `No devices found` は実態と違う表示で、**止まっていたのは探索ではなく「本体が返した応答の検証」でした**。
 
 アプリ側の実装（[m5stack/StackChan](https://github.com/m5stack/StackChan) にアプリのソースも同居）を読むと、接続 30 秒・検証 20 秒のタイムアウトを持ち、失敗時のメッセージとして `Device did not return encryption data.` / `Device verification decryption failed.` が用意されていて、検証を通過してからサーバーにデバイスを登録する流れになっています。
 
