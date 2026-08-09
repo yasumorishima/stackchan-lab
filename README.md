@@ -56,6 +56,20 @@ https://github.com/user-attachments/assets/c8362b72-3d51-4fe3-9bae-85891034855b
 
 さらに **新ファームは OTA → OTA には Wi-Fi → Wi-Fi 設定にはアプリのペアリング** という循環になっており、**USB 書き込み以外に出口がありません**。詳細は [初期設定とペアリング不能問題](docs/setup/pairing-and-firmware.md) を参照してください。
 
+## さくらのAI Engine について実測で分かったこと
+
+会話の頭脳に **[さくらのAI Engine](https://ai.sakura.ad.jp/sakura-ai/ai-engine/)** の `gpt-oss-120b` を使っています。使う前に迷いやすい点を、実際に API を叩いて確かめた結果として残します（2026-08-09 時点）。
+
+**「OpenAI・Anthropic 互換」の Anthropic 互換は、API の形式が互換という意味です。Claude が使えるわけではありません。**
+
+- `POST /v1/messages`（Anthropic 形式）は**実際に動きます**。返る形も Anthropic のもので、`content` ブロック・`stop_reason`・`usage.input_tokens` が揃っています。ただし**応答するのは `gpt-oss-120b`** です
+- Claude を指定すると拒否されます。`claude-sonnet-4-20250514` も `claude-3-5-sonnet-20241022` も `{"error":{"message":"This model is not available."}}` でした
+- `GET /v1/models` で配布モデルを一覧すると **12 個すべて `owned_by: "sakura"` の公開ウェイトモデル**（`gpt-oss-120b` / `llm-jp-3.1-8x13b-instruct4` / `Kimi-K2.6` / `Qwen3.6-35B-A3B` / `gemma-4-31B-it` / `Phi-4-mini` / `whisper-large-v3-turbo` / `multilingual-e5-large` ほか）で、Anthropic のモデルは含まれません
+
+つまり **OpenAI 互換と Anthropic 互換のどちらを選んでも、動くモデルは同じ**です。違うのはリクエストとレスポンスの形だけなので、既存コードが喋る方言に合わせて選べば十分です。このサーバーは Ollama から移してきた経緯があり、`POST /v1/chat/completions` のまま接続先とモデル名の 2 行だけ書き換えて動きました。
+
+**無償枠まわり**（公式ページの記載）: 基盤モデル無償プランと従量課金プランは別のプランで、**自動的に従量課金プランへ移行することはありません**。無償枠を超えた場合は課金ではなく**レート制御**がかかります。利用量は**API では取れない**ので、このサーバーは自分で数えて `get_llm_quota` という道具にしています（数え漏れがあることも一緒に答えさせています）。
+
 ## ツール
 
 | ツール | 用途 |
