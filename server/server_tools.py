@@ -2496,18 +2496,25 @@ _OJT_VOICE = os.environ.get(
     "OPENJTALK_VOICE",
     "/usr/share/hts-voice/nitech-jp-atr503-m001/nitech_jp_atr503_m001.htsvoice")
 _READINGS: dict = {}
+_MORPHS: dict = {}
 
 
-def _yomi(text: str) -> str:
-    """その字の読み（カタカナ）。取れなければ空。"""
+def _ojt_morphs(text: str):
+    """Open JTalk の形態素解析の行（カンマ区切りの列の並び）を返す。
+
+    合成に使っているのと同じ辞書（naist-jdic）。列は
+    0=表層 1=品詞 … 8=読み 9=発音。**8 と 9 は違う**（助詞「へ」は
+    読み ヘ／発音 エ）ので、用途で使い分ける。
+    """
     text = str(text or "").strip()
     if not text:
-        return ""
-    if text in _READINGS:
-        return _READINGS[text]
+        return []
+    hit = _MORPHS.get(text)
+    if hit is not None:
+        return hit
     import subprocess
     import tempfile
-    out = kana = ""
+    out = ""
     try:
         with tempfile.TemporaryDirectory() as tmp:
             trace = os.path.join(tmp, "t.txt")
@@ -2518,8 +2525,46 @@ def _yomi(text: str) -> str:
             if r.returncode == 0 and os.path.exists(trace):
                 out = open(trace, encoding="utf-8", errors="replace").read()
     except Exception as e:                            # noqa: BLE001
-        log.warning("読みが取れない: %s: %s", type(e).__name__, e)
+        log.warning("形態素が取れない: %s: %s", type(e).__name__, e)
+    rows = []
     for line in out.splitlines():
+        if not line or line.startswith("["):
+            continue
+        if line.startswith("0 ") or "^" in line:      # ここからは音素の並び
+            break
+        cols = line.split(",")
+        if len(cols) > 8:
+            rows.append(cols)
+    if rows:                 # 失敗（timeout 等）を覚え込まない
+        _MORPHS[text] = rows
+    return rows
+
+
+def first_morph(text: str):
+    """先頭の形態素 (表層, 品詞, 発音)。取れなければ None。
+
+    「は」「へ」が助詞か語の一部かを決めるのに使う。規則では当てられない
+    （空白の無い歌詞では「しょうりへみちびけ」の へ が語末に見えず、
+    「みせつけろへらる」の へ は ヘラルド の一部）ので辞書に訊く。
+    実測 2026-08-23: 公式歌詞 25 曲の「は」「へ」24 箇所すべてで人手の
+    正解と一致した（`test_particle.py`）。
+    """
+    rows = _ojt_morphs(text)
+    if not rows:
+        return None
+    c = rows[0]
+    return (c[0], c[1], c[9] if len(c) > 9 else "")
+
+
+def _yomi(text: str) -> str:
+    """その字の読み（カタカナ）。取れなければ空。"""
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    if text in _READINGS:
+        return _READINGS[text]
+    kana = ""
+    for line in [",".join(c) for c in _ojt_morphs(text)]:
         if not line or line.startswith("["):
             continue
         if line.startswith("0 ") or "^" in line:      # ここからは音素の並び
@@ -2534,6 +2579,17 @@ def _yomi(text: str) -> str:
 
 _NOT_A_NAME_RE = re.compile(r"テーマ|その他")
 
+# 聞き取りが繰り返し返す別の字。音は近いのに読みの近さでは届かないもの
+# だけをここに置く（実ログで複数回出たものに限る）。**規則で当てにいかず
+# 教わった通り足す**: 音の近さの救済 `_nearest_by_sound` で拾えるものは
+# 書かない。2026-08-23 に server.log 全体から拾った実例
+_MISHEARD = {
+    "不合": "筒香嘉智",        # フゴウ（不都合 は音の近さで拾える）
+    "渡来": "度会隆輝",        # トライ
+    "小柱": "戸柱恭孝",        # ショウハシラ
+    "杭秀秀": "牧秀悟",        # クイシュウシュウ
+}
+
 
 def _find_player(songs: dict, who: str):
     """言われた名前で引く。姓だけ・名だけでも当てる。1 人に絞れなければ None。"""
@@ -2543,6 +2599,10 @@ def _find_player(songs: dict, who: str):
     table = {n: _norm_name(n) for n in songs}
     if q in songs:
         return q
+    alias = _MISHEARD.get(q)
+    if alias and alias in songs:
+        log.info("聞き取りの常連の誤り %s を %s とみなした", q, alias)
+        return alias
     # 姓は名前の**先頭**にある。途中一致より先に前方一致を見ないと、
     # 「森」が 森敬斗 と 三森大貴 の 2 件に当たって絞れない（実測 2026-08-05）
     for pick in (lambda q_, v: q_ == v,
@@ -2579,7 +2639,62 @@ def _find_player(songs: dict, who: str):
             hit = [x for x in persons if reads.get(x) and reads[x].startswith(hr)]
             if len(hit) == 1:
                 return hit[0]
-    return None
+    # 字も読みも当たらない時の最後の救済。**聞き取りは音は合っているのに
+    # 別の字を当てる**（実ログ: 神里→上里・筒香→不都合/不合・度会→田谷隆輝/
+    # 雪度会/度洗・牧→牧野）。姓は先頭にあるので、選手の読みの**頭だけ**と
+    # 比べて一番近いものを採る。
+    # 目安は実ログの誤認識 22 件と、選手でない語 18 件で測って決めた
+    # （0.5 未満まで採ると 阿部・雲・物 のような雑音まで選手になる）
+    best = _nearest_by_sound(qr, reads, persons, q)
+    if best:
+        log.info("聞き取りの字が違うとみて 読み %s から %s で引いた", qr, best)
+    return best
+
+
+# 読みの近さの下限。これ未満は「その選手はいない」と答える
+SOUND_MIN = float(os.environ.get("SOUND_MIN", "0.5"))
+# 字が 1 つも重ならない時に採るための、もっと厳しい下限
+SOUND_MIN_NO_KANJI = float(os.environ.get("SOUND_MIN_NO_KANJI", "0.65"))
+
+
+def _sound_score(qr: str, pr: str) -> float:
+    """言われた読みと、選手の読みの**頭**との近さ（0〜1）。
+
+    選手の読みは姓＋名なので、丸ごと比べると名のぶんだけ薄まる
+    （実測: ウエサト×カミサトカズキ=0.36 で、無関係な スズキ=0.40 に負ける）。
+    頭の長さを言われた語の前後 2 モーラで振って、一番近い所を採る。
+    **1 文字だけの頭とは比べない**（モノ×モ=0.67 のように、短い頭は偶然
+    高く出て「雲」「物」まで選手になる。実測 2026-08-23）。
+    """
+    import difflib
+    best = 0.0
+    for k in range(max(2, len(qr) - 2), min(len(pr), len(qr) + 2) + 1):
+        best = max(best, difflib.SequenceMatcher(None, qr, pr[:k]).ratio())
+    return best
+
+
+def _shares_kanji(a: str, b: str) -> bool:
+    """漢字を 1 つでも共有するか。聞き取りの誤りは音が合っていて字が近い
+    （上里/神里 は「里」、度洗/度会 は「度」、田谷隆輝/度会隆輝 は「隆輝」）。
+    逆に無関係な語（岡本・村上・中村）は 1 つも重ならない。"""
+    ka = set(c for c in a if "一" <= c <= "鿿")
+    return bool(ka & set(c for c in b if "一" <= c <= "鿿"))
+
+
+def _nearest_by_sound(qr: str, reads: dict, persons: list, who: str = ""):
+    """読みが一番近い選手。決め手に欠ける（同点・遠い）なら None。"""
+    if not qr:
+        return None
+    rank = sorted(((_sound_score(qr, reads[n]), n)
+                   for n in persons if reads.get(n)), reverse=True)
+    if len(rank) < 2:
+        return None
+    (s1, n1), (s2, _n2) = rank[0], rank[1]
+    if s1 < SOUND_MIN or s1 <= s2:        # 同点は取り違えるので採らない
+        return None
+    if s1 < SOUND_MIN_NO_KANJI and not _shares_kanji(who, n1):
+        return None
+    return n1
 
 
 async def sing_cheer_song(session, args, ctx=None) -> str:

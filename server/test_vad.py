@@ -111,6 +111,28 @@ def main():
     check("環境音そのものは発話にしない",
           st3["speech_ms"] < app.VAD_MIN_SPEECH_MS, True)
 
+    # 語の中の谷で切らない（user 実機 2026-08-23「反応がにぶい、まれに
+    # 反応したりで、とても使いづらい」）。実機ログでは声の最大 rms が
+    # 200〜540 の発話 30 件がすべて「あ」「あれ」の断片になっていた。
+    # 山 450 / 谷 300 / 環境音 200 は、その 12:00〜12:24 の実測帯。
+    # 谷は 0.96 秒＝VAD_SILENCE（本番 600ms / 既定 800ms）より長くする
+    st = fresh()
+    run(st, [(200.0, 60)])                    # 部屋の静けさ（敷居 400 / 続き 240）
+    word = [(450.0, 6), (300.0, 16), (450.0, 6)]   # 山・谷・山＝1 つの語
+    got = run(st, word)
+    check("語の中の谷（敷居未満）で切らない", got is None, True)
+    got = run(st, [(200.0, 20)])
+    check("語が終わってからちゃんと切れる", got is not None, True)
+    check("切れた時 speech_ms は谷ぶんも入る",
+          st["speech_ms"] >= 1000.0, True)
+    # 下げた敷居は**開けっ放しにしない**。物音で話し始めたことになっても、
+    # そのあと環境音だけなら普通に切れる（VAD_MAX まで抱え込まない）
+    st = fresh()
+    run(st, [(200.0, 60)])
+    got = run(st, [(450.0, 6), (300.0, 400)])
+    check("環境音が続いても VAD_MAX 前に切れる",
+          got is not None and got < int(app.VAD_MAX_MS / MS), True)
+
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

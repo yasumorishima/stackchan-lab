@@ -238,6 +238,7 @@ def _share_phrase(notes, morae):
 
 
 # 掛け声だけの行（「オオオオー」等）。音程を持たないので旋律に乗せない
+_LONG_RE = re.compile(r"[ー〜～]")
 _CHANT_RE = re.compile(r"^[オぉおー\s！!・]*$")
 # 🔴 歌の前の掛け声が「普通の歌詞に見える」曲がある。文字では判別できないので
 # **曲ごとの事実として持つ**（値 = 歌が始まる行番号）。user 様の指摘で埋める。
@@ -256,6 +257,14 @@ TAIL_CHANT = {"筒香嘉智": 1}
 SUNG_LINES = {
     "柴田竜拓": ["ねらーいすましたミートと", "たくみな グラブさばきは",
                  "どりょくという かけらの", "けっしょうの あかしだ"],
+    # 度会: 「しょうり」を 1 音 1 モーラで配ると しょ(4) う(3) り(1) になり、
+    # う が伸びて り が潰れる（user 実機 2026-08-23「打てよー、しょおおりの
+    # ためにー になってる。正しくは 勝利のためにー」）。**う を長音として
+    # 前にくっつける**と しょー(4) り(3) の(1) た め に(12) になり、
+    # 「しょうりー…ためにー」の形になる。譜面自体は別動画の採譜と
+    # 完全一致（残差 0.00 半音）＝読み取りではなく歌詞の配り方の問題
+    "度会隆輝": ["きらめく このそらに", "ゆめのきどう えがけ",
+                 "いま このかんせい", "うてよ しょーりのために"],
 }
 
 
@@ -264,9 +273,52 @@ _PARTICLE_RE = re.compile(r"は(?=\s|$)")
 _PARTICLE_HE_RE = re.compile(r"へ(?=\s|$)")
 
 
+# 助詞の発音（カタカナ）を歌詞の平仮名に戻す
+_PARTICLE_KANA = {"ワ": "わ", "エ": "え"}
+
+
+def _is_particle(rest):
+    """`rest` の先頭 1 文字が助詞か。辞書が引けなければ None（分からない）。"""
+    try:
+        import server_tools
+        got = server_tools.first_morph(rest)
+    except Exception:                                  # noqa: BLE001
+        return None
+    if not got:
+        return None
+    surface, pos, pron = got
+    if surface != rest[0] or "助詞" not in pos:
+        return False
+    return _PARTICLE_KANA.get(pron)
+
+
 def read_particles(line):
-    """歌うときの読みに直す。語末・行末の「は」→「わ」、「へ」→「え」。"""
-    return _PARTICLE_HE_RE.sub("え", _PARTICLE_RE.sub("わ", line))
+    """歌うときの読みに直す。助詞の「は」→「わ」、「へ」→「え」。
+
+    **どこが助詞かは辞書に訊く**（Open JTalk の形態素解析＝合成に使うのと
+    同じ naist-jdic）。規則では当てられない: 公式歌詞は空白がまばらで
+    「しょうりへみちびけ」の へ は語末に見えず読み替えられていなかった
+    （user 実機指摘 2026-08-23「へ が え の発音になってない」。林・松尾・
+    戸柱・石上・梶原 の 5 曲）。逆に「みせつけろへらる」の へ は
+    ヘラルド の一部なので読み替えてはいけない。
+    実測 2026-08-23: 公式歌詞 25 曲の「は」「へ」24 箇所すべてで人手の
+    正解と一致した（`test_particle.py`）。
+    辞書が引けない時は、従来どおり語末・行末だけ読み替える（fail-safe）。
+    """
+    out = []
+    fallback = False
+    for i, c in enumerate(line):
+        if c in ("は", "へ"):
+            got = _is_particle(line[i:])
+            if got is None:
+                fallback = True
+                break
+            out.append(got or c)
+        else:
+            out.append(c)
+    if fallback:
+        return _PARTICLE_HE_RE.sub("え", _PARTICLE_RE.sub("わ", line))
+    return "".join(out)
 
 
 def drop_chant(lines, name=""):
@@ -321,6 +373,19 @@ def drop_strays(notes):
     return notes
 
 
+def _long_mora_index(ms):
+    """2 モーラ以上を 1 音に詰めるとき、**伸ばす側**のモーラの番号。
+
+    既定は最後（「ためにー」＝長音が後ろ）。ただし前のモーラが長音を持ち、
+    最後が持たないなら前を伸ばす（「ロード」＝ロー+ド）。
+    """
+    if not _LONG_RE.search(ms[-1]):
+        for i, m in enumerate(ms[:-1]):
+            if _LONG_RE.search(m):
+                return i
+    return len(ms) - 1
+
+
 def build(sheet, lines, moras, name=""):
     """(音符, テンポ, モーラ数, コール行) を返す。
 
@@ -364,14 +429,17 @@ def build(sheet, lines, moras, name=""):
             out.append([None, n["t16"] - t, ""])          # 休み
         pitch = to_pitch(n["semi"])
         if len(ms) > 1 and n["len16"] >= len(ms) + 1:
-            # 詰め込みの 2 モーラは「先を短く・後を残り全部で伸ばす」。
-            # 1 音のまま渡すと均等割り（sing_vv._spread）になり、
-            # 「ためにー」が「ためー・にー」に化ける（user 指摘 2026-08-08）
+            # 詰め込みの 2 モーラは片方だけ伸ばす（1 音のまま渡すと均等割り
+            # sing_vv._spread になり「ためにー」が「ためー・にー」に化ける・
+            # user 指摘 2026-08-08）。**伸ばすのは長音を持つ方**。
+            # 既定の「後ろを伸ばす」だけだと、長音が前にある「ロード」が
+            # 「ロ・ドーーー」＝「ロドー」に化ける（user 指摘 2026-08-23・
+            # 佐野の末尾。譜面自体は 3 本の動画の採譜が一致していて正しい）
             lead = 1 if n["len16"] < 4 else 2
+            long_at = _long_mora_index(ms)
             rest = n["len16"] - lead * (len(ms) - 1)
-            for m in ms[:-1]:
-                out.append([pitch, lead, m])
-            out.append([pitch, rest, ms[-1]])
+            for i, m in enumerate(ms):
+                out.append([pitch, rest if i == long_at else lead, m])
         else:
             out.append([pitch, n["len16"], "".join(ms)])
         t = n["t16"] + n["len16"]

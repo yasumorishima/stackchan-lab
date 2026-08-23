@@ -120,14 +120,33 @@ VAD_RMS_MAX = float(os.environ.get("VAD_RMS_MAX", "600"))
 VAD_FLOOR_RISE = float(os.environ.get("VAD_FLOOR_RISE", "0.02"))
 
 
-def vad_threshold(state) -> float:
-    """いま声とみなす下限。静かな部屋では下がり、うるさい部屋では上がる。"""
+# 話し始めたあとは敷居を下げる（ヒステリシス）。**1 つの敷居で切ると語の
+# 途中で切れる**: 声の大きさは語の中で 3 倍以上ゆれるので、山だけが敷居を
+# 越えて谷が「無音」になり、VAD_MIN_SPEECH(0.3s)+VAD_SILENCE(0.6s) で
+# 語の頭だけ掃き出してしまう。実測 2026-08-23 12:00〜12:24 の実機ログ:
+# 声の最大 rms が 200〜540 の発話 30 件はすべて「あ」「あれ」「あっ」に
+# なり、相槌の門番で無応答（user「反応がにぶい、まれに反応したりで、
+# とても使いづらい」）。同じ人が 980 以上で話した 8 件は全文が通っている
+VAD_CONT_RATIO = float(os.environ.get("VAD_CONT_RATIO", "0.6"))
+# 敷居を下げておく時間。**下げっぱなしにはしない**（物音で話し始めたことに
+# なると、その後は環境音でも「まだ喋っている」ことになり VAD_MAX まで
+# 抱え込む）。語の中の谷を跨げれば足りるので短くてよい
+VAD_CONT_MS = float(os.environ.get("VAD_CONT_MS", "1200"))
+
+
+def vad_threshold(state, started: bool = False) -> float:
+    """いま声とみなす下限。静かな部屋では下がり、うるさい部屋では上がる。
+
+    `started`（もう話し始めている）なら下げる。話し始めを見つける敷居と、
+    続きを追う敷居は別物でよい。
+    """
     if not VAD_ADAPT:
-        return VAD_RMS
-    floor = state.get("floor")
-    if floor is None:
-        return VAD_RMS
-    return min(VAD_RMS_MAX, max(VAD_RMS_MIN, floor * VAD_RMS_MULT))
+        base = VAD_RMS
+    else:
+        floor = state.get("floor")
+        base = (VAD_RMS if floor is None
+                else min(VAD_RMS_MAX, max(VAD_RMS_MIN, floor * VAD_RMS_MULT)))
+    return base * VAD_CONT_RATIO if started else base
 # 受信バッファの絶対上限（フレーム数）。VAD が効かない手動モードの保険
 MAX_BUFFER_FRAMES = int(float(os.environ.get("MAX_BUFFER_MS", "120000")) / 60.0)
 # 読み上げが本体で鳴り終わるまでの余裕。短いと自分の声を拾って再認識する
@@ -219,10 +238,17 @@ def vad_step(state, ms: float, rms: float) -> bool:
     state["buffered_ms"] += ms
     if rms > state["max_rms"]:
         state["max_rms"] = rms
-    limit = vad_threshold(state)
+    start_thr = vad_threshold(state)
+    # 「大きい声からどれだけ経ったか」。これが短い間だけ敷居を下げる
+    quiet = state.get("quiet_ms", 0.0)
+    started = state["speech_ms"] > 0.0 and quiet <= VAD_CONT_MS
+    limit = vad_threshold(state, started)
+    state["quiet_ms"] = 0.0 if rms >= start_thr else quiet + ms
+    state["limit"] = limit
     # 静かなときの水準は「敷居を下回ったフレーム」だけでゆっくり追う。
-    # 声そのもので上がると自分の首を絞める
-    if rms < limit:
+    # 声そのもので上がると自分の首を絞める。**下げた敷居では追わない**
+    # （続きを追っている間に水準が上がると、次の発話の頭が拾えなくなる）
+    if rms < vad_threshold(state):
         floor = state.get("floor")
         state["floor"] = (rms if floor is None
                           else floor + (rms - floor) * VAD_FLOOR_RISE)
@@ -2077,8 +2103,10 @@ async def ws_handler(request: web.Request):
     def finish_listening():
         state["listening"] = False
         # 閾値を実機の音量に合わせるための材料。推測で決めない
-        log.info("この発話の最大音量 rms=%.0f（閾値 %.0f）",
-                 state["max_rms"], VAD_RMS)
+        log.info("この発話の最大音量 rms=%.0f（話し始めの閾値 %.0f / "
+                 "続きの閾値 %.0f / 静けさ %.0f）",
+                 state["max_rms"], vad_threshold(state),
+                 vad_threshold(state, True), state.get("floor") or 0.0)
         pcm = b"".join(pcm_chunks)
         pcm_chunks.clear()
         stream = state["stream"]
