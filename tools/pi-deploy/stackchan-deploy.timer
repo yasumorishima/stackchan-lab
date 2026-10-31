@@ -1,0 +1,11 @@
+[Unit]
+Description=Check GitHub main for Stack-chan server changes every 2 minutes
+
+[Timer]
+# OnActiveSec が無いと、有効にした直後は「前回の終わり」が無くて一度も動かない
+OnActiveSec=1min
+OnBootSec=3min
+OnUnitInactiveSec=2min
+
+[Install]
+WantedBy=timers.target
