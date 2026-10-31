@@ -322,6 +322,21 @@ HOST=127.0.0.1 ./.venv/bin/python test_hello_grace.py
 - **歌**（`test_sing_tool.py` / `test_sing_e2e.py` / `test_transcribe.py`）は通らない: 音源の配布ページがクラウドの IP を 403 で拒む。`cache/songs`・`cache/sheets` は手元にしか無い
 - 同じ日に直したもの: `get_baseball` はシーズンオフに速報の枠が消えると「取得先が応答しません」になっていた（今は最終順位を答える）。`get_news` は NHK の RSS が `news.web.nhk` へ移っていた
 
+### 本番のログを非公開レポに貯める（2026-10-31）
+
+実機で起きたこと（「うまく答えられませんでした」など）をクラウド側で読めるよう、
+RPi5 の `server.log` を 10 分ごとに非公開レポ `stackchan-logs` へ push する。
+`logs/<日付>.log` に増えた分だけ追記する（`ship_logs.sh`）。
+
+```bash
+# RPi5 で 1 回だけ（レポに書き込める deploy key を登録してから）
+git clone git@github.com:yasumorishima/stackchan-logs.git ~/stackchan-logs
+sudo cp stackchan-logs.service stackchan-logs.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now stackchan-logs.timer
+```
+
+ログには聞き取った言葉がそのまま残るので、**レポは必ず非公開**にする。
+
 ## 本体が繋がるのに黙って切れる時（2026-07-30）
 
 本体は接続してくるのに、こちらの受信ログが 0 行のまま 15 秒ほどで切れることがあります。

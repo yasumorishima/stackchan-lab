@@ -1,0 +1,7 @@
+[Unit]
+Description=Push Stack-chan server.log to the private log repo
+
+[Service]
+Type=oneshot
+User=yasu
+ExecStart=/home/yasu/stackchan-server/ship_logs.sh
