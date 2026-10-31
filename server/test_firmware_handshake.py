@@ -15,8 +15,8 @@ import os
 import socket
 import sys
 
-HOST = "192.168.10.111"
-PORT = 8000
+HOST = os.environ.get("HOST", "192.168.10.111")
+PORT = int(os.environ.get("PORT", "8000"))
 PATH = "/ws"
 
 headers = {

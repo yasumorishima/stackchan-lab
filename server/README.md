@@ -302,6 +302,45 @@ TEST_TEXT="今日の天気を教えて。" ./.venv/bin/python test_client.py
 SAKURA_BASE=http://127.0.0.1:8100 SAKURA_TOKEN=dummy LLM_BACKEND=sakura ./.venv/bin/python app.py
 ```
 
+`HOST` / `PORT` を変えれば試験の宛先を変えられます（既定は RPi5 の `192.168.10.111` か `127.0.0.1`）。
+`/home/yasu/stackchan-server` 決め打ちだった所は、そのファイル自身の場所を使うように直してあります。
+
+### クラウド（Claude Code on the web）で回す（2026-10-31）
+
+RPi5 を使わずに、Claude Code のクラウド環境（Ubuntu x86_64・4 コア・15GB）でも同じ試験が回ります。
+
+```bash
+./cloud_setup.sh   # 依存・認識モデル・VOICEVOX・Ollama(qwen2.5:3b) を入れる（環境の Setup script に置く）
+./cloud_up.sh      # VOICEVOX・Ollama・サーバー(8000) を起動。止めるのは ./cloud_up.sh stop
+HOST=127.0.0.1 ./.venv/bin/python test_hello_grace.py
+```
+
+`SAKURA_TOKEN` が環境変数にあれば本物のさくらへ、無ければ手元の qwen2.5:3b へ投げます。
+
+2026-10-31 に測った結果: 認識・読み上げ・握手・割り込み・天気の通し会話を含めて **歌以外はすべて通る**。
+
+- **歌**（`test_sing_tool.py` / `test_sing_e2e.py` / `test_transcribe.py`）は通らない: 音源の配布ページがクラウドの IP を 403 で拒む。`cache/songs`・`cache/sheets` は手元にしか無い
+- 同じ日に直したもの: `get_baseball` はシーズンオフに速報の枠が消えると「取得先が応答しません」になっていた（今は最終順位を答える）。`get_news` は NHK の RSS が `news.web.nhk` へ移っていた
+
+### 本番のログを非公開レポに貯める（2026-10-31）
+
+実機で起きたこと（「うまく答えられませんでした」など）をクラウド側で読めるよう、
+RPi5 の `server.log` を 10 分ごとに非公開レポ `stackchan-logs` へ push する。
+`logs/<日付>.log` に増えた分だけ追記する（`ship_logs.sh`）。
+
+```bash
+# RPi5 で 1 回だけ（レポに書き込める deploy key を登録してから）
+git clone git@github.com:yasumorishima/stackchan-logs.git ~/stackchan-logs
+sudo cp stackchan-logs.service stackchan-logs.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now stackchan-logs.timer
+sudo systemctl start stackchan-logs.service   # 初回の 1 回（これが無いとタイマーが回らない）
+```
+
+ログには聞き取った言葉がそのまま残るので、**レポは必ず非公開**にする。
+
+タイマーは有効にしただけでは回り出さない（「前回から 10 分」の基準になる実行が無い）。
+初回だけ `sudo systemctl start stackchan-logs.service` を手で叩く（2026-10-31 実測）。
+
 ## 本体が繋がるのに黙って切れる時（2026-07-30）
 
 本体は接続してくるのに、こちらの受信ログが 0 行のまま 15 秒ほどで切れることがあります。

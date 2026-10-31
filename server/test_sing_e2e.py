@@ -31,7 +31,7 @@ HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8000"))
 UP_RATE, FRAME_MS = 16000, 60
 DEVICE_ID = os.environ.get("DEVICE_ID", "aa:bb:cc:dd:ee:03")
-LOG = os.environ.get("LOG", "/home/yasu/stackchan-server/server.log")
+LOG = os.environ.get("LOG", os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.log"))
 ASK = os.environ.get("ASK", "宮﨑の応援歌を歌って")
 WHO = os.environ.get("WHO", "宮﨑")
 

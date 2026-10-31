@@ -21,6 +21,7 @@ import struct
 import tempfile
 import time
 import uuid
+import weakref
 import wave
 
 import aiohttp
@@ -1223,7 +1224,8 @@ async def transcribe(session, pcm: bytes) -> str:
 
 
 # 「◯◯の応援歌を歌って」と頼まれたか。道具が呼ばれなかった時の保険に使う
-SING_ASK_RE = re.compile(r"(.{1,12}?)\s*の\s*(?:応援歌|おうえんか|応歌)")
+# 「度会の歌歌って」のように「の歌」とだけ言うことも多い（実機 2026-10-31）
+SING_ASK_RE = re.compile(r"(.{1,12}?)\s*の\s*(?:応援歌|おうえんか|応歌|歌|うた)")
 # 歌を用意できているのに「歌えない」と言う矛盾（実機 2026-08-08 22:00）
 NEGATIVE_SONG_RE = re.compile(r"見つから|歌えな|ありません|見つけられ")
 SING_VERB_RE = re.compile(r"歌|うた|唄")
@@ -1646,6 +1648,8 @@ async def ws_handler(request: web.Request):
     # 見張りは切り、切断は本体か TCP に任せる
     ws = web.WebSocketResponse(heartbeat=None, max_msg_size=0, compress=False)
     await ws.prepare(request)
+    # 止めるときにこちらから閉じるために覚えておく（on_shutdown）
+    request.app["sockets"].add(ws)
     session: aiohttp.ClientSession = request.app["http"]
 
     device_id = request.headers.get("Device-Id", "?")
@@ -1985,11 +1989,21 @@ async def ws_handler(request: web.Request):
             # 残りを書いている時間ぶん待たなくてよい（実測 2026-08-08:
             # 1 文目 1.21 秒 / 全部 1.82 秒＝0.6 秒ぶん早く鳴り出す）。
             # 道具を使う番は本文が出ないので、その間は 1 文目を待つだけ
-            queue = asyncio.Queue()
-            feed = SentenceFeed(queue)
-            task = asyncio.create_task(respond_feeding(
-                session, state["history"], tools, call_tool, feed))
-            first = await queue.get()
+            # 歌の依頼だけは流さない。流すと、道具を呼ぶ前にモデルが書いた本文
+            # （自分の知識で作った歌詞など）が歌より先に読まれる（実機 2026-10-31）。
+            # 全部済んでから「◯◯の応援歌を歌うね。」だけ言って歌う
+            asked = sing_request_name(text)
+            if asked:
+                task = asyncio.create_task(respond(
+                    session, state["history"], tools=tools,
+                    call_tool=call_tool))
+                first = None
+            else:
+                queue = asyncio.Queue()
+                feed = SentenceFeed(queue)
+                task = asyncio.create_task(respond_feeding(
+                    session, state["history"], tools, call_tool, feed))
+                first = await queue.get()
 
             async def _no_deny(src):
                 """歌を用意できている間は否定的な文を読まない。"""
@@ -2037,7 +2051,21 @@ async def ws_handler(request: web.Request):
                 # 本文が 1 文も出なかった（モデルが黙った・道具だけで終わった）
                 reply, trace = await task
                 queued = state.get("song")
-                if queued and (reply.startswith("うまく答えられませんでした")
+                if asked and not queued:
+                    # 道具が呼ばれなかった（「歌うね」とだけ言う）。こちらで用意する
+                    ctx2 = {}
+                    try:
+                        await server_tools.sing_cheer_song(
+                            session, {"player": asked}, ctx2)
+                    except Exception as e:
+                        log.warning("頼まれた歌を用意できなかった: %s: %s",
+                                    type(e).__name__, e)
+                    if ctx2.get("song"):
+                        log.info("道具が呼ばれなかったので %s の歌を"
+                                 "こちらで用意した", asked)
+                        state["song"] = queued = ctx2["song"]
+                if queued and (asked
+                               or reply.startswith("うまく答えられませんでした")
                                or NEGATIVE_SONG_RE.search(reply or "")):
                     # 歌は用意できているのに「答えられません」と言わせない。
                     # モデルが本文を返さず往復の上限に当たった時に起きる
@@ -2241,11 +2269,27 @@ async def health(request):
 
 async def on_startup(app):
     app["http"] = aiohttp.ClientSession()
+    app["sockets"] = weakref.WeakSet()
     app["histories"] = {}      # device_id -> (最終更新, messages)
     if STT_BACKEND in LOCAL_STT:
         # 初回発話でモデル読み込みを待たせない
         await asyncio.to_thread(local_stt.warmup, STT_BACKEND)
         log.info("local stt warmed up: %s", STT_BACKEND)
+
+
+async def on_shutdown(app):
+    """開いている WebSocket をこちらから閉じる。
+
+    閉じないと aiohttp は本体が自分から切るまで待つ。本体はつなぎっぱなしに
+    するので、systemctl restart が 90 秒待たされて強制終了になっていた
+    （本番 2026-10-31 14:15）。"""
+    for ws in list(app["sockets"]):
+        try:
+            await asyncio.wait_for(
+                ws.close(code=aiohttp.WSCloseCode.GOING_AWAY,
+                         message=b"server shutdown"), 2.0)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def on_cleanup(app):
@@ -2261,6 +2305,7 @@ def main():
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/health", health)
     app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
     app.on_cleanup.append(on_cleanup)
     log.info("listening on 0.0.0.0:%d  ota=http://%s:%d/xiaozhi/ota/  ws=ws://%s:%d/ws",
              PORT, PUBLIC_HOST, PORT, PUBLIC_HOST, PORT)

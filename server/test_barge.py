@@ -27,7 +27,7 @@ PORT = int(os.environ.get("PORT", "8000"))
 UP_RATE, FRAME_MS = 16000, 60
 DEVICE_ID = os.environ.get("DEVICE_ID", "aa:bb:cc:dd:ee:02")
 BODY_DELAY = float(os.environ.get("BODY_DELAY", "0.7"))
-LOG = os.environ.get("LOG", "/home/yasu/stackchan-server/server.log")
+LOG = os.environ.get("LOG", os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.log"))
 # 長い返事になる問いを選ぶ（窓は 6 秒ぶん送ってから開くので短い返事では開かない）。
 # ⚠️ 2026-08-06 に「燃油サーチャージを教えて」で FAIL した。道具は 6 方面すべてを
 # 返したのに、モデルが読まずに「どこの燃油サーチャージが知りたいか」と聞き返し、

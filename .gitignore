@@ -3,3 +3,5 @@ server/.venv/
 __pycache__/
 *.pyc
 server/*.log
+server/.cloud_server.pid
+server/cache/

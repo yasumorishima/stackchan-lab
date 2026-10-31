@@ -291,7 +291,8 @@ async def prepare(session, want):
     # 🔴 音源は掛け声込みの全曲ぶんある。**全歌詞で対応付けてから歌う範囲だけ
     # 切り出す**（歌詞だけ減らすと 1 音が伸びて「対応していない」で弾かれる。
     # 実測 2026-08-08: 筒香が 39 モーラ / 32 秒 = 0.83 秒で歌えなくなった）
-    all_lines = list(songs.get(key, []))
+    # 注意書き（※…）は音源で歌われていないので、対応付けにも入れない
+    all_lines = sheet_song.drop_notes(list(songs.get(key, [])))
     all_morae = moras("".join(all_lines))
     morae = moras(text)
     if not morae:

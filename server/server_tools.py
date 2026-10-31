@@ -25,6 +25,14 @@ from places import PLACES
 
 log = logging.getLogger("stackchan.tools")
 
+# MLB の道具は mlb_schema.json と duckdb が要る。片方が欠けただけで
+# サーバー全体が起動しなくなるのは困るので、その時は MLB だけ止める
+try:
+    import mlb_ask
+except Exception as _e:  # noqa: BLE001
+    mlb_ask = None
+    log.warning("MLB の道具は使えません: %s: %s", type(_e).__name__, _e)
+
 JST = datetime.timezone(datetime.timedelta(hours=9), "JST")
 WDAY = ["月", "火", "水", "木", "金", "土", "日"]
 
@@ -517,8 +525,29 @@ async def _stock_one(session, key):
     return line + stale
 
 
+# 発話に指数の名前があれば、モデルが index を落としても補う（infer_when と同じ
+# 考え方）。ask_mlb_stats を足した後、「日経平均いくら？」で index が null に
+# なる率が 0/6 から 4/7 に上がった（probe_llm、2026-09-26）。null だと 4 指数
+# 全部を読み上げるので中身は正しいが長い。
+INDEX_WORDS = (("nikkei", ("日経",)), ("dow", ("ダウ",)),
+               ("sp500", ("S&P", "エスアンドピー", "SP500")),
+               ("nasdaq", ("ナスダック", "NASDAQ")))
+
+
+def index_from_text(text: str):
+    text = text or ""
+    for key, words in INDEX_WORDS:
+        if any(w in text for w in words):
+            return key
+    return None
+
+
 async def get_stock_index(session, args, ctx=None) -> str:
     key = (args or {}).get("index")
+    if key not in STOCK_INDEXES:
+        key = index_from_text((ctx or {}).get("utterance") or "")
+        if key:
+            log.info("index を発話から補った: %s", key)
     keys = [key] if key in STOCK_INDEXES else list(STOCK_INDEXES)
     lines = [await _stock_one(session, k) for k in keys]
     good = [x for x in lines if not x.startswith("error:")]
@@ -680,7 +709,9 @@ async def get_crypto(session, args, ctx=None) -> str:
 # NHK の公開 RSS（cat0 = 主要ニュース）。リダイレクトされるので追従が必要
 # （aiohttp は既定で追従）。応答整形が 2 文で切るため、見出しは読点で繋いだ
 # 一文にして返す。
-NEWS_URL = os.environ.get("NEWS_URL", "https://www.nhk.or.jp/rss/news/cat0.xml")
+# 2026-10 時点で旧 www.nhk.or.jp/rss/news/ は 301 でここへ移る（クラウドからは旧の方が 403）
+NEWS_URL = os.environ.get(
+    "NEWS_URL", "https://news.web.nhk/n-data/conf/na/rss/cat0.xml")
 NEWS_COUNT = int(os.environ.get("NEWS_COUNT", "3"))
 NEWS_CACHE_TTL = float(os.environ.get("NEWS_CACHE_TTL", "600"))
 NEWS_STALE_MAX = float(os.environ.get("NEWS_STALE_MAX", "21600"))
@@ -692,6 +723,8 @@ async def _news_fetch(session):
     async with session.get(NEWS_URL, headers={"User-Agent": "Mozilla/5.0"},
                            timeout=aiohttp.ClientTimeout(total=10)) as r:
         raw = await r.read()
+        if r.status != 200:
+            raise RuntimeError("news %d" % r.status)
     root = ET.fromstring(raw)
     titles = [t.text.strip() for t in root.iter("title") if t.text and t.text.strip()]
     titles = titles[1:]   # 先頭はチャンネル名
@@ -2191,7 +2224,11 @@ def _parse_live(html: str) -> dict:
     """試合速報の一覧と、同じページの勝敗表を読む。"""
     i = html.find('id="score_live_basic"')
     if i < 0:
-        raise RuntimeError("試合速報の枠が見つからない")
+        # シーズンが終わると速報の枠ごと消え、勝敗表（「全日程終了」）だけ残る
+        stand = _parse_standings(html)
+        if not stand:
+            raise RuntimeError("試合速報の枠も勝敗表も見つからない")
+        return {"day": "", "at": "", "games": [], "stand": stand, "off": True}
     seg = html[i:]
     j = seg.find("<h4>")            # 次の見出し（勝敗表）の手前まで
     if j > 0:
@@ -2290,6 +2327,8 @@ async def get_baseball(session, args, ctx=None) -> str:
         return "error: いまプロ野球の速報を取れませんでした（取得先が応答しません）"
     age = time.monotonic() - ts
     stale = "※%d分前の情報です。" % int(age / 60) if age > 600 else ""
+    if data.get("off"):
+        return _baseball_off(data["stand"], want) + stale
     day = data["day"] or "今日"
     games = data["games"]
     if want:
@@ -2308,6 +2347,21 @@ async def get_baseball(session, args, ctx=None) -> str:
             else "%sの速報です。%s。" % (day,
                                   "。".join(_game_line(g) for g in games)))
     return head + _stand_line(data["stand"]) + stale
+
+
+def _baseball_off(stand: dict, want) -> str:
+    """速報の枠が無い時（シーズンオフ・開幕前）の答え。日本シリーズ等は扱わない。"""
+    done = any("終了" in v["asof"] for v in stand.values())
+    head = ("今季の公式戦は全日程を終えました。" if done
+            else "いまは公式戦の試合速報が出ていません。")
+    if want:
+        st = stand.get(want)
+        if not st:
+            return head
+        return head + "%sは%s%d位、%s勝%s敗%s分%s。" % (
+            npb_short(want), st["lg"], st["rank"], st["w"], st["l"], st["d"],
+            "でした" if done else "です（%s）" % st["asof"])
+    return head + ("最終順位は、" if done else "") + _stand_line(stand)
 
 
 def _stand_line(stand: dict) -> str:
@@ -2946,6 +3000,26 @@ SPECS = [{
 }, {
     "type": "function",
     "function": {
+        "name": "ask_mlb_stats",
+        "description": "MLB（メジャーリーグ）の選手やシーズンの成績を調べる（2015年以降）。"
+                       "「大谷の去年のwOBAは？」「ダルビッシュの防御率は？」"
+                       "「去年一番三振を取った投手は？」「スイーパーの空振り率が高いのは？」など。"
+                       "日本人メジャーリーガー（大谷・山本由伸・ダルビッシュ・今永・千賀・"
+                       "鈴木誠也・吉田正尚・菊池・佐々木朗希など）の成績もこれで調べる。"
+                       "日本のプロ野球（NPB）の試合や順位は get_baseball を使う。"
+                       "答えの英語の選手名はカタカナにして話す。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string",
+                             "description": "聞かれた質問を、年・選手名・指標がわかる形の日本語の文で"},
+            },
+            "required": ["question"],
+        },
+    },
+}, {
+    "type": "function",
+    "function": {
         "name": "get_roster_move",
         "description": "プロ野球（NPB）の今日の公示＝出場選手の登録・登録抹消を"
                        "調べる。「選手の入れ替えあった？」「誰か抹消された？」"
@@ -3008,7 +3082,34 @@ SPECS = [{
     },
 }]
 
+# ---- MLB のシーズン成績（mlb_ask）-------------------------------------------
+# mlb-data-pipeline の dbt マート（HF 公開）に、さくらの LLM が書いた SELECT を
+# 読み取り専用で当てる。精度は mlb_eval.py（金の SQL と照合）で測る。
+_MLB_BASE = os.environ.get("SAKURA_BASE", "https://api.ai.sakura.ad.jp")
+_MLB_MODEL = os.environ.get("SAKURA_MODEL", "gpt-oss-120b")
+
+
+async def ask_mlb_stats(session, args, ctx=None) -> str:
+    q = (args.get("question") or "").strip()
+    if not q:
+        return "error: 何を調べるか分かりませんでした"
+    token = os.environ.get("SAKURA_TOKEN", "")
+    if not token or mlb_ask is None:
+        return "error: MLB の成績を調べる準備ができていません"
+    loop = asyncio.get_running_loop()
+    try:
+        table, sql = await loop.run_in_executor(
+            None, lambda: mlb_ask.ask(q, _MLB_BASE, _MLB_MODEL, token,
+                                      on_request=count_llm_request))
+    except Exception as e:  # noqa: BLE001
+        log.warning("mlb ask failed: %s: %s", type(e).__name__, e)
+        return "error: MLB のデータから答えを見つけられませんでした"
+    log.info("mlb sql: %s", " ".join(sql.split()))
+    return "MLB シーズン成績（2015年から。今年の分は途中まで）:" + chr(10) + table
+
+
 HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy,
+            "ask_mlb_stats": ask_mlb_stats,
             "get_stock_index": get_stock_index,
             "get_llm_quota": get_llm_quota,
             "get_crypto": get_crypto,

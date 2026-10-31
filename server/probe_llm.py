@@ -76,13 +76,18 @@ CASES = [
      {"country": "タイ"}),
     ("フランス行っても大丈夫かな。", "get_travel_advisory",
      {"country": "フランス"}),
+    ("大谷の去年のwOBAっていくつ？", "ask_mlb_stats", {}),
+    ("ダルビッシュの今年の防御率は？", "ask_mlb_stats", {}),
+    ("メジャーで去年一番三振を取ったピッチャーは誰？", "ask_mlb_stats", {}),
+    ("ベイスターズ勝ってる？", "get_baseball", {}),
+    ("今日のプロ野球の結果を教えて。", "get_baseball", {}),
     ("ありがとう、またね。", None, {}),
 ]
 
 
 async def ask(session, messages):
     payload = {"model": MODEL, "messages": messages, "temperature": 0.7,
-               "max_tokens": 200, "stream": False,
+               "max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "800")), "stream": False,
                "tools": TOOLS, "tool_choice": "auto"}
     t0 = time.monotonic()
     async with session.post(BASE + "/v1/chat/completions", json=payload,

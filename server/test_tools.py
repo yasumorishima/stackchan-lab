@@ -987,6 +987,29 @@ async def main():
                ("勝敗表の順位", live["stand"]["横浜DeNAベイスターズ"]["rank"], 2),
                ("勝敗表の勝敗", live["stand"]["横浜DeNAベイスターズ"]["l"], "51")]
 
+    # シーズンオフ: 速報の枠が消えて勝敗表（全日程終了）だけ残る（2026-10-31 の実物）
+    off_html = (
+        "<h4>2026年 勝敗表</h4>"
+        + chr(60) + 'div class="standings_wrap_c"><time>全日程終了</time>'
+        + "<tr><th>阪神タイガース 阪神</th><td>143</td><td>79</td><td>62</td>"
+        + "<td>2</td><td>.560</td><td>-</td></tr>"
+        + "<tr><th>横浜DeNAベイスターズ 横浜DeNA</th><td>143</td><td>71</td>"
+        + "<td>66</td><td>6</td><td>.518</td><td>6.0</td></tr>")
+    off = server_tools._parse_live(off_html)
+    checks2 += [
+        ("オフの印", off.get("off"), True),
+        ("オフの試合数", len(off["games"]), 0),
+        ("オフの球団", server_tools._baseball_off(off["stand"], "横浜DeNAベイスターズ"),
+         "今季の公式戦は全日程を終えました。横浜DeNAはセ・リーグ2位、71勝66敗6分でした。"),
+        ("オフの全体", server_tools._baseball_off(off["stand"], None),
+         "今季の公式戦は全日程を終えました。最終順位は、セ・リーグは、阪神、横浜DeNAの順です。")]
+    try:
+        server_tools._parse_live("<html>メンテナンス中</html>")
+        got = "no raise"
+    except RuntimeError:
+        got = "raised"
+    checks2.append(("枠も表も無ければ取れない扱い", got, "raised"))
+
     # 1 行の作り方。開始前は得点が「*」で、状況に球場と開始時刻が入る
     for memo, g, want in (
             ("試合中", {"t1": "横浜DeNAベイスターズ", "t2": "阪神タイガース",
