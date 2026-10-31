@@ -21,6 +21,7 @@ import struct
 import tempfile
 import time
 import uuid
+import weakref
 import wave
 
 import aiohttp
@@ -1647,6 +1648,8 @@ async def ws_handler(request: web.Request):
     # 見張りは切り、切断は本体か TCP に任せる
     ws = web.WebSocketResponse(heartbeat=None, max_msg_size=0, compress=False)
     await ws.prepare(request)
+    # 止めるときにこちらから閉じるために覚えておく（on_shutdown）
+    request.app["sockets"].add(ws)
     session: aiohttp.ClientSession = request.app["http"]
 
     device_id = request.headers.get("Device-Id", "?")
@@ -2266,11 +2269,27 @@ async def health(request):
 
 async def on_startup(app):
     app["http"] = aiohttp.ClientSession()
+    app["sockets"] = weakref.WeakSet()
     app["histories"] = {}      # device_id -> (最終更新, messages)
     if STT_BACKEND in LOCAL_STT:
         # 初回発話でモデル読み込みを待たせない
         await asyncio.to_thread(local_stt.warmup, STT_BACKEND)
         log.info("local stt warmed up: %s", STT_BACKEND)
+
+
+async def on_shutdown(app):
+    """開いている WebSocket をこちらから閉じる。
+
+    閉じないと aiohttp は本体が自分から切るまで待つ。本体はつなぎっぱなしに
+    するので、systemctl restart が 90 秒待たされて強制終了になっていた
+    （本番 2026-10-31 14:15）。"""
+    for ws in list(app["sockets"]):
+        try:
+            await asyncio.wait_for(
+                ws.close(code=aiohttp.WSCloseCode.GOING_AWAY,
+                         message=b"server shutdown"), 2.0)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def on_cleanup(app):
@@ -2286,6 +2305,7 @@ def main():
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/health", health)
     app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
     app.on_cleanup.append(on_cleanup)
     log.info("listening on 0.0.0.0:%d  ota=http://%s:%d/xiaozhi/ota/  ws=ws://%s:%d/ws",
              PORT, PUBLIC_HOST, PORT, PUBLIC_HOST, PORT)
