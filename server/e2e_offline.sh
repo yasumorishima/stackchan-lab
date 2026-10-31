@@ -5,7 +5,7 @@
 # RPi5 は共有機なので推論回数は最小限（warm 1 + 発話 2）に留める。
 # 本番の systemd（8000番・llm=dry）は止めない。
 set -u
-cd /home/yasu/stackchan-server
+cd "$(dirname "$0")"
 set -a
 . ./server.conf
 set +a
@@ -21,7 +21,7 @@ export FALLBACK_LLM_MODEL=qwen2.5:3b
 export STT_BACKEND=sherpa
 export TTS_BACKEND=voicevox
 
-LOG=/home/yasu/stackchan-server/e2e_offline.log
+LOG="$PWD/e2e_offline.log"
 : > "$LOG"
 fuser -k 8002/tcp 2>/dev/null || true
 sleep 1

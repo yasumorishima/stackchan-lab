@@ -3,7 +3,7 @@
   SAKURA_BASE=https://api.ai.sakura.ad.jp SAKURA_TOKEN=... で実行する。
 """
 import asyncio, json, os, sys, time
-sys.path.insert(0, "/home/yasu/stackchan-server")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import aiohttp, server_tools
 
 BASE = os.environ.get("SAKURA_BASE", "http://127.0.0.1:11434")

@@ -2,7 +2,7 @@
 # 実 LLM（Ollama）を繋いだ状態で、音声経路まで含めた E2E を通す。
 # 本番の systemd（8000番・llm=dry）は止めずに、8001番で別インスタンスを立てる。
 set -u
-cd /home/yasu/stackchan-server
+cd "$(dirname "$0")"
 set -a
 . ./server.conf
 set +a
@@ -15,7 +15,7 @@ export SAKURA_TOKEN=dummy
 export STT_BACKEND=sherpa
 export TTS_BACKEND=voicevox
 
-LOG=/home/yasu/stackchan-server/e2e_real_llm.log
+LOG="$PWD/e2e_real_llm.log"
 : > "$LOG"
 fuser -k 8001/tcp 2>/dev/null || true
 sleep 1

@@ -302,6 +302,26 @@ TEST_TEXT="今日の天気を教えて。" ./.venv/bin/python test_client.py
 SAKURA_BASE=http://127.0.0.1:8100 SAKURA_TOKEN=dummy LLM_BACKEND=sakura ./.venv/bin/python app.py
 ```
 
+`HOST` / `PORT` を変えれば試験の宛先を変えられます（既定は RPi5 の `192.168.10.111` か `127.0.0.1`）。
+`/home/yasu/stackchan-server` 決め打ちだった所は、そのファイル自身の場所を使うように直してあります。
+
+### クラウド（Claude Code on the web）で回す（2026-10-31）
+
+RPi5 を使わずに、Claude Code のクラウド環境（Ubuntu x86_64・4 コア・15GB）でも同じ試験が回ります。
+
+```bash
+./cloud_setup.sh   # 依存・認識モデル・VOICEVOX・Ollama(qwen2.5:3b) を入れる（環境の Setup script に置く）
+./cloud_up.sh      # VOICEVOX・Ollama・サーバー(8000) を起動。止めるのは ./cloud_up.sh stop
+HOST=127.0.0.1 ./.venv/bin/python test_hello_grace.py
+```
+
+`SAKURA_TOKEN` が環境変数にあれば本物のさくらへ、無ければ手元の qwen2.5:3b へ投げます。
+
+2026-10-31 に測った結果: 認識・読み上げ・握手・割り込み・天気の通し会話を含めて **ほぼすべて通る**。通らないのは次の 2 つ。
+
+- **歌**（`test_sing_tool.py` / `test_sing_e2e.py` / `test_transcribe.py`）: 音源の配布ページがクラウドの IP を 403 で拒む。`cache/songs`・`cache/sheets` は手元にしか無い
+- **`get_baseball`**: シーズンが終わると npb.jp の試合速報の枠が無くなり「取得先が応答しません」になる（クラウドに限らない）
+
 ## 本体が繋がるのに黙って切れる時（2026-07-30）
 
 本体は接続してくるのに、こちらの受信ログが 0 行のまま 15 秒ほどで切れることがあります。

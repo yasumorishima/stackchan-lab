@@ -11,8 +11,8 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, "/home/yasu/stackchan-server")
-os.chdir("/home/yasu/stackchan-server")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 import align_lyrics as al  # noqa: E402
 import align_sung  # noqa: E402
