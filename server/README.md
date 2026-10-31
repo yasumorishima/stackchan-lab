@@ -333,9 +333,13 @@ RPi5 の `server.log` を 10 分ごとに非公開レポ `stackchan-logs` へ pu
 git clone git@github.com:yasumorishima/stackchan-logs.git ~/stackchan-logs
 sudo cp stackchan-logs.service stackchan-logs.timer /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now stackchan-logs.timer
+sudo systemctl start stackchan-logs.service   # 初回の 1 回（これが無いとタイマーが回らない）
 ```
 
 ログには聞き取った言葉がそのまま残るので、**レポは必ず非公開**にする。
+
+タイマーは有効にしただけでは回り出さない（「前回から 10 分」の基準になる実行が無い）。
+初回だけ `sudo systemctl start stackchan-logs.service` を手で叩く（2026-10-31 実測）。
 
 ## 本体が繋がるのに黙って切れる時（2026-07-30）
 

@@ -1223,7 +1223,8 @@ async def transcribe(session, pcm: bytes) -> str:
 
 
 # 「◯◯の応援歌を歌って」と頼まれたか。道具が呼ばれなかった時の保険に使う
-SING_ASK_RE = re.compile(r"(.{1,12}?)\s*の\s*(?:応援歌|おうえんか|応歌)")
+# 「度会の歌歌って」のように「の歌」とだけ言うことも多い（実機 2026-10-31）
+SING_ASK_RE = re.compile(r"(.{1,12}?)\s*の\s*(?:応援歌|おうえんか|応歌|歌|うた)")
 # 歌を用意できているのに「歌えない」と言う矛盾（実機 2026-08-08 22:00）
 NEGATIVE_SONG_RE = re.compile(r"見つから|歌えな|ありません|見つけられ")
 SING_VERB_RE = re.compile(r"歌|うた|唄")
