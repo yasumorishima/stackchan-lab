@@ -1,0 +1,9 @@
+[Unit]
+Description=Check the deploy branch every 10 minutes
+
+[Timer]
+OnBootSec=7min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
