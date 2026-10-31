@@ -24,6 +24,11 @@ pgrep -x ollama >/dev/null || { nohup ollama serve >/tmp/ollama.log 2>&1 & sleep
 export PORT=8000 PUBLIC_HOST=127.0.0.1 WS_TOKEN=stackchan-local
 export STT_BACKEND=sherpa TTS_BACKEND="${TTS_BACKEND:-openjtalk}" LLM_BACKEND=sakura
 export FALLBACK_LLM_BASE=http://127.0.0.1:11434 FALLBACK_LLM_MODEL=qwen2.5:3b
+# 歌の音源と譜面は非公開レポ stackchan-cache に置いてある（clone してあれば使う）
+CACHE_REPO="${CACHE_REPO:-/home/user/stackchan-cache}"
+if [ -d "$CACHE_REPO/songs" ]; then
+  export CHEER_CACHE="$CACHE_REPO/songs" CHEER_SHEET_DIR="$CACHE_REPO/sheets"
+fi
 if [ -z "${SAKURA_TOKEN:-}" ]; then
   # 代役を主にする（FALLBACK と同じ宛先にすると app.py は二重に試さない）
   export SAKURA_BASE=http://127.0.0.1:11434 SAKURA_MODEL=qwen2.5:3b SAKURA_TOKEN=dummy

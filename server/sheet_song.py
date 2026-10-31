@@ -237,6 +237,65 @@ def _share_phrase(notes, morae):
     return [[x] for x in morae] + [[_extension(morae[-1])]] * (n - m)
 
 
+def _share_in_bars(notes, morae, bounds):
+    """1 フレーズの中を、**語の切れ目＝小節の頭**で揃えて配る。
+
+    休符の無いまま 2 語以上が続くフレーズでは、余り・不足の調整を
+    フレーズの末尾でまとめてすると、手前の語の伸ばし（「みやざきー」）に
+    次の語の頭が入り込み、そこから後ろが 1 音ずつ前へずれる（実機
+    2026-10-31 宮﨑「歌詞のタイミングが違う」: 0〜1 小節の 11 音に
+    「さあふりぬけみやざき」10 モーラ＋次の「き」が乗っていた）。
+    小節の頭で音を区切り、語の切れ目でしか切らない組み分けを DP で選ぶ。
+    ずれの二乗和が同じなら組を多く取る（小節と語が揃う方）。1 音に
+    2 モーラを詰めないと揃わないフレーズは、従来の配りのまま。
+    `bounds` はこのフレーズの中の語の切れ目（0 と末尾を含む）。
+    """
+    chunks, cur = [], []
+    for n in notes:
+        if cur and n["t16"] % CELLS_PER_BAR == 0:
+            chunks.append(cur)
+            cur = []
+        cur.append(n)
+    if cur:
+        chunks.append(cur)
+    cuts = sorted(bounds)
+    if len(chunks) < 2 or len(cuts) < 3:
+        return _share_phrase(notes, morae)
+    c_n, m_n = len(chunks), len(morae)
+    size = [0]
+    for c in chunks:
+        size.append(size[-1] + len(c))
+    # best[(チャンクの切れ目, モーラの切れ目)] = (ずれ, -組の数, 戻り先)
+    best = {(0, 0): (0, 0, None)}
+    for i in range(1, c_n + 1):
+        for e in cuts:
+            if e == 0:
+                continue
+            for (i0, s0), (c0, g0, _) in list(best.items()):
+                if i0 >= i or s0 >= e:
+                    continue
+                n_g, m_g = size[i] - size[i0], e - s0
+                # 1 音に 2 モーラを詰める組み分けは取らない（捕手のテーマで
+                # 「すす」が 16 分 1 つに詰まった）。詰めるなら従来どおり
+                if m_g > n_g:
+                    continue
+                cand = (c0 + (m_g - n_g) ** 2, g0 - 1, (i0, s0))
+                if (i, e) not in best or cand[:2] < best[(i, e)][:2]:
+                    best[(i, e)] = cand
+    if (c_n, m_n) not in best:
+        return _share_phrase(notes, morae)
+    path, key = [], (c_n, m_n)
+    while key != (0, 0):
+        prev = best[key][2]
+        path.append((prev, key))
+        key = prev
+    out = []
+    for (i0, s0), (i1, e1) in reversed(path):
+        out.extend(_share_phrase([n for c in chunks[i0:i1] for n in c],
+                                 morae[s0:e1]))
+    return out
+
+
 # 掛け声だけの行（「オオオオー」等）。音程を持たないので旋律に乗せない
 _LONG_RE = re.compile(r"[ー〜～]")
 _CHANT_RE = re.compile(r"^[オぉおー\s！!・]*$")
@@ -353,9 +412,19 @@ def split_call(lines):
     音符は書かれていない）。ここを旋律に乗せると、余った音符に無理やり
     詰め込まれて歌にならない（user 指摘 2026-08-07）。
     """
+    lines = drop_notes(lines)
     if lines and ("かっとばせ" in lines[-1] or "かっ飛ばせ" in lines[-1]):
         return lines[:-1], lines[-1]
     return lines, ""
+
+
+def drop_notes(lines):
+    """歌詞に混じる注意書きの行（「※代打での打席では使用しません」）を落とす。
+
+    公式の歌詞ページは注意書きも同じ並びに置いている。歌わせると
+    「でのでわしません」と歌い出していた（捕手のテーマ・2026-10-31）。
+    """
+    return [x for x in lines if not x.lstrip().startswith(("※", "＊", "*"))]
 
 
 def drop_strays(notes):
@@ -415,8 +484,16 @@ def build(sheet, lines, moras, name=""):
     groups = _fit_words(words, phrases) if len(phrases) >= 2 else None
     if groups is not None:
         lyrics = []
+        word_ends, acc = set(), 0
+        for w in words:
+            acc += len(w)
+            word_ends.add(acc)
+        start = 0
         for ph, gm in zip(phrases, groups):
-            lyrics.extend(_share_phrase(ph, gm))
+            local = {b - start for b in word_ends
+                     if start <= b <= start + len(gm)} | {0, len(gm)}
+            lyrics.extend(_share_in_bars(ph, gm, local))
+            start += len(gm)
     else:
         notes, joined = share_morae(notes, morae)
         lyrics = [[x] for x in joined]
