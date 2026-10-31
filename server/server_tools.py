@@ -680,7 +680,9 @@ async def get_crypto(session, args, ctx=None) -> str:
 # NHK の公開 RSS（cat0 = 主要ニュース）。リダイレクトされるので追従が必要
 # （aiohttp は既定で追従）。応答整形が 2 文で切るため、見出しは読点で繋いだ
 # 一文にして返す。
-NEWS_URL = os.environ.get("NEWS_URL", "https://www.nhk.or.jp/rss/news/cat0.xml")
+# 2026-10 時点で旧 www.nhk.or.jp/rss/news/ は 301 でここへ移る（クラウドからは旧の方が 403）
+NEWS_URL = os.environ.get(
+    "NEWS_URL", "https://news.web.nhk/n-data/conf/na/rss/cat0.xml")
 NEWS_COUNT = int(os.environ.get("NEWS_COUNT", "3"))
 NEWS_CACHE_TTL = float(os.environ.get("NEWS_CACHE_TTL", "600"))
 NEWS_STALE_MAX = float(os.environ.get("NEWS_STALE_MAX", "21600"))
@@ -692,6 +694,8 @@ async def _news_fetch(session):
     async with session.get(NEWS_URL, headers={"User-Agent": "Mozilla/5.0"},
                            timeout=aiohttp.ClientTimeout(total=10)) as r:
         raw = await r.read()
+        if r.status != 200:
+            raise RuntimeError("news %d" % r.status)
     root = ET.fromstring(raw)
     titles = [t.text.strip() for t in root.iter("title") if t.text and t.text.strip()]
     titles = titles[1:]   # 先頭はチャンネル名
@@ -2191,7 +2195,11 @@ def _parse_live(html: str) -> dict:
     """試合速報の一覧と、同じページの勝敗表を読む。"""
     i = html.find('id="score_live_basic"')
     if i < 0:
-        raise RuntimeError("試合速報の枠が見つからない")
+        # シーズンが終わると速報の枠ごと消え、勝敗表（「全日程終了」）だけ残る
+        stand = _parse_standings(html)
+        if not stand:
+            raise RuntimeError("試合速報の枠も勝敗表も見つからない")
+        return {"day": "", "at": "", "games": [], "stand": stand, "off": True}
     seg = html[i:]
     j = seg.find("<h4>")            # 次の見出し（勝敗表）の手前まで
     if j > 0:
@@ -2290,6 +2298,8 @@ async def get_baseball(session, args, ctx=None) -> str:
         return "error: いまプロ野球の速報を取れませんでした（取得先が応答しません）"
     age = time.monotonic() - ts
     stale = "※%d分前の情報です。" % int(age / 60) if age > 600 else ""
+    if data.get("off"):
+        return _baseball_off(data["stand"], want) + stale
     day = data["day"] or "今日"
     games = data["games"]
     if want:
@@ -2308,6 +2318,21 @@ async def get_baseball(session, args, ctx=None) -> str:
             else "%sの速報です。%s。" % (day,
                                   "。".join(_game_line(g) for g in games)))
     return head + _stand_line(data["stand"]) + stale
+
+
+def _baseball_off(stand: dict, want) -> str:
+    """速報の枠が無い時（シーズンオフ・開幕前）の答え。日本シリーズ等は扱わない。"""
+    done = any("終了" in v["asof"] for v in stand.values())
+    head = ("今季の公式戦は全日程を終えました。" if done
+            else "いまは公式戦の試合速報が出ていません。")
+    if want:
+        st = stand.get(want)
+        if not st:
+            return head
+        return head + "%sは%s%d位、%s勝%s敗%s分%s。" % (
+            npb_short(want), st["lg"], st["rank"], st["w"], st["l"], st["d"],
+            "でした" if done else "です（%s）" % st["asof"])
+    return head + ("最終順位は、" if done else "") + _stand_line(stand)
 
 
 def _stand_line(stand: dict) -> str:

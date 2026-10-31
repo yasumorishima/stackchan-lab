@@ -317,10 +317,10 @@ HOST=127.0.0.1 ./.venv/bin/python test_hello_grace.py
 
 `SAKURA_TOKEN` が環境変数にあれば本物のさくらへ、無ければ手元の qwen2.5:3b へ投げます。
 
-2026-10-31 に測った結果: 認識・読み上げ・握手・割り込み・天気の通し会話を含めて **ほぼすべて通る**。通らないのは次の 2 つ。
+2026-10-31 に測った結果: 認識・読み上げ・握手・割り込み・天気の通し会話を含めて **歌以外はすべて通る**。
 
-- **歌**（`test_sing_tool.py` / `test_sing_e2e.py` / `test_transcribe.py`）: 音源の配布ページがクラウドの IP を 403 で拒む。`cache/songs`・`cache/sheets` は手元にしか無い
-- **`get_baseball`**: シーズンが終わると npb.jp の試合速報の枠が無くなり「取得先が応答しません」になる（クラウドに限らない）
+- **歌**（`test_sing_tool.py` / `test_sing_e2e.py` / `test_transcribe.py`）は通らない: 音源の配布ページがクラウドの IP を 403 で拒む。`cache/songs`・`cache/sheets` は手元にしか無い
+- 同じ日に直したもの: `get_baseball` はシーズンオフに速報の枠が消えると「取得先が応答しません」になっていた（今は最終順位を答える）。`get_news` は NHK の RSS が `news.web.nhk` へ移っていた
 
 ## 本体が繋がるのに黙って切れる時（2026-07-30）
 
