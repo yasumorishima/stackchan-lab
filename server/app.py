@@ -1985,11 +1985,21 @@ async def ws_handler(request: web.Request):
             # 残りを書いている時間ぶん待たなくてよい（実測 2026-08-08:
             # 1 文目 1.21 秒 / 全部 1.82 秒＝0.6 秒ぶん早く鳴り出す）。
             # 道具を使う番は本文が出ないので、その間は 1 文目を待つだけ
-            queue = asyncio.Queue()
-            feed = SentenceFeed(queue)
-            task = asyncio.create_task(respond_feeding(
-                session, state["history"], tools, call_tool, feed))
-            first = await queue.get()
+            # 歌の依頼だけは流さない。流すと、道具を呼ぶ前にモデルが書いた本文
+            # （自分の知識で作った歌詞など）が歌より先に読まれる（実機 2026-10-31）。
+            # 全部済んでから「◯◯の応援歌を歌うね。」だけ言って歌う
+            asked = sing_request_name(text)
+            if asked:
+                task = asyncio.create_task(respond(
+                    session, state["history"], tools=tools,
+                    call_tool=call_tool))
+                first = None
+            else:
+                queue = asyncio.Queue()
+                feed = SentenceFeed(queue)
+                task = asyncio.create_task(respond_feeding(
+                    session, state["history"], tools, call_tool, feed))
+                first = await queue.get()
 
             async def _no_deny(src):
                 """歌を用意できている間は否定的な文を読まない。"""
@@ -2037,7 +2047,21 @@ async def ws_handler(request: web.Request):
                 # 本文が 1 文も出なかった（モデルが黙った・道具だけで終わった）
                 reply, trace = await task
                 queued = state.get("song")
-                if queued and (reply.startswith("うまく答えられませんでした")
+                if asked and not queued:
+                    # 道具が呼ばれなかった（「歌うね」とだけ言う）。こちらで用意する
+                    ctx2 = {}
+                    try:
+                        await server_tools.sing_cheer_song(
+                            session, {"player": asked}, ctx2)
+                    except Exception as e:
+                        log.warning("頼まれた歌を用意できなかった: %s: %s",
+                                    type(e).__name__, e)
+                    if ctx2.get("song"):
+                        log.info("道具が呼ばれなかったので %s の歌を"
+                                 "こちらで用意した", asked)
+                        state["song"] = queued = ctx2["song"]
+                if queued and (asked
+                               or reply.startswith("うまく答えられませんでした")
                                or NEGATIVE_SONG_RE.search(reply or "")):
                     # 歌は用意できているのに「答えられません」と言わせない。
                     # モデルが本文を返さず往復の上限に当たった時に起きる
