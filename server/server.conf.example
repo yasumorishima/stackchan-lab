@@ -3,25 +3,19 @@
 # このファイル自体には秘密を書かない。
 
 PORT=8000
-# 本体の hello をこの秒数待って来なければ、こちらから先に server hello を送る
-# （本体は自分の hello を送ってから 10 秒しか待たない）
-HELLO_GRACE=3
-
 # 本体に返す接続先。省略すると起動時に LAN アドレスを自動検出する
-PUBLIC_HOST=192.168.0.10
+PUBLIC_HOST=192.168.10.111
 
 # 音声認識: sherpa / vosk / whisper / sakura / dry
 STT_BACKEND=sherpa
-SHERPA_DIR=~/models/reazonspeech-k2-v2
-# VOSK_MODEL=~/models/vosk-model-small-ja-0.22
+SHERPA_DIR=/home/yasu/models/reazonspeech-k2-v2
+# VOSK_MODEL=/home/yasu/models/vosk-model-small-ja-0.22
 # WHISPER_MODEL=small
 
-# 読み上げ: openjtalk / voicevox / sakura / tone
-TTS_BACKEND=openjtalk
-# openjtalk: apt の open-jtalk + naist-jdic + nitech 声で動く軽量 TTS（RPi5 で 1 文 0.3 秒）
-# voicevox に戻す場合は TTS_BACKEND=voicevox と下 2 行を有効にする
-#VOICEVOX_URL=http://127.0.0.1:50021
-#VOICEVOX_SPEAKER=3
+# 読み上げ: voicevox / sakura / tone
+TTS_BACKEND=voicevox
+VOICEVOX_URL=http://127.0.0.1:50021
+VOICEVOX_SPEAKER=3
 
 # 応答生成: sakura / dry
 LLM_BACKEND=dry

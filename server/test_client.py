@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import opus_codec  # noqa: E402
 
 OTA = os.environ.get("OTA_URL", "http://127.0.0.1:8000/xiaozhi/ota/")
-DEVICE_ID = os.environ.get("DEVICE_ID", "aa:bb:cc:dd:ee:ff")   # 本体の Wi-Fi MAC
+DEVICE_ID = os.environ.get("DEVICE_ID", "80:45:6b:4d:e9:84")
 UP_RATE = 16000
 FRAME_MS = 60
 
