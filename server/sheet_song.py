@@ -237,6 +237,10 @@ def _share_phrase(notes, morae):
     return [[x] for x in morae] + [[_extension(morae[-1])]] * (n - m)
 
 
+LONG_NOTE = 8              # 16 分 8 つ＝2 分音符。これ以上は語の終わりに置く
+LONG_START = 10            # 語を長い音から始める組み分けの罰
+
+
 def _share_in_bars(notes, morae, bounds):
     """1 フレーズの中を、**語の切れ目＝小節の頭**で揃えて配る。
 
@@ -247,12 +251,16 @@ def _share_in_bars(notes, morae, bounds):
     「さあふりぬけみやざき」10 モーラ＋次の「き」が乗っていた）。
     小節の頭で音を区切り、語の切れ目でしか切らない組み分けを DP で選ぶ。
     ずれの二乗和が同じなら組を多く取る（小節と語が揃う方）。1 音に
-    2 モーラを詰めないと揃わないフレーズは、従来の配りのまま。
+    2 モーラ詰めるのは 4 分音符以上の音だけ。揃わなければ従来の配りのまま。
     `bounds` はこのフレーズの中の語の切れ目（0 と末尾を含む）。
     """
     chunks, cur = [], []
     for n in notes:
-        if cur and n["t16"] % CELLS_PER_BAR == 0:
+        # 小節の頭と、長い音（2 分音符以上）の直後で区切れる。長い音は
+        # フレーズの終わり（捕手のテーマ: 2 小節目頭の 12 マスで「いざすすめ」が
+        # 終わり、続く 9 音が「そのてでかじをとれ」）
+        if cur and (n["t16"] % CELLS_PER_BAR == 0
+                    or cur[-1]["len16"] >= LONG_NOTE):
             chunks.append(cur)
             cur = []
         cur.append(n)
@@ -262,9 +270,10 @@ def _share_in_bars(notes, morae, bounds):
     if len(chunks) < 2 or len(cuts) < 3:
         return _share_phrase(notes, morae)
     c_n, m_n = len(chunks), len(morae)
-    size = [0]
+    size, roomy = [0], [0]
     for c in chunks:
         size.append(size[-1] + len(c))
+        roomy.append(roomy[-1] + sum(1 for n in c if n["len16"] >= 4))
     # best[(チャンクの切れ目, モーラの切れ目)] = (ずれ, -組の数, 戻り先)
     best = {(0, 0): (0, 0, None)}
     for i in range(1, c_n + 1):
@@ -275,11 +284,15 @@ def _share_in_bars(notes, morae, bounds):
                 if i0 >= i or s0 >= e:
                     continue
                 n_g, m_g = size[i] - size[i0], e - s0
-                # 1 音に 2 モーラを詰める組み分けは取らない（捕手のテーマで
-                # 「すす」が 16 分 1 つに詰まった）。詰めるなら従来どおり
-                if m_g > n_g:
+                # 1 音に 2 モーラを詰めるのは 4 分音符以上の音だけ（捕手の
+                # テーマで「すす」が 16 分 1 つに詰まった）
+                if m_g > n_g + roomy[i] - roomy[i0]:
                     continue
-                cand = (c0 + (m_g - n_g) ** 2, g0 - 1, (i0, s0))
+                # 語を長い音から始めない（長い音は前の語の伸ばし）
+                start_long = i0 > 0 and chunks[i0][0]["len16"] >= LONG_NOTE
+                cand = (c0 + (m_g - n_g) ** 2 + (LONG_START if start_long
+                                                  else 0),
+                        g0 - 1, (i0, s0))
                 if (i, e) not in best or cand[:2] < best[(i, e)][:2]:
                     best[(i, e)] = cand
     if (c_n, m_n) not in best:
@@ -309,7 +322,8 @@ _CHANT_RE = re.compile(r"^[オぉおー\s！!・]*$")
 LEAD_CHANT = {"牧秀悟": 4, "筒香嘉智": 3}
 # 末尾の掛け声を落とす行数（「かっとばせー！○○！」以外の形。split_call が
 # 落としたあとの行数で数える）。筒香: 「ゴー！ゴー！つつごう！」
-TAIL_CHANT = {"筒香嘉智": 1}
+# 筒香の「ゴー！ゴー！つつごう！」は split_call が「！」で終わるコールとして落とす
+TAIL_CHANT = {}
 # 🔴 実際の歌い方は公式歌詞の表記と違う（長音の位置など）。文字からは導けない
 # ので、教えていただいた歌い方をそのまま持つ。指定があれば歌詞を置き換える。
 # 柴田: 公式は「ねらいすました ミートと」だが、歌は「ねらーいすましたミートと」
@@ -322,6 +336,11 @@ SUNG_LINES = {
     # 前にくっつける**と しょー(4) り(3) の(1) た め に(12) になり、
     # 「しょうりー…ためにー」の形になる。譜面自体は別動画の採譜と
     # 完全一致（残差 0.00 半音）＝読み取りではなく歌詞の配り方の問題
+    # 梶原: 公式の 3 行目には空白が無い。0・4・6 小節目は同じリズムで、1 行目
+    # 「さっそうと」と同じく「つきすすめ」で 4 小節目が終わる（譜面の形から。
+    # 2026-10-31・耳ではまだ確かめていない）
+    "梶原昂希": ["さっそうとかけろ", "あおくわくよこはまの",
+                 "つきすすめ しょうりへのみち", "ほしをつかめ"],
     "度会隆輝": ["きらめく このそらに", "ゆめのきどう えがけ",
                  "いま このかんせい", "うてよ しょーりのために"],
 }
@@ -413,9 +432,20 @@ def split_call(lines):
     詰め込まれて歌にならない（user 指摘 2026-08-07）。
     """
     lines = drop_notes(lines)
-    if lines and ("かっとばせ" in lines[-1] or "かっ飛ばせ" in lines[-1]):
+    if lines and _is_call(lines[-1]):
         return lines[:-1], lines[-1]
     return lines, ""
+
+
+def _is_call(line):
+    """最後の行がコール（叫び）か。「かっとばせ」のほか、「！」で終わる行。
+
+    神里の「イーヤーサーサー ！かみざと！」を歌として最後の 2 小節に
+    詰め込んでいた（2026-10-31）。筒香の「ゴー！ゴー！つつごう！」も同じ形。
+    """
+    t = line.strip()
+    return ("かっとばせ" in t or "かっ飛ばせ" in t
+            or t.endswith(("！", "!")))
 
 
 def drop_notes(lines):
@@ -482,6 +512,11 @@ def build(sheet, lines, moras, name=""):
     words = [w for w in words if w]
     phrases = _phrases(notes)
     groups = _fit_words(words, phrases) if len(phrases) >= 2 else None
+    if groups is None and len(phrases) == 1:
+        # 休符が 1 つも無い曲（梶原）。全体一括に回すと 1 小節目の最後に次の
+        # 行の頭が入ってずれる（2026-10-31）。曲全体を 1 フレーズとして
+        # 小節の頭で語に揃える
+        groups = [morae]
     if groups is not None:
         lyrics = []
         word_ends, acc = set(), 0
