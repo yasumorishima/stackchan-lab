@@ -24,6 +24,8 @@ pgrep -x ollama >/dev/null || { nohup ollama serve >/tmp/ollama.log 2>&1 & sleep
 export PORT=8000 PUBLIC_HOST=127.0.0.1 WS_TOKEN=stackchan-local
 export STT_BACKEND=sherpa TTS_BACKEND="${TTS_BACKEND:-openjtalk}" LLM_BACKEND=sakura
 export FALLBACK_LLM_BASE=http://127.0.0.1:11434 FALLBACK_LLM_MODEL=qwen2.5:3b
+# 試験の往復で、リポジトリの llm_usage.json（本番の無償枠の数え）を増やさない
+export LLM_USAGE_PATH="${LLM_USAGE_PATH:-/tmp/llm_usage.cloud.json}"
 # 歌の音源と譜面は非公開レポ stackchan-cache に置いてある（clone してあれば使う）
 CACHE_REPO="${CACHE_REPO:-/home/user/stackchan-cache}"
 if [ -d "$CACHE_REPO/songs" ]; then
