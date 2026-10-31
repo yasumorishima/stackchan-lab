@@ -25,6 +25,14 @@ from places import PLACES
 
 log = logging.getLogger("stackchan.tools")
 
+# MLB の道具は mlb_schema.json と duckdb が要る。片方が欠けただけで
+# サーバー全体が起動しなくなるのは困るので、その時は MLB だけ止める
+try:
+    import mlb_ask
+except Exception as _e:  # noqa: BLE001
+    mlb_ask = None
+    log.warning("MLB の道具は使えません: %s: %s", type(_e).__name__, _e)
+
 JST = datetime.timezone(datetime.timedelta(hours=9), "JST")
 WDAY = ["月", "火", "水", "木", "金", "土", "日"]
 
@@ -517,8 +525,29 @@ async def _stock_one(session, key):
     return line + stale
 
 
+# 発話に指数の名前があれば、モデルが index を落としても補う（infer_when と同じ
+# 考え方）。ask_mlb_stats を足した後、「日経平均いくら？」で index が null に
+# なる率が 0/6 から 4/7 に上がった（probe_llm、2026-09-26）。null だと 4 指数
+# 全部を読み上げるので中身は正しいが長い。
+INDEX_WORDS = (("nikkei", ("日経",)), ("dow", ("ダウ",)),
+               ("sp500", ("S&P", "エスアンドピー", "SP500")),
+               ("nasdaq", ("ナスダック", "NASDAQ")))
+
+
+def index_from_text(text: str):
+    text = text or ""
+    for key, words in INDEX_WORDS:
+        if any(w in text for w in words):
+            return key
+    return None
+
+
 async def get_stock_index(session, args, ctx=None) -> str:
     key = (args or {}).get("index")
+    if key not in STOCK_INDEXES:
+        key = index_from_text((ctx or {}).get("utterance") or "")
+        if key:
+            log.info("index を発話から補った: %s", key)
     keys = [key] if key in STOCK_INDEXES else list(STOCK_INDEXES)
     lines = [await _stock_one(session, k) for k in keys]
     good = [x for x in lines if not x.startswith("error:")]
@@ -2971,6 +3000,26 @@ SPECS = [{
 }, {
     "type": "function",
     "function": {
+        "name": "ask_mlb_stats",
+        "description": "MLB（メジャーリーグ）の選手やシーズンの成績を調べる（2015年以降）。"
+                       "「大谷の去年のwOBAは？」「ダルビッシュの防御率は？」"
+                       "「去年一番三振を取った投手は？」「スイーパーの空振り率が高いのは？」など。"
+                       "日本人メジャーリーガー（大谷・山本由伸・ダルビッシュ・今永・千賀・"
+                       "鈴木誠也・吉田正尚・菊池・佐々木朗希など）の成績もこれで調べる。"
+                       "日本のプロ野球（NPB）の試合や順位は get_baseball を使う。"
+                       "答えの英語の選手名はカタカナにして話す。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string",
+                             "description": "聞かれた質問を、年・選手名・指標がわかる形の日本語の文で"},
+            },
+            "required": ["question"],
+        },
+    },
+}, {
+    "type": "function",
+    "function": {
         "name": "get_roster_move",
         "description": "プロ野球（NPB）の今日の公示＝出場選手の登録・登録抹消を"
                        "調べる。「選手の入れ替えあった？」「誰か抹消された？」"
@@ -3033,7 +3082,34 @@ SPECS = [{
     },
 }]
 
+# ---- MLB のシーズン成績（mlb_ask）-------------------------------------------
+# mlb-data-pipeline の dbt マート（HF 公開）に、さくらの LLM が書いた SELECT を
+# 読み取り専用で当てる。精度は mlb_eval.py（金の SQL と照合）で測る。
+_MLB_BASE = os.environ.get("SAKURA_BASE", "https://api.ai.sakura.ad.jp")
+_MLB_MODEL = os.environ.get("SAKURA_MODEL", "gpt-oss-120b")
+
+
+async def ask_mlb_stats(session, args, ctx=None) -> str:
+    q = (args.get("question") or "").strip()
+    if not q:
+        return "error: 何を調べるか分かりませんでした"
+    token = os.environ.get("SAKURA_TOKEN", "")
+    if not token or mlb_ask is None:
+        return "error: MLB の成績を調べる準備ができていません"
+    loop = asyncio.get_running_loop()
+    try:
+        table, sql = await loop.run_in_executor(
+            None, lambda: mlb_ask.ask(q, _MLB_BASE, _MLB_MODEL, token,
+                                      on_request=count_llm_request))
+    except Exception as e:  # noqa: BLE001
+        log.warning("mlb ask failed: %s: %s", type(e).__name__, e)
+        return "error: MLB のデータから答えを見つけられませんでした"
+    log.info("mlb sql: %s", " ".join(sql.split()))
+    return "MLB シーズン成績（2015年から。今年の分は途中まで）:" + chr(10) + table
+
+
 HANDLERS = {"get_weather": get_weather, "get_usdjpy": get_usdjpy,
+            "ask_mlb_stats": ask_mlb_stats,
             "get_stock_index": get_stock_index,
             "get_llm_quota": get_llm_quota,
             "get_crypto": get_crypto,

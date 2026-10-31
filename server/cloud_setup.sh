@@ -2,7 +2,7 @@
 # Claude Code のクラウド環境（Ubuntu・x86_64・root）に、サーバーの試験に要るものを入れる。
 # 環境設定の「Setup script」から呼ぶ。何度走らせても同じ結果になる。
 #
-#   入るもの: venv（aiohttp / numpy / sherpa-onnx）・Open JTalk・libopus・
+#   入るもの: venv（aiohttp / numpy / sherpa-onnx / duckdb）・Open JTalk・libopus・
 #             音声認識モデル（ReazonSpeech k2 v2 int8・160MB）・Docker の VOICEVOX・
 #             Ollama と qwen2.5:3b（さくらの代役）
 #   入らないもの: 秘密（SAKURA_TOKEN / ODPT_TOKEN）と cache/（歌の音源・譜面）
@@ -14,7 +14,7 @@ apt-get install -y -q open-jtalk open-jtalk-mecab-naist-jdic \
   hts-voice-nitech-jp-atr503-m001 libopus0 zstd
 
 [ -x .venv/bin/python ] || python3 -m venv .venv
-./.venv/bin/pip install -q aiohttp numpy sherpa-onnx
+./.venv/bin/pip install -q aiohttp numpy sherpa-onnx duckdb
 
 M=~/models/reazonspeech-k2-v2
 mkdir -p "$M"
