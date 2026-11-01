@@ -8,7 +8,8 @@
 #     FAILED      試験用サーバー（8003 番）での試験に落ちた＝本番は触っていない
 #     ROLLED_BACK 入れ替え後の確認に落ちた＝poll.sh が入れ替え前へ戻す
 #     RETRY       Pi が混んでいる・8003 番が使用中など、コードと関係ない理由
-#     DEFERRED    本体と会話中（8000 番に接続がある）なので入れ替えを待つ
+#     DEFERRED    本体とつながっている（8000 番に接続がある）ので入れ替えを待つ
+#     DRYRUN      DRY_RUN=1 で試験まで（手で試すとき用。依頼も走らせない）
 #
 #   本番に残すもの（リポの版で上書きしない）: server.conf llm_usage.json test_client.py
 #   試験の一覧: server/deploy_tests.txt（無ければ下の既定）
@@ -39,6 +40,24 @@ health() {  # health <port> <秒> [見張る pid]
   return 1
 }
 
+run_requests() {  # 依頼の実行（本番フォルダで・本番の環境で）。DRY_RUN では走らせない
+  [ ${#reqs[@]} -gt 0 ] || return 0
+  if [ "${DRY_RUN:-0}" = 1 ]; then rep "DRY_RUN なので依頼 ${#reqs[@]} 本は走らせない。"; return 0; fi
+  local r blob path rc
+  (
+    unset PORT PUBLIC_HOST HOST CHEER_CACHE CHEER_SHEET_DIR LLM_USAGE_PATH LOG FALLBACK_LLM_BASE
+    set -a; . "$PROD/server.conf"; set +a
+    for r in "${reqs[@]}"; do
+      blob=${r%%$TAB*}; path=${r#*$TAB}
+      rep "## 依頼 $path"
+      ( cd "$PROD" && timeout 1800 bash "$REPO/$path" ) > "$OUT/req.out" 2>&1
+      rc=$?
+      rep "終了コード $rc"; fence; tail -n 80 "$OUT/req.out" >> "$OUT/report.md"; fence
+      echo "$blob $path" >> "$STATE/requests_done"
+    done
+  )
+}
+
 echo "== sha $SHA  prev ${PREV_SHA:-（記録なし）}"
 
 # --- Pi が混んでいれば今は出さない（共有機） ---
@@ -55,16 +74,20 @@ while IFS="$TAB" read -r meta path; do
   mode=${meta%% *}; rel=${path#server/}
   case "$KEEP" in *" $rel "*) continue ;; esac
   case "$rel" in cache/*|.venv/*|__pycache__/*|*/__pycache__/*) continue ;; esac
-  if [ -e "$PROD/$rel" ] && git -C "$REPO" show "$SHA:$path" | cmp -s - "$PROD/$rel"; then continue; fi
+  if [ -e "$PROD/$rel" ] && git -C "$REPO" show "$SHA:$path" | cmp -s - "$PROD/$rel"; then
+    want=0; [ "$mode" = 100755 ] && want=1
+    have=0; [ -x "$PROD/$rel" ] && have=1
+    [ "$want" = "$have" ] && continue
+  fi
   changed+=("$mode$TAB$rel")
-done < <(git -C "$REPO" ls-files -s server/)
+done < <(git -C "$REPO" -c core.quotePath=false ls-files -s server/)
 
 # --- 新しい依頼（ops/requests/*.sh。中身ごとに 1 回だけ走る） ---
 reqs=()
 while IFS="$TAB" read -r meta path; do
   blob=$(echo "$meta" | cut -d' ' -f2)
   grep -qxF "$blob $path" "$STATE/requests_done" 2>/dev/null || reqs+=("$blob$TAB$path")
-done < <(git -C "$REPO" ls-files -s 'ops/requests/*.sh')
+done < <(git -C "$REPO" -c core.quotePath=false ls-files -s 'ops/requests/*.sh')
 
 if [ -n "${PREV_SHA:-}" ] && git -C "$REPO" cat-file -e "$PREV_SHA" 2>/dev/null; then
   gone=$(git -C "$REPO" diff --name-only --diff-filter=D "$PREV_SHA" "$SHA" -- server/ | sed 's#^server/##')
@@ -89,6 +112,13 @@ fi
 set -a; . "$PROD/server.conf"; set +a
 
 if [ ${#changed[@]} -gt 0 ]; then
+  # --- 会話中なら待つ（2 分おきに見て最大 MAX_DEFER 回） ---
+  if [ "${DRY_RUN:-0}" != 1 ] && ss -Htn state established '( sport = :8000 )' | grep -q . \
+     && [ "${DEFER_COUNT:-0}" -lt $MAX_DEFER ]; then
+    rep "本体とつながっている（会話中かもしれない）ので入れ替えを待つ（${DEFER_COUNT:-0}/$MAX_DEFER）。"
+    status DEFERRED; exit 0
+  fi
+
   # --- 試験用の写し（本番の写し＋変更分）。キャッシュも写しを使う ---
   mkdir -p "$STAGE"
   rsync -a --delete --exclude '*.log' --exclude .venv --exclude __pycache__ "$PROD/" "$STAGE/"
@@ -115,7 +145,8 @@ if [ ${#changed[@]} -gt 0 ]; then
     if grep -q "ModuleNotFoundError" "$STAGE/server.log"; then
       rep "→ 足りないモジュールがある。Pi の venv に入れる必要がある（ops/requests で pip install を依頼できる）。"
     fi
-    status FAILED; exit 0
+    kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; SRV=""
+    status FAILED; run_requests; exit 0
   fi
   echo "== 試験用サーバー 8003 起動"
 
@@ -125,12 +156,12 @@ if [ ${#changed[@]} -gt 0 ]; then
   fail=0
   for t in $tests; do
     ok=0
-    for try in 1 2; do
+    for try in 1 2 3; do   # モデルの返事の揺れで落ちることがある（2026-11-01 に test_barge で実測）
       if ( cd "$STAGE" && timeout 600 "$PY" "$t" ) > "$OUT/test.out" 2>&1; then ok=1; break; fi
       echo "== $t 失敗（$try 回目）"; tail -n 20 "$OUT/test.out"
     done
     if [ $ok = 1 ]; then
-      if [ "$try" = 2 ]; then rep "- PASS $t（2 回目で）"; else rep "- PASS $t"; fi
+      if [ "$try" != 1 ]; then rep "- PASS $t（$try 回目で）"; else rep "- PASS $t"; fi
     else
       fail=1; rep "- FAIL $t"; fence; tail -n 30 "$OUT/test.out" >> "$OUT/report.md"; fence
     fi
@@ -139,17 +170,11 @@ if [ ${#changed[@]} -gt 0 ]; then
   if [ $fail = 1 ]; then
     rep ""; rep "## 試験用サーバーのログ（末尾）"
     fence; tail -n 40 "$STAGE/server.log" >> "$OUT/report.md"; fence
-    status FAILED; exit 0
+    status FAILED; run_requests; exit 0
   fi
   rep ""
 
   if [ "${DRY_RUN:-0}" = 1 ]; then rep "DRY_RUN なので入れ替えない。"; status DRYRUN; exit 0; fi
-
-  # --- 会話中なら待つ ---
-  if ss -Htn state established '( sport = :8000 )' | grep -q . && [ "${DEFER_COUNT:-0}" -lt $MAX_DEFER ]; then
-    rep "本体と会話中なので入れ替えを待つ（${DEFER_COUNT:-0}/$MAX_DEFER）。試験は通っている。"
-    status DEFERRED; exit 0
-  fi
 
   # --- 入れ替え ---
   ts=$(date +%Y%m%d-%H%M%S)
@@ -169,8 +194,9 @@ if [ ${#changed[@]} -gt 0 ]; then
     mkdir -p "$PROD/$(dirname "$rel")"
     cp -p "$STAGE/$rel" "$PROD/$rel.deploytmp" && mv -f "$PROD/$rel.deploytmp" "$PROD/$rel"
   done
+  sudo -n systemctl stop stackchan-server
   pre=$(stat -c %s "$PROD/server.log" 2>/dev/null || echo 0)
-  sudo -n systemctl restart stackchan-server
+  sudo -n systemctl start stackchan-server
   if ! health 8000 120 || ! systemctl is-active -q stackchan-server; then
     rep "## 入れ替え後、本番が /health に答えない → 入れ替え前へ戻す"
     fence; tail -c +"$((pre + 1))" "$PROD/server.log" | tail -n 40 >> "$OUT/report.md"; fence
@@ -183,23 +209,13 @@ if [ ${#changed[@]} -gt 0 ]; then
     status ROLLED_BACK; exit 0
   fi
   rm -f "$STATE/swap_in_progress"
+  status DEPLOYED
   rep "## 入れ替え済み（本番 8000 番の /health OK・起動後 15 秒 Traceback なし）"
   rep "戻し用の控え: $tarf"
   ls -1t "$BASE"/backups/*.tar 2>/dev/null | tail -n +11 | while read -r o; do rm -f "$o" "${o%.tar}.new"; done
   rep ""
 fi
 
-# --- 依頼の実行（本番フォルダで・本番の環境で） ---
-unset PORT PUBLIC_HOST HOST CHEER_CACHE CHEER_SHEET_DIR LLM_USAGE_PATH LOG FALLBACK_LLM_BASE
-set -a; . "$PROD/server.conf"; set +a
-for r in "${reqs[@]}"; do
-  blob=${r%%$TAB*}; path=${r#*$TAB}
-  rep "## 依頼 $path"
-  ( cd "$PROD" && timeout 1800 bash "$REPO/$path" ) > "$OUT/req.out" 2>&1
-  rc=$?
-  rep "終了コード $rc"; fence; tail -n 80 "$OUT/req.out" >> "$OUT/report.md"; fence
-  echo "$blob $path" >> "$STATE/requests_done"
-done
-
+run_requests
 if [ ${#changed[@]} -gt 0 ]; then status DEPLOYED; else status NOOP; fi
 exit 0
