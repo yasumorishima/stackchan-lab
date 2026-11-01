@@ -1,0 +1,12 @@
+[Unit]
+Description=Deploy Stack-chan server from GitHub main (test on 8003, swap, verify)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=yasu
+ExecStart=/home/yasu/stackchan-deploy/poll.sh
+TimeoutStartSec=2h
+Nice=10
+IOSchedulingClass=idle
