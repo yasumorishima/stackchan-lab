@@ -1533,14 +1533,26 @@ async def respond(session, history, tools=None, call_tool=None, feed=None):
     msgs = list(history)
     trace = []
     verbatim = False
+    lyrics = None        # 歌詞の道具が返した本文（読むべきもの）
     for _ in range(MAX_TOOL_ROUNDS):
-        # feed があれば流しながら受け取る（1 文できた時点で読み上げが始まる）
+        # feed があれば流しながら受け取る（1 文できた時点で読み上げが始まる）。
+        # 歌詞を受け取った後の番は流さない＝読む前に歌詞が入っているか確かめる
+        stream = feed is not None and lyrics is None
         msg = await sakura_chat(session, msgs, tools,
-                                on_delta=feed.add if feed else None)
+                                on_delta=feed.add if stream else None)
         calls = msg.get("tool_calls") or []
         if not calls or call_tool is None:
-            reply = shorten_reply(clean_reply(msg.get("content")),
-                                  verbatim)
+            content = msg.get("content")
+            if lyrics is not None and not calls:
+                if not has_lyrics(content, lyrics):
+                    # 歌詞を受け取ったのに「どうぞ！」とだけ返すことがある
+                    # （本番 2026-11-01 09:59）。道具の本文をそのまま読む
+                    log.info("返事に歌詞が無いので道具の歌詞を読む: %r",
+                             (content or "")[:60])
+                    content = lyrics
+                if feed is not None:
+                    await feed.add(clean_reply(content))
+            reply = shorten_reply(clean_reply(content), verbatim)
             if not reply:
                 log.warning("空の応答（本文=%r）",
                             (msg.get("content") or "")[:120])
@@ -1580,6 +1592,8 @@ async def respond(session, history, tools=None, call_tool=None, feed=None):
                     result = "error: %s" % e
             if name in VERBATIM_TOOLS:
                 verbatim = True
+                if not str(result).startswith("error"):
+                    lyrics = str(result)
                 if feed is not None:
                     feed.verbatim = True   # 応援歌は繰り返しも読む
             log.info("tool %s(%s) -> %s", name, args, str(result)[:200])
@@ -1588,6 +1602,19 @@ async def respond(session, history, tools=None, call_tool=None, feed=None):
             msgs.append(out)
             trace.append(out)
     return "うまく答えられませんでした。", trace
+
+
+def has_lyrics(reply, lyrics) -> bool:
+    """返事が歌詞を読んでいるか。歌詞の最初の行の頭 8 字が入っていれば読んでいる。
+
+    道具の本文は「◯◯の応援歌です。<1 行目>。<2 行目>。…」の形。
+    空白・句読点・記号は比べる前に落とす（モデルは区切りを変えて書く）。
+    """
+    def norm(t):
+        return re.sub(r"[\s、。，．,.！!？?「」『』（）()・ー〜～]", "", t or "")
+    body = lyrics.split("応援歌です。", 1)[-1]
+    first = norm(body.split("。", 1)[0])[:8]
+    return bool(first) and first in norm(reply)
 
 
 def last_user_text(history) -> str:
