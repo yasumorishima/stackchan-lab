@@ -49,6 +49,7 @@ https://github.com/user-attachments/assets/c8362b72-3d51-4fe3-9bae-85891034855b
 | [音声バックエンド差し替えの検討](docs/voice/voice-backend-plan.md) | 出荷時は中国のクラウド XiaoZhi 経由。自前サーバーへ寄せる設計と、無償枠・自前ビルド・プロビジョニングの前提整理。差し替えポイントと現在の進捗 |
 | [XiaoZhi WebSocket プロトコル](docs/voice/xiaozhi-websocket-protocol.md) | 自前サーバーを書くために必要な仕様のまとめ。OTA 応答スキーマ、hello の交換、音声フレームの形式、JSON メッセージの一覧 |
 | [自前サーバーの実装](server/) | 本体の接続先をこのサーバーへ向けるための実装一式。OTA と WebSocket、ローカル音声認識、VOICEVOX での読み上げ、MCP のツール呼び出し。実機なしで検証するための試験クライアントとモックつき |
+| [クラウドから本番（RPi5）へ出す](docs/pi-deploy.md) | Pi が 2 分ごとに `main` を見て、変わったファイルを 8003 番の写しで試験してから本番へ入れ替える仕組み。結果は非公開の `stackchan-logs` の `deploy/LATEST.md`。Pi で何かを走らせる依頼（`ops/requests/`）の書き方つき |
 
 ## 要点だけ先に
 

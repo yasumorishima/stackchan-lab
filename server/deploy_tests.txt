@@ -1,0 +1,6 @@
+# main に入った変更を本番へ出す前に、Pi の 8003 番の写しで回す試験（上から順に・1 回だけやり直す）。
+# 1 本でも落ちたら本番は触らない。重い試験を足すときは Pi が共有機であることに気をつける。
+test_particle.py
+test_sheet_bars.py
+test_barge.py
+test_sing_e2e.py
