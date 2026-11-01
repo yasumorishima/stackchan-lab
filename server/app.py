@@ -308,6 +308,10 @@ SYSTEM_PROMPT = os.environ.get(
     "あなたは卓上ロボット「スタックちゃん」です。短く親しみやすく話します。"
     "天気や機体の操作は、推測せず必ずツールを使って答えます。"
     "前のやり取りに数値が出ていても、聞かれたらツールを呼び直します。"
+    # 作り話が多い（実機 2026-11-01:「得点テーマは BAY STAR POWER」、歌って
+    # いないのに「流しています！」）
+    "ツールで確かめていないこと（曲名・歌詞・成績・出来事など）は作らず、"
+    "分からないと正直に言います。歌は sing_cheer_song が ok を返した時だけ歌えます。"
     "発話の先頭の丸括弧はその発話の時刻です。"
     "この時刻を応答に書き写してはいけません（時刻を聞かれた時だけ答えます）。",
 )
@@ -1226,6 +1230,18 @@ async def transcribe(session, pcm: bytes) -> str:
 # 「◯◯の応援歌を歌って」と頼まれたか。道具が呼ばれなかった時の保険に使う
 # 「度会の歌歌って」のように「の歌」とだけ言うことも多い（実機 2026-10-31）
 SING_ASK_RE = re.compile(r"(.{1,12}?)\s*の\s*(?:応援歌|おうえんか|応歌|歌|うた)")
+# 認識が選手名を別の言葉に聞き違える（実機 2026-11-01: 度会→「待たない」
+# 「また来年」、筒香→「不都合」「不合」）。「◯◯の応援／歌」の形の時だけ直す
+# （ふだんの「また来年」まで度会にしない）
+HEARD_NAMES = {"待たない": "度会", "また来年": "度会", "渡会": "度会",
+               "わたらい": "度会", "不都合": "筒香", "不合": "筒香",
+               "つつごう": "筒香", "筒郷": "筒香"}
+HEARD_RE = re.compile(r"(%s)(?=\s*の\s*(?:応援|おうえん|応歌|歌|うた))"
+                      % "|".join(map(re.escape, HEARD_NAMES)))
+
+
+def fix_heard_names(text: str) -> str:
+    return HEARD_RE.sub(lambda m: HEARD_NAMES[m.group(1)], text or "")
 # 歌を用意できているのに「歌えない」と言う矛盾（実機 2026-08-08 22:00）
 NEGATIVE_SONG_RE = re.compile(r"見つから|歌えな|ありません|見つけられ")
 SING_VERB_RE = re.compile(r"歌|うた|唄")
@@ -1534,10 +1550,14 @@ async def respond(session, history, tools=None, call_tool=None, feed=None):
     trace = []
     verbatim = False
     lyrics = None        # 歌詞の道具が返した本文（読むべきもの）
+    sang = False         # 歌を用意できた。この後の本文は読まない
     for _ in range(MAX_TOOL_ROUNDS):
         # feed があれば流しながら受け取る（1 文できた時点で読み上げが始まる）。
         # 歌詞を受け取った後の番は流さない＝読む前に歌詞が入っているか確かめる
-        stream = feed is not None and lyrics is None
+        # 歌を用意できた後の番も流さない。本文が「牧牧が　Okay!」のような崩れた
+        # 文になることがあり、それが歌の前に読まれた（実機 2026-11-01 20:10）。
+        # 歌の前の一言は呼び出し側が「◯◯の応援歌を歌うね。」に決めて言う
+        stream = feed is not None and lyrics is None and not sang
         msg = await sakura_chat(session, msgs, tools,
                                 on_delta=feed.add if stream else None)
         calls = msg.get("tool_calls") or []
@@ -1590,6 +1610,8 @@ async def respond(session, history, tools=None, call_tool=None, feed=None):
                     result = await call_tool(name, args)
                 except Exception as e:
                     result = "error: %s" % e
+            if name == "sing_cheer_song" and str(result).startswith("ok"):
+                sang = True
             if name in VERBATIM_TOOLS:
                 verbatim = True
                 if not str(result).startswith("error"):
@@ -1981,6 +2003,10 @@ async def ws_handler(request: web.Request):
             else:
                 text = await transcribe(session, pcm)
             log.info("STT: %s", text)
+            fixed = fix_heard_names(text)
+            if fixed != text:
+                log.info("聞き違いの選手名を直した: %s", fixed)
+                text = fixed
             age = time.monotonic() - state["last_spoke"]
             streak = state.get("filler_streak", 0)
             state["filler_streak"] = streak + 1 if _is_filler(text) else 0
@@ -2091,9 +2117,7 @@ async def ws_handler(request: web.Request):
                         log.info("道具が呼ばれなかったので %s の歌を"
                                  "こちらで用意した", asked)
                         state["song"] = queued = ctx2["song"]
-                if queued and (asked
-                               or reply.startswith("うまく答えられませんでした")
-                               or NEGATIVE_SONG_RE.search(reply or "")):
+                if queued:
                     # 歌は用意できているのに「答えられません」と言わせない。
                     # モデルが本文を返さず往復の上限に当たった時に起きる
                     # 差し替えは clean_reply の後なので、読みの置換だけ改めて
