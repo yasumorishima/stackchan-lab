@@ -89,9 +89,9 @@ if "PRIVATE KEY-----" in t or left:
 open(dst, "w", encoding="utf-8").write(t)
 PY
   then
-    printf '# %s %s\n\n- 時刻: %s\n- sha: %s\n\n伏せ字の検査に通らなかったので本文は出さない。Pi の %s に残した。\n' \
-      "$st" "${sha:0:7}" "$(date '+%F %T %Z')" "$sha" "$raw" > "$OUT/unsent/$name"
     cp "$raw" "$raw.$day-$now"
+    printf '# %s %s\n\n- 時刻: %s\n- sha: %s\n\n伏せ字の検査に通らなかったので本文は出さない。Pi の %s に残した。\n' \
+      "$st" "${sha:0:7}" "$(date '+%F %T %Z')" "$sha" "$raw.$day-$now" > "$OUT/unsent/$name"
   fi
   rm -f "$raw"
   flush
