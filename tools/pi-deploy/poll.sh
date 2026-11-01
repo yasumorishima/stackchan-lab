@@ -68,9 +68,10 @@ for line in open(conf, encoding="utf-8", errors="replace"):
     line = line.strip()
     if not line or line.startswith("#") or "=" not in line:
         continue
-    v = line.split("=", 1)[1].strip()
-    v = re.sub(r"\s+#.*$", "", v).strip().strip('"').strip("'")
-    if len(v) >= 6 and not v.startswith(("/", "http://127.", "http://localhost")):
+    k, v = line.split("=", 1)
+    v = re.sub(r"\s+#.*$", "", v.strip()).strip().strip('"').strip("'")
+    secretish = re.search(r"TOKEN|KEY|SECRET|PASS|AUTH|CRED", k, re.I)
+    if (secretish and len(v) >= 4) or (len(v) >= 20 and not v.startswith(("/", "http"))):
         vals.append(v)
 t = open(src, encoding="utf-8", errors="replace").read()
 for v in sorted(set(vals), key=len, reverse=True):
@@ -106,27 +107,32 @@ flush() {  # unsent/ にある報告を全部 stackchan-logs へ。届いたも�
     GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes" git clone -q "$LOGS_URL" "$LOGS" || return 1
     git -C "$LOGS" config core.sshCommand "ssh -i $KEY -o IdentitiesOnly=yes"
   fi
-  git -C "$LOGS" pull -q --rebase || return 1
+  git -C "$LOGS" rebase --abort >/dev/null 2>&1
+  git -C "$LOGS" fetch -q origin && git -C "$LOGS" reset -q --hard "@{u}" && git -C "$LOGS" clean -qfd || return 1
   latest=""
   while IFS= read -r f; do
     rel=${f#"$OUT/unsent/"}
-    mkdir -p "$LOGS/$(dirname "$rel")"; cp "$f" "$LOGS/$rel"; latest="$f"
+    mkdir -p "$LOGS/$(dirname "$rel")"; cp "$f" "$LOGS/$rel" || return 1; latest="$f"
   done < <(find "$OUT/unsent/deploy" -type f -name '*.md' | sort)
-  [ -n "$latest" ] && cp "$latest" "$LOGS/deploy/LATEST.md"
+  if [ -n "$latest" ]; then cp "$latest" "$LOGS/deploy/LATEST.md" || return 1; fi
   git -C "$LOGS" add -A deploy
-  git -C "$LOGS" diff --cached --quiet || git -C "$LOGS" commit -q -m "deploy report $(date '+%F %T')"
+  git -C "$LOGS" diff --cached --quiet || git -C "$LOGS" commit -q -m "deploy report $(date '+%F %T')" || return 1
   local i
   for i in 1 2 3; do
     if git -C "$LOGS" pull -q --rebase && git -C "$LOGS" push -q; then
       find "$OUT/unsent/deploy" -type f -name '*.md' -delete
       return 0
     fi
+    git -C "$LOGS" rebase --abort >/dev/null 2>&1
     sleep 5
   done
   return 1   # 届かなかった分は unsent/ とローカルの commit に残り、次の回で送る
 }
 
-flush > /dev/null 2>&1 || true   # 前の回で送れなかった報告
+# 試験から関数だけ読み込むとき（POLL_LIB_ONLY=1 で source）はここで止める
+[ "${POLL_LIB_ONLY:-0}" = 1 ] && return 0
+
+flush >> "$OUT/flush.log" 2>&1 || echo "$(date '+%F %T') flush NG" >> "$OUT/flush.log"   # 前の回で送れなかった報告
 
 # 前回の入れ替えが途中で死んでいたら、まず戻す
 if [ -f "$STATE/swap_in_progress" ]; then
@@ -147,14 +153,14 @@ nt=$(cat "$STATE/next_try_$remote" 2>/dev/null || echo 0)
 if [ ! -d "$REPO/.git" ]; then git clone -q "$URL" "$REPO" || exit 0; fi
 git -C "$REPO" fetch -q origin main || exit 0
 sha=$(git -C "$REPO" rev-parse FETCH_HEAD)
-git -C "$REPO" checkout -q --detach "$sha" || exit 0
+git -C "$REPO" checkout -qf --detach "$sha" || exit 0
 git -C "$REPO" clean -qfdx
 echo "$sha" > "$STATE/attempting"
 
 : > "$OUT/report.md"; echo CRASHED > "$OUT/status"
 DEFER_COUNT=$(cat "$STATE/defer_$sha" 2>/dev/null || echo 0) \
 PREV_SHA=$(cat "$STATE/deployed_sha" 2>/dev/null || echo) \
-  timeout 5400 bash "$REPO/tools/pi-deploy/deploy.sh" "$sha" > "$OUT/run.log" 2>&1 9>&-
+  timeout 9000 bash "$REPO/tools/pi-deploy/deploy.sh" "$sha" > "$OUT/run.log" 2>&1 9>&-
 rc=$?
 st=$(cat "$OUT/status")
 echo "deploy.sh rc=$rc status=$st" >> "$OUT/run.log"
@@ -163,6 +169,8 @@ if [ -f "$STATE/swap_in_progress" ]; then               # 入れ替え中に落�
   restore >> "$OUT/run.log" 2>&1
   [ "$st" = ROLLED_BACK ] || st=CRASHED_ROLLED_BACK
 fi
+
+if [ "${DRY_RUN:-0}" = 1 ]; then publish "DRY_$st" "$sha"; rm -f "$STATE/attempting"; exit 0; fi
 
 case "$st" in
   DEPLOYED|NOOP)
@@ -180,8 +188,6 @@ case "$st" in
   DEFERRED)
     echo $(( DEFER_COUNT_NOW = $(cat "$STATE/defer_$sha" 2>/dev/null || echo 0) + 1 )) > "$STATE/defer_$sha"
     [ -f "$STATE/notified_defer_$sha" ] || { publish DEFERRED "$sha"; touch "$STATE/notified_defer_$sha"; } ;;
-  DRYRUN)
-    publish DRYRUN "$sha" ;;
   *)
     echo "$sha $st" >> "$STATE/done"
     publish "$st" "$sha" ;;

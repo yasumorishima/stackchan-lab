@@ -42,10 +42,10 @@ Pi: main の server/ と本番を比べる
 
 コードを変えずに Pi で走らせたいとき（歌の作り直し・probe・pip install・ログの確認など）は、`ops/requests/<名前>.sh` を足して main に入れる。
 
-- 入れ替えのあとに走る。試験に落ちた（`FAILED`）ときも走る＝足りない `pip install` は同じ commit で足せばよい
+- 入れ替えのあとに走る。試験に落ちたときも走り、そのときは同じ sha を `RETRY` として試し直す＝足りない `pip install` は同じ commit で足せばよい
 
 - 本番フォルダ（`~/stackchan-server`）で、本番の `server.conf` を読んだ環境で `bash` で 1 回だけ走る（中身を変えればもう一度走る）
-- 上限 30 分。出力の末尾 80 行が報告に載る（server.conf の値は伏せ字になる）
+- 上限 30 分。出力の末尾 80 行が報告に載る（server.conf の秘密らしい値と鍵らしき形は伏せ字になる。伏せきれないと本文は出さない）
 - 再起動はしない。必要なら依頼の中で `sudo -n systemctl restart stackchan-server`
 
 例: `ops/requests/2026-11-01-prerender.sh`

@@ -56,6 +56,11 @@ run_requests() {  # 依頼の実行（本番フォルダで・本番の環境で
       echo "$blob $path" >> "$STATE/requests_done"
     done
   )
+  touch "$OUT/req_ran"
+}
+fail_with_requests() {  # 試験に落ちた。依頼が走ったなら、それで直ったかもしれないので RETRY
+  rm -f "$OUT/req_ran"; run_requests
+  if [ -f "$OUT/req_ran" ]; then rep "依頼を走らせたので、この sha をもう一度試す。"; status RETRY; else status FAILED; fi
 }
 
 echo "== sha $SHA  prev ${PREV_SHA:-（記録なし）}"
@@ -146,7 +151,7 @@ if [ ${#changed[@]} -gt 0 ]; then
       rep "→ 足りないモジュールがある。Pi の venv に入れる必要がある（ops/requests で pip install を依頼できる）。"
     fi
     kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; SRV=""
-    status FAILED; run_requests; exit 0
+    status FAILED; fail_with_requests; exit 0
   fi
   echo "== 試験用サーバー 8003 起動"
 
@@ -157,7 +162,9 @@ if [ ${#changed[@]} -gt 0 ]; then
   for t in $tests; do
     ok=0
     for try in 1 2 3; do   # モデルの返事の揺れで落ちることがある（2026-11-01 に test_barge で実測）
-      if ( cd "$STAGE" && timeout 600 "$PY" "$t" ) > "$OUT/test.out" 2>&1; then ok=1; break; fi
+      ( cd "$STAGE" && timeout 600 "$PY" "$t" ) > "$OUT/test.out" 2>&1; trc=$?
+      if [ $trc = 0 ]; then ok=1; break; fi
+      [ $trc = 124 ] && { echo "== $t 600 秒で打ち切り"; break; }
       echo "== $t 失敗（$try 回目）"; tail -n 20 "$OUT/test.out"
     done
     if [ $ok = 1 ]; then
@@ -170,7 +177,7 @@ if [ ${#changed[@]} -gt 0 ]; then
   if [ $fail = 1 ]; then
     rep ""; rep "## 試験用サーバーのログ（末尾）"
     fence; tail -n 40 "$STAGE/server.log" >> "$OUT/report.md"; fence
-    status FAILED; run_requests; exit 0
+    status FAILED; fail_with_requests; exit 0
   fi
   rep ""
 
@@ -185,14 +192,16 @@ if [ ${#changed[@]} -gt 0 ]; then
     if [ -e "$PROD/$rel" ]; then echo "$rel" >> "$lst"; else echo "$rel" >> "$newf"; fi
   done
   if ! tar -cpf "$tarf" -C "$PROD" -T "$lst"; then
-    rep "控えの tar が作れない。入れ替えない。"; status FAILED; exit 0
+    rep "控えの tar が作れない（容量など）。入れ替えずに後でやり直す。"; status RETRY; exit 0
   fi
   rm -f "$lst"
   printf '%s\n%s\n' "$tarf" "$newf" > "$STATE/swap_in_progress"
   for c in "${changed[@]}"; do
     rel=${c#*$TAB}
     mkdir -p "$PROD/$(dirname "$rel")"
-    cp -p "$STAGE/$rel" "$PROD/$rel.deploytmp" && mv -f "$PROD/$rel.deploytmp" "$PROD/$rel"
+    if ! { cp -p "$STAGE/$rel" "$PROD/$rel.deploytmp" && mv -f "$PROD/$rel.deploytmp" "$PROD/$rel"; }; then
+      rm -f "$PROD/$rel.deploytmp"; rep "## $rel を本番へ写せない → 入れ替え前へ戻す"; status ROLLED_BACK; exit 0
+    fi
   done
   sudo -n systemctl stop stackchan-server
   pre=$(stat -c %s "$PROD/server.log" 2>/dev/null || echo 0)
@@ -208,8 +217,8 @@ if [ ${#changed[@]} -gt 0 ]; then
     fence; tail -c +"$((pre + 1))" "$PROD/server.log" | tail -n 40 >> "$OUT/report.md"; fence
     status ROLLED_BACK; exit 0
   fi
-  rm -f "$STATE/swap_in_progress"
   status DEPLOYED
+  rm -f "$STATE/swap_in_progress"
   rep "## 入れ替え済み（本番 8000 番の /health OK・起動後 15 秒 Traceback なし）"
   rep "戻し用の控え: $tarf"
   ls -1t "$BASE"/backups/*.tar 2>/dev/null | tail -n +11 | while read -r o; do rm -f "$o" "${o%.tar}.new"; done
