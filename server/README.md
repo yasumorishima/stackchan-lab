@@ -341,40 +341,6 @@ sudo systemctl start stackchan-logs.service   # 初回の 1 回（これが無�
 タイマーは有効にしただけでは回り出さない（「前回から 10 分」の基準になる実行が無い）。
 初回だけ `sudo systemctl start stackchan-logs.service` を手で叩く（2026-10-31 実測）。
 
-### クラウドから本番へ反映する（2026-10-31）
-
-Pi へは外から入れないので、**Pi の側から取りに行く**。クラウドの Claude Code が
-`stackchan-lab` の `deploy` ブランチに push すると、Pi の `stackchan-deploy.timer`
-（10 分ごとの一回実行・常駐しない）が `pull_deploy.sh` を呼び、
-
-1. 前回反映した commit から変わった `server/` 直下のファイルだけを退避して上書き
-2. 構文確認と `test_clean.py`・`test_sheet_bars.py`。落ちたら元に戻す（再起動しない）
-3. 歌の割り振りに関わるファイルが変わっていれば VOICEVOX を一時的に立てて `prerender.py`
-4. 再起動して `/health` と起動ログを確かめる。駄目なら元に戻して再起動
-5. 経過は `server.log` に `deploy:` で書く＝ログ用レポ経由でクラウドが読める
-
-一度落ちた commit は、次の commit が来るまで試し直さない。前回より前へ戻された・
-別の歴史に書き換えられた `deploy` は反映しない。`server.conf`・`llm_usage.json`・
-`cache/`・`.venv/` は触らない。systemd の定義（`*.service`/`*.timer`）は報告だけ。
-
-Pi で 1 回だけ:
-
-```bash
-cd ~/stackchan-lab && git fetch origin && git checkout -q origin/deploy -- server/pull_deploy.sh \
-  server/stackchan-deploy.service server/stackchan-deploy.timer
-cp server/pull_deploy.sh ~/stackchan-server/ && chmod +x ~/stackchan-server/pull_deploy.sh
-~/stackchan-server/pull_deploy.sh --init <今の本番に当たる commit>
-echo 'yasu ALL=(root) NOPASSWD: /usr/bin/systemctl restart stackchan-server' \
-  | sudo tee /etc/sudoers.d/stackchan-deploy && sudo chmod 440 /etc/sudoers.d/stackchan-deploy
-sudo cp server/stackchan-deploy.service server/stackchan-deploy.timer /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now stackchan-deploy.timer
-sudo systemctl start stackchan-deploy.service
-```
-
-クラウドで同じ流れを模して確かめた（GitHub 役の bare レポ・本番の写し・本物の
-サーバーを立て直す systemctl の代役）: 正常な反映／試験が落ちる／構文エラー／
-履歴の書き換え／直した commit が後から来る、の 5 通り。
-
 ## 本体が繋がるのに黙って切れる時（2026-07-30）
 
 本体は接続してくるのに、こちらの受信ログが 0 行のまま 15 秒ほどで切れることがあります。

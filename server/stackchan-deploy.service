@@ -1,7 +1,0 @@
-[Unit]
-Description=Pull and apply Stack-chan server updates from the deploy branch
-
-[Service]
-Type=oneshot
-User=yasu
-ExecStart=/home/yasu/stackchan-server/pull_deploy.sh
