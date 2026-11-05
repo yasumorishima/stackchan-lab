@@ -2763,7 +2763,7 @@ async def sing_cheer_song(session, args, ctx=None) -> str:
     if ctx is not None and ctx.get("song"):
         # 同じ往復で二度呼ばれることがある（同じ tool_calls が 2 つ来る実測あり）。
         # 作り直さず、同じ答えを返す
-        return "ok: %sの応援歌をこれから歌う" % ctx["song"]["name"]
+        return "ok: %sをこれから歌う" % song_label(ctx["song"]["name"])
     try:
         notes, tempo, name = await cheer_song.prepare(session, who)
     except LookupError:
@@ -2779,7 +2779,13 @@ async def sing_cheer_song(session, args, ctx=None) -> str:
     # 「うまく答えられませんでした」になる（2026-08-05 実測）。
     # 「ひとこと添えて」の指示は SPECS の description 側に書く（答えに書くと
     # そのまま読み上げられる）
-    return "ok: %sの応援歌をこれから歌う" % name
+    return "ok: %sをこれから歌う" % song_label(name)
+
+
+def song_label(name):
+    """「牧秀悟の応援歌」「熱き星たちよ」。チーム曲は曲名だけで呼ぶ。"""
+    import team_song
+    return name if name in team_song.ALIASES else "%sの応援歌" % name
 
 
 async def get_cheer_song(session, args, ctx=None) -> str:
@@ -3048,7 +3054,13 @@ SPECS = [{
                        "歌詞を読み上げるだけでよい時は get_cheer_song。"
                        "この道具が ok を返したら歌は用意できている。"
                        "同じ選手で呼び直さず、「◯◯の応援歌を歌うね」のように"
-                       "ひとことだけ短く返すこと。歌はその直後に流れる。",
+                       "ひとことだけ短く返すこと。歌はその直後に流れる。"
+                       "チーム応援歌も歌える（熱き星たちよ＝得点の歌、"
+                       "勝利の輝き＝試合開始、ライジングテーマ＝負けてる時、"
+                       "チャンステーマ0〜3、ハンターチャンス、攻めまくれ、"
+                       "Fight Oh! YOKOHAMA、つなげ！、All in one、"
+                       "BAY BLUE ANTHEM、勇者の遺伝子、横浜市歌）。その時は "
+                       "player に曲名か場面（例: 得点、負けてる時）を入れる。",
         "parameters": {
             "type": "object",
             "properties": {

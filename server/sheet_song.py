@@ -491,7 +491,7 @@ def _long_mora_index(ms):
     return len(ms) - 1
 
 
-def build(sheet, lines, moras, name=""):
+def build(sheet, lines, moras, name="", as_is=False):
     """(音符, テンポ, モーラ数, コール行) を返す。
 
     sheet=譜面 JSON の dict / lines=公式歌詞の行 / moras=モーラ分割の関数
@@ -504,9 +504,14 @@ def build(sheet, lines, moras, name=""):
     「ためーに」になり user 指摘。フレーズ単位なら 18 音 18 モーラの
     1:1 で自動的に合う）。
     """
-    sung_lines, call = split_call(list(lines))
-    # 先頭の掛け声（オオオオー…）は音程を持たないので歌わない
-    sung_lines = SUNG_LINES.get(name) or drop_chant(sung_lines, name)
+    if as_is:
+        # チーム曲（team_song.py）は歌う行を曲ごとに決めてある。「オオオオー」も
+        # 「かっとばせー」も旋律に乗せて歌う行なので、落とさない
+        sung_lines, call = list(lines), ""
+    else:
+        sung_lines, call = split_call(list(lines))
+        # 先頭の掛け声（オオオオー…）は音程を持たないので歌わない
+        sung_lines = SUNG_LINES.get(name) or drop_chant(sung_lines, name)
     # 助詞の「は」「へ」は「わ」「え」と歌う（user 指摘 2026-08-08）
     sung_lines = [read_particles(x) for x in sung_lines]
     morae = moras("".join(sung_lines))
