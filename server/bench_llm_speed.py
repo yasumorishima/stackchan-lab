@@ -4,8 +4,9 @@ server.conf の SAKURA_BASE / SAKURA_TOKEN を使う。トークンは表示し�
 本番と同じ指示文・道具一覧を付けて、モデルごとに 2 問 × 3 回ずつ投げ、
 「最初の 1 文字（または道具の呼び出し）が届くまで」と「全部届くまで」を測る。
 
-  ./.venv/bin/python bench_llm_speed.py            # 一覧から候補を選んで測る
-  ./.venv/bin/python bench_llm_speed.py gpt-oss-120b preview/Qwen3.6-35B-A3B
+  ./.venv/bin/python bench_llm_speed.py
+
+無償枠で動かすのが絶対なので、測るのは gpt-oss-120b だけ（考える量 low と既定）。
 """
 import asyncio
 import json
@@ -88,7 +89,10 @@ async def main():
         print("SAKURA_TOKEN が無い")
         return 1
     async with aiohttp.ClientSession() as s:
-        cands = sys.argv[1:] or await models(s)
+        # 🔴 無償枠で動かすのが絶対（user 2026-11-05）。無償枠があるのは
+        # gpt-oss-120b だけなので、ほかのモデルには投げない
+        await models(s)
+        cands = ["gpt-oss-120b"]
         runs = []
         for m in cands:
             for effort in (["low", None] if "gpt-oss" in m else [None]):
