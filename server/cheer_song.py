@@ -245,8 +245,8 @@ async def _prepare_sheet(key, songs):
 # 🔴 前奏と歌で歌詞が違う曲（前奏は掛け声の歌詞）は、全歌詞を曲全体へ均等に
 # 合わせると歌の頭が前奏に食い込む（user 実機 2026-11-05「牧と筒香は前奏が
 # 違う歌詞なのに、歌おうとして間違ってる」「前奏も正しい歌詞で歌えばいい」）。
-# 音源で歌が始まる秒を曲ごとに持ち、**前奏は掛け声の行、そこから後ろは歌の
-# 行**と分けて合わせ、両方歌う。
+# 音源で歌が始まる秒を曲ごとに持ち、**そこから後ろだけを歌の行に合わせて歌う**
+# （前奏も歌わせたら駄目だった。user 実機 2026-11-05「牧と筒香は前奏なしで」）。
 # 牧: 2.8〜9 秒の旋律が 16.7 秒からもう一度出る（音高の並びが一致）＝後半が歌。
 # 筒香: 13.8 秒からの長い音のあと 15.7 秒から歌（音量も 16 秒台で一段上がる）
 # 値は (歌が始まる秒, 最後のコールも音源にあるか)。牧の後半は 8.5 秒で
@@ -268,13 +268,14 @@ def _cut(path, start, end=None):
 
 
 async def _prepare_two_parts(key, path, songs, sung_lines):
-    """前奏（掛け声の行）と歌（歌の行）を別々に音源へ合わせて、続けて歌う。"""
+    """前奏は歌わず、音源の from_sec 秒から後ろだけを歌の行に合わせて歌う。"""
     from_sec, with_tail = SUNG_FROM_SEC[key]
     # sung_lines は助詞の読みを直した後の行なので、こちらも直してから比べる
     lines = [sheet_song.read_particles(x) for x in
              sheet_song.drop_notes(list(songs.get(key, [])))]
     first = next((i for i, ln in enumerate(lines) if ln in sung_lines), 0)
-    intro = lines[:first]
+    # 🔴 前奏は歌わない（user 実機 2026-11-05「牧と筒香は前奏なしで」）。
+    # 前奏を掛け声の歌詞で歌わせたら駄目だった。歌は from_sec から
     body = lines[first:]
     if not with_tail:
         while body and body[-1] not in sung_lines:
@@ -284,29 +285,19 @@ async def _prepare_two_parts(key, path, songs, sung_lines):
         if ln in sung_lines:
             break
         tail += len(moras(ln))
-    notes = []
-    tempo = None
-    if intro:
-        n1, tempo = await notes_by_morae(
-            key + "_intro%g" % from_sec,
-            await asyncio.to_thread(_cut, path, 0, from_sec),
-            moras("".join(intro)))
-        notes += n1
     n2, t2 = await notes_by_morae(
         key + "_from%g" % from_sec,
         await asyncio.to_thread(_cut, path, from_sec),
         moras("".join(body)))
-    if tempo is not None and abs(t2 - tempo) > 1e-6:
-        raise LookupError("前奏と歌でテンポの単位が違う")
-    notes += n2[:len(n2) - tail] if tail else n2
-    n_morae = len(moras("".join(intro))) + len(n2) - tail
+    notes = n2[:len(n2) - tail] if tail else n2
+    n_morae = len(n2) - tail
     spm = sum(n[1] for n in notes) * 0.01 / max(n_morae, 1)
     if spm > MAX_SEC_PER_MORA:
         log.info("%s は 1 音 %.2f 秒＝歌詞と音源が対応していないので歌わない",
                  key, spm)
         raise LookupError("歌詞と音源が合っていない")
-    log.info("%s: 前奏 %d 行と歌 %d 行を %.1f 秒で分けて歌う（%d 音・1 音 %.2f 秒）",
-             key, len(intro), len(body), from_sec, len(notes), spm)
+    log.info("%s: 前奏を除き %.1f 秒からの歌 %d 行を歌う（%d 音・1 音 %.2f 秒）",
+             key, from_sec, len(body), len(notes), spm)
     return notes, t2, key
 
 
