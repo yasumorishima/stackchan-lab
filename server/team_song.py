@@ -14,6 +14,7 @@ from_bar で外して歌わない。
 import json
 import logging
 import os
+import random
 import re
 
 import sheet_song
@@ -54,6 +55,9 @@ ALIASES = {
 DEFAULT_CHANCE = "チャンステーマ0"
 _CHANCE_RE = re.compile(r"チャンス(?:テーマ|の歌|のうた|の時|のとき)")
 # 頼み方（歌・テーマ・流して）。これが無い文では曲を選ばない（「得点圏」等）
+CHANCES = ["チャンステーマ0", "チャンステーマ1", "チャンステーマ2",
+           "チャンステーマ3", "ハンターチャンス"]
+_OTHER_RE = re.compile(r"他の|ほかの|別の|べつの|違う|ちがう")
 ASK_RE = re.compile(r"歌|うた|唄|テーマ|流して|聞かせて|聴かせて")
 
 
@@ -72,7 +76,10 @@ def find(text):
     for alias, title in pairs:
         if _norm(alias) in t:
             return title
-    if _CHANCE_RE.search(t):
+    if _CHANCE_RE.search(t) or "チャンス" in t:
+        if _OTHER_RE.search(t):
+            # 「他のチャンステーマ」で同じ曲をまた歌っていた（実機 2026-11-05）
+            return random.choice([c for c in CHANCES if c != DEFAULT_CHANCE])
         return DEFAULT_CHANCE
     return None
 
@@ -102,6 +109,25 @@ def titles(sheet_dir):
     return out
 
 
+def joined(moras):
+    """「+」でつないだ音を 1 つに数えるモーラ分け（べ+い → 「べい」1 つ）。
+
+    応援では「ベイ」「スター」を 1 音で歌う。モーラ単位で数えると歌詞が
+    音符より多くなり、1 つの音符に 2 つ詰めた所から後ろが全部ずれた
+    （user 実機 2026-11-05「歌詞ズレすぎ」。ライジング 音符 86 に歌詞 96）。
+    """
+    def split(text):
+        out = []
+        for i, seg in enumerate(str(text).split("+")):
+            ms = moras(seg)
+            if i > 0 and out and ms:
+                out[-1] += ms[0]
+                ms = ms[1:]
+            out.extend(ms)
+        return out
+    return split
+
+
 def build(title, sheet_dir, moras):
     """(音符, テンポ) を返す。歌えなければ LookupError。"""
     spec = _table(sheet_dir).get(title)
@@ -122,7 +148,7 @@ def build(title, sheet_dir, moras):
     sheet = dict(sheet, notes=notes)
     try:
         out, tempo, nm, _call = sheet_song.build(
-            sheet, spec["lines"], moras, title, as_is=True)
+            sheet, spec["lines"], joined(moras), title, as_is=True)
     except Exception as e:
         log.warning("%s の譜面に歌詞が乗らない: %s: %s",
                     title, type(e).__name__, e)

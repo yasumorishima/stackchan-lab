@@ -523,6 +523,14 @@ def build(sheet, lines, moras, name="", as_is=False):
     words = [w for w in words if w]
     phrases = _phrases(notes)
     groups = _fit_words(words, phrases) if len(phrases) >= 2 else None
+    if as_is and len(sung_lines) == len(phrases):
+        # チーム曲は行をフレーズ（休みで切れる所）に 1 対 1 で書いてある。
+        # DP に任せると同点の切り方で 1 フレーズずれることがあった
+        # （ライジング・2026-11-05「歌詞ズレすぎ」）
+        direct = [moras(ln) for ln in sung_lines]
+        if all(g and len(g) <= 2 * len(ph)
+               for g, ph in zip(direct, phrases)):
+            groups = direct
     if groups is None and len(phrases) == 1:
         # 休符が 1 つも無い曲（梶原）。全体一括に回すと 1 小節目の最後に次の
         # 行の頭が入ってずれる（2026-10-31）。曲全体を 1 フレーズとして
