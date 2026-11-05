@@ -267,6 +267,77 @@ def _cut(path, start, end=None):
     return out
 
 
+def _style_table():
+    """伸ばし方の置き場（非公開・cache/sheets/sung_style.json）。
+
+    形: {選手: {公式の行: 実際の歌い方}}。歌い方は「めざーせ」「ホームラーン」の
+    ように**伸ばす音に「ー」を付けた行**（user 様に教わった形のまま）。
+    """
+    path = os.path.join(SHEET_DIR, "sung_style.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log.warning("sung_style.json が読めない: %s", e)
+        return {}
+
+
+def restyle(notes, lines, style):
+    """行ごとの長さは音源のまま、行の中の音の長さを歌い方の「ー」で配り直す。
+
+    音源から起こした音符は、どの音もほぼ同じ長さ（0.3 秒前後）に並んでいた。
+    「勝利をさあめざーせ」「ホームラーン」の伸ばしが無く、user 実機で
+    「歌ひどい」（2026-11-05）。ー の付いた音を 2、他を 1 の重みで行の長さを
+    分ける。音の高さは、配り直した音と一番長く重なる元の音のもの。
+    notes は [高さ, 長さ, 歌詞]（休みは高さ None）、lines は公式の行。
+    """
+    sung = []                      # (始まり, 長さ, 高さ) 歌う音だけ
+    t = 0
+    rests = {}                     # 歌う音の番号 → 直前の休み
+    for n in notes:
+        if n[0] is None:
+            rests[len(sung)] = rests.get(len(sung), 0) + n[1]
+        else:
+            sung.append((t, n[1], n[0]))
+        t += n[1]
+    out, i = [], 0
+    for ln in lines:
+        k = len(moras(ln))
+        part = sung[i:i + k]
+        want = style.get(ln)
+        if want and len(part) == k and k:
+            ms = moras(want)
+            w = [1 + m.count("ー") for m in ms]
+            t0, t1 = part[0][0], part[-1][0] + part[-1][1]
+            span, acc = t1 - t0, 0
+            if rests.get(i):
+                out.append([None, rests[i], ""])
+            for m, wi in zip(ms, w):
+                a = t0 + span * acc // sum(w)
+                acc += wi
+                b = t0 + span * acc // sum(w)
+                best = max(part, key=lambda q: min(b, q[0] + q[1]) - max(a, q[0]))
+                out.append([best[2], b - a, m])
+        else:
+            for j, q in enumerate(part):
+                if rests.get(i + j):
+                    out.append([None, rests[i + j], ""])
+                out.append([q[2], q[1], notes_lyric(notes, i + j)])
+        i += k
+    for j, q in enumerate(sung[i:]):
+        if rests.get(i + j):
+            out.append([None, rests[i + j], ""])
+        out.append([q[2], q[1], notes_lyric(notes, i + j)])
+    return out
+
+
+def notes_lyric(notes, idx):
+    """歌う音の idx 番目の歌詞。"""
+    return [n for n in notes if n[0] is not None][idx][2]
+
+
 async def _prepare_two_parts(key, path, songs, sung_lines):
     """前奏は歌わず、音源の from_sec 秒から後ろだけを歌の行に合わせて歌う。"""
     from_sec, with_tail = SUNG_FROM_SEC[key]
@@ -291,6 +362,9 @@ async def _prepare_two_parts(key, path, songs, sung_lines):
         moras("".join(body)))
     notes = n2[:len(n2) - tail] if tail else n2
     n_morae = len(n2) - tail
+    style = _style_table().get(key)
+    if style:
+        notes = restyle(notes, body, style)
     spm = sum(n[1] for n in notes) * 0.01 / max(n_morae, 1)
     if spm > MAX_SEC_PER_MORA:
         log.info("%s は 1 音 %.2f 秒＝歌詞と音源が対応していないので歌わない",
