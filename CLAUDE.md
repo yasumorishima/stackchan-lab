@@ -10,6 +10,7 @@
 - Pi で 1 回だけ何か走らせる（prerender・pip install など）: `ops/requests/<日付>-<名前>.sh` を足して merge
 - **歌の割り振り（`sheet_song.py` など）を変えたら、prerender の依頼も一緒に出す**。本番は普段 VOICEVOX を止めている
 - 同じ sha は二度試さない。やり直しは新しい commit で
+- Pi は自然に電源が切れる。ログや反映の報告が止まっていても、まず電源が切れているだけと考える（入れば溜まった main から反映される）
 - 本番で上書きしないもの: `server.conf`・`llm_usage.json`・`test_client.py`・`cache/`・`.venv`
 - `tools/pi-deploy/poll.sh` を変えたときだけ、ローカルで `install.sh` の入れ直しが要る
 - Pi に Claude Code は入れない（共有機。常駐を増やさない）。Pi に入れるのは上の経路だけ
