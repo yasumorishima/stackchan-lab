@@ -218,12 +218,46 @@ def gap_ratio(notes):
     return sum(n[1] for n in notes if not n[0]) / float(total)
 
 
+def per_note(sheet, spec):
+    """譜面の音符 1 つずつに歌詞を書いた歌い方で歌う（並びは音符の順）。
+
+    「ー」は前の音の伸ばし。同じ高さで続く音なら前の音にくっつけ、
+    高さが変わるなら前の母音のまま次の高さへ移る（「せー」が 3 音にまたがる）。
+    """
+    toks = [x for x in spec.replace("/", " ").split()]
+    notes = sorted(sheet["notes"], key=lambda n: n["t16"])
+    if len(toks) != len(notes):
+        raise LookupError("歌い方の字の数 %d が音符 %d と合わない"
+                          % (len(toks), len(notes)))
+    out, t = [], notes[0]["t16"]
+    for n, tok in zip(notes, toks):
+        if n["t16"] > t:
+            out.append([None, n["t16"] - t, ""])
+        pitch = sheet_song.to_pitch(n["semi"])
+        if (tok == "ー" and out and out[-1][0] == pitch
+                and n["t16"] == t):
+            out[-1][1] += n["len16"]
+        else:
+            out.append([pitch, n["len16"], tok])
+        t = n["t16"] + n["len16"]
+    return out, 240.0 / sheet["sec_per_bar"]
+
+
 async def _prepare_sheet(key, songs):
     """譜面 JSON から歌う。音源と違い休符も長さも譜面どおりなので、
     休み割合や 秒/モーラ の門番（音源と歌詞の対応の検査）は通さない。"""
     path = sheet_source(key)
     if path is None:
         raise LookupError("音源が無い")
+    spec = _style_table().get(key, {}).get("per_note")
+    if spec:
+        # 🔴 牧: 音源の歌の部分（15.2 秒〜）には旋律の楽器が無く、音から
+        # 採るとベースを拾っていた（user 実機 2026-11-06「メロディが違う」）。
+        # 譜面の 8 小節＝歌の 8 小節に、教わった歌い方を 1 音ずつ乗せる
+        with open(path, encoding="utf-8") as f:
+            notes, tempo = per_note(json.load(f), spec)
+        log.info("%s: 譜面に 1 音ずつ歌詞を乗せて歌う（%d 音）", key, len(notes))
+        return notes, tempo, key
     # 譜面 JSON の破損・欠落・歌詞との不整合は**恒久的なデータ不良**。
     # 汎用の except に落とすと「いま歌えませんでした」（一時エラー風の
     # 返事）になり何度でも呼ばれるので、LookupError（「その選手の応援歌
