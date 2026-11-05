@@ -24,6 +24,7 @@ import time
 import segment_dp
 import server_tools
 import sheet_song
+import team_song
 import transcribe
 
 log = logging.getLogger("stackchan.song")
@@ -311,6 +312,16 @@ async def _prepare_two_parts(key, path, songs, sung_lines):
 
 async def prepare(session, want):
     """(音符, テンポ, 見出し) を返す。歌えなければ LookupError。"""
+    # チーム曲（熱き星たちよ・チャンステーマ 等）は呼び方で決まり、歌詞も
+    # 譜面も非公開の置き場にある。選手の公式歌詞は要らないので先に見る
+    # 譜面がまだ届いていない時に選手の曲（「捕手のテーマ」等）へ当てない
+    title = team_song.find(want)
+    if title:
+        if title not in team_song.titles(SHEET_DIR):
+            raise LookupError("チーム曲の譜面がまだ無い")
+        notes, tempo = await asyncio.to_thread(
+            team_song.build, title, SHEET_DIR, moras)
+        return notes, tempo, title
     songs = await server_tools._songs(session)
     key = await asyncio.to_thread(server_tools._find_player,
                                   songs, want)

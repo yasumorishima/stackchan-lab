@@ -32,6 +32,7 @@ import mcp_client
 import opus_codec
 import server_tools
 import sing_vv
+import team_song
 
 log = logging.getLogger("stackchan")
 
@@ -457,7 +458,10 @@ async def chat_once(session: aiohttp.ClientSession, history, tools,
                                     token, timeout, on_delta,
                                     effort=REASONING_EFFORT)
         except ChatHTTPError as e:
-            if e.status not in (400, 422) or "reasoning" not in str(e).lower():
+            # Ollama は「does not support thinking」と返す
+            low = str(e).lower()
+            if e.status not in (400, 422) or not (
+                    "reasoning" in low or "thinking" in low):
                 raise
             log.warning("%s は reasoning_effort を受け付けないので外す: %s",
                         base, str(e)[:160])
@@ -1919,7 +1923,8 @@ async def ws_handler(request: web.Request):
         if not song:
             log.info("%s は歌えないので LLM に回す: %s", asked, str(result)[:80])
             return False
-        reply = fix_reading("%sの応援歌を歌うね。" % song["name"])
+        reply = fix_reading("%sを歌うね。"
+                            % server_tools.song_label(song["name"]))
         log.info("LLM を通さずに歌う: %s", song["name"])
         log.info("LLM: %s", reply)
         await send_json({"type": "llm", "emotion": "happy", "text": "😀"})
@@ -2104,7 +2109,9 @@ async def ws_handler(request: web.Request):
             # 歌の依頼だけは流さない。流すと、道具を呼ぶ前にモデルが書いた本文
             # （自分の知識で作った歌詞など）が歌より先に読まれる（実機 2026-10-31）。
             # 全部済んでから「◯◯の応援歌を歌うね。」だけ言って歌う
-            asked = sing_request_name(text)
+            # チーム曲（「点が入った時の歌」「チャンステーマ」）は「◯◯の歌」の
+            # 形にならないことが多いので、呼び方から先に当てる
+            asked = team_song.request(text) or sing_request_name(text)
             if asked and await sing_without_llm(asked):
                 return
             if asked:
@@ -2130,8 +2137,8 @@ async def ws_handler(request: web.Request):
 
             if first is not None and state.get("song") and                     NEGATIVE_SONG_RE.search(first):
                 log.info("歌は用意できているので最初の文を差し替えた: %r", first)
-                first = fix_reading("%sの応援歌を歌うね。"
-                                    % state["song"]["name"])
+                first = fix_reading("%sを歌うね。" % server_tools.song_label(
+                    state["song"]["name"]))
             if first is not None:
                 await send_json({"type": "llm", "emotion": "happy",
                                  "text": "😀"})
@@ -2184,7 +2191,8 @@ async def ws_handler(request: web.Request):
                     # 差し替えは clean_reply の後なので、読みの置換だけ改めて
                     # 通す（実測 2026-08-08 07:52: 差し替え文の「度会隆輝」が
                     # 素通りして「タカテル」と読まれた）
-                    reply = fix_reading("%sの応援歌を歌うね。" % queued["name"])
+                    reply = fix_reading("%sを歌うね。" % server_tools.song_label(
+                        queued["name"]))
                     log.info("本文が無いので歌の一言に差し替えた")
                 log.info("LLM: %s", reply)
                 await send_json({"type": "llm", "emotion": "happy",

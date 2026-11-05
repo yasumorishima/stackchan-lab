@@ -18,6 +18,7 @@ import aiohttp  # noqa: E402
 import cheer_song  # noqa: E402
 import server_tools  # noqa: E402
 import sing_vv  # noqa: E402
+import team_song  # noqa: E402
 
 HOP, WIN = 0.01, 0.06
 RMS_GATE, AC_GATE = 0.004, 0.5
@@ -83,6 +84,10 @@ async def main():
         songs = await server_tools._songs(s)
         names = list(songs)
         print(f"公式に歌詞があるのは {len(names)} 件\n")
+        # チーム曲（熱き星たちよ 等）も作っておく。歌詞と譜面は cache/sheets
+        team = team_song.titles(cheer_song.SHEET_DIR)
+        print(f"チーム曲は {len(team)} 曲\n")
+        names += team
         print("  曲                 秒   声%  ずれ  最長無音  作るのに  控え")
         okn = []
         for name in names:
