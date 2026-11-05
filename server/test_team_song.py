@@ -78,6 +78,13 @@ with tempfile.TemporaryDirectory() as d:
     except LookupError:
         check("無い曲は LookupError", True, True)
 
+# ⑤ 伸ばし方（音源から起こすと全部同じ長さになる。ー の音を長く配り直す）
+src = [["C4", 30, "め"], ["D4", 30, "ざ"], [None, 10, ""], ["E4", 30, "せ"],
+       ["F4", 30, "ほ"]]
+got = cheer_song.restyle(src, ["めざせ", "ほ"], {"めざせ": "めざーせ"})
+check("ー を長く", [(n[2], n[1]) for n in got],
+      [("め", 25), ("ざー", 50), ("せ", 25), ("ほ", 30)])
+
 # ④ 返事の言い方
 check("チーム曲", server_tools.song_label("熱き星たちよ"), "熱き星たちよ")
 check("選手", server_tools.song_label("牧秀悟"), "牧秀悟の応援歌")
