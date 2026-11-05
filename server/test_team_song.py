@@ -85,6 +85,14 @@ got = cheer_song.restyle(src, ["めざせ", "ほ"], {"めざせ": "めざーせ"
 check("ー を長く", [(n[2], n[1]) for n in got],
       [("め", 25), ("ざー", 50), ("せ", 25), ("ほ", 30)])
 
+# ⑥ 譜面に 1 音ずつ歌詞（同じ高さの「ー」は前に足す・高さが変わる「ー」は残す）
+sh = {"sec_per_bar": 1.28, "notes": [
+    {"t16": 2, "len16": 2, "semi": 7}, {"t16": 4, "len16": 8, "semi": 7},
+    {"t16": 12, "len16": 2, "semi": 5}, {"t16": 16, "len16": 4, "semi": 4}]}
+got, _t = cheer_song.per_note(sh, "ワ ー / せ ー")
+check("1 音ずつ", [(n[2], n[1]) for n in got],
+      [("ワ", 10), ("せ", 2), ("", 2), ("ー", 4)])
+
 # ④ 返事の言い方
 check("チーム曲", server_tools.song_label("熱き星たちよ"), "熱き星たちよ")
 check("選手", server_tools.song_label("牧秀悟"), "牧秀悟の応援歌")
