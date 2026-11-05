@@ -440,9 +440,36 @@ def should_fall_back(e) -> bool:
     return True
 
 
+# gpt-oss は答える前に考える（analysis）。既定の考える量（medium）だと
+# 最初の 1 文まで中央 1.24 秒・道具ありで 2.67 秒かかる（本番 11 月）。
+# 卓上の短い会話には low で足りる。受け付けない API なら外して送り直す
+REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "low")
+_effort_refused = set()        # reasoning_effort を弾いた base
+
+
 async def chat_once(session: aiohttp.ClientSession, history, tools,
                     base: str, model: str, token: str,
                     timeout: float = None, on_delta=None) -> dict:
+    """reasoning_effort を付けて叩き、弾かれたら外して叩き直す。"""
+    if REASONING_EFFORT and base not in _effort_refused:
+        try:
+            return await _chat_once(session, history, tools, base, model,
+                                    token, timeout, on_delta,
+                                    effort=REASONING_EFFORT)
+        except ChatHTTPError as e:
+            if e.status not in (400, 422) or "reasoning" not in str(e).lower():
+                raise
+            log.warning("%s は reasoning_effort を受け付けないので外す: %s",
+                        base, str(e)[:160])
+            _effort_refused.add(base)
+    return await _chat_once(session, history, tools, base, model, token,
+                            timeout, on_delta)
+
+
+async def _chat_once(session: aiohttp.ClientSession, history, tools,
+                     base: str, model: str, token: str,
+                     timeout: float = None, on_delta=None,
+                     effort: str = None) -> dict:
     """OpenAI 互換の chat completions を 1 回叩き、assistant メッセージを返す。
 
     tool_calls を落とさないよう、本文の文字列ではなく message 辞書を返す。
@@ -462,6 +489,8 @@ async def chat_once(session: aiohttp.ClientSession, history, tools,
         "max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "800")),
         "stream": on_delta is not None,
     }
+    if effort:
+        payload["reasoning_effort"] = effort
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -1874,6 +1903,36 @@ async def ws_handler(request: web.Request):
         """出来上がっている音を、合成と同じ形で渡すための包み。"""
         return pcm
 
+    async def sing_without_llm(asked):
+        """「◯◯の応援歌歌って」は LLM を通さずに歌う。歌えなければ False。
+
+        LLM を通すと道具の往復で 2〜6 秒待たせる（本番 11 月の中央 2.67 秒）。
+        頼まれ方がはっきりしているので、こちらで道具を呼べば足りる。"""
+        ctx2 = {}
+        try:
+            result = await server_tools.sing_cheer_song(
+                session, {"player": asked}, ctx2)
+        except Exception as e:
+            log.warning("歌を用意できなかった: %s: %s", type(e).__name__, e)
+            return False
+        song = ctx2.get("song")
+        if not song:
+            log.info("%s は歌えないので LLM に回す: %s", asked, str(result)[:80])
+            return False
+        reply = fix_reading("%sの応援歌を歌うね。" % song["name"])
+        log.info("LLM を通さずに歌う: %s", song["name"])
+        log.info("LLM: %s", reply)
+        await send_json({"type": "llm", "emotion": "happy", "text": "😀"})
+        try:
+            await speak(reply)
+        finally:
+            await sing_song(song)
+        state["history"].append({"role": "assistant", "content": reply})
+        state["history"] = trim_history(state["history"])
+        hist_store[device_id] = (time.time(), list(state["history"]))
+        state["last_spoke"] = time.monotonic()
+        return True
+
     async def sing_song(song):
         """応援歌を歌う。合成は重いので別スレッドで回す。"""
         t0 = time.monotonic()
@@ -2046,6 +2105,8 @@ async def ws_handler(request: web.Request):
             # （自分の知識で作った歌詞など）が歌より先に読まれる（実機 2026-10-31）。
             # 全部済んでから「◯◯の応援歌を歌うね。」だけ言って歌う
             asked = sing_request_name(text)
+            if asked and await sing_without_llm(asked):
+                return
             if asked:
                 task = asyncio.create_task(respond(
                     session, state["history"], tools=tools,
