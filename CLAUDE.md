@@ -20,6 +20,13 @@
 - `yasumorishima/stackchan-cache`: 本番の `cache/`（`songs/` 音源と歌・`sheets/` 譜面・`marts/` MLB の表）。
   音源と歌詞は公開レポ（このレポ）に入れない
 
+## LLM（決定済み・調べ直さない）
+- **さくらの gpt-oss-120b のまま**（user 決定 2026-11-05）。さくらで無償枠（月 3,000 回）があるのはこれだけ。
+  gpt-oss-20b はさくらに無い。ほかの軽いモデル（Qwen3.6-35B-A3B・gemma-4・llm-jp 等）は有料かプレビューなので使わない。
+  Haiku など他社への乗り換えも提案しない
+- 速さはモデルを替えずに詰める: `reasoning_effort=low`（`LLM_REASONING_EFFORT`）、歌の依頼は LLM を通さない、
+  起動時の認識の温め。次の候補は話し終わり判定（無音 0.6 秒）の短縮と、よくある質問を LLM なしで答えること
+
 ## クラウドで試す
 - `server/cloud_setup.sh` で依存・認識モデル・VOICEVOX・Ollama を入れ、`server/cloud_up.sh` で起動
   （`stackchan-cache` を `/home/user/stackchan-cache` に clone してあれば歌もそれを使う）
