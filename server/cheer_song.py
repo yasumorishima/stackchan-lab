@@ -241,6 +241,27 @@ async def _prepare_sheet(key, songs):
     return notes, tempo, key
 
 
+# 🔴 前奏が「同じ旋律を掛け声で歌う」形の曲は、全歌詞を曲全体へ均等に
+# 合わせると歌の頭が前奏に食い込む（user 実機 2026-11-05「牧と筒香は前奏が
+# 違う歌詞なのに、歌おうとして間違ってる」）。音源で歌が始まる秒を曲ごとに
+# 持ち、そこから後ろだけを歌詞に合わせる。
+# 牧: 2.8〜9 秒の旋律が 16.7 秒からもう一度出る（音高の並びが一致）＝後半が歌。
+# 筒香: 13.8 秒からの長い音のあと 15.7 秒から歌（音量も 16 秒台で一段上がる）
+# 値は (歌が始まる秒, 最後のコールも音源にあるか)。牧の後半は 8.5 秒で
+# 歌詞 25 モーラ＝前半の掛け声と同じ 1 音 0.34 秒になり、コールの入る余地が無い
+SUNG_FROM_SEC = {"牧秀悟": (16.6, False), "筒香嘉智": (15.6, True)}
+
+
+def _cut_from(path, sec):
+    """音源の `sec` 秒から後ろを wav に切り出して置く（一度作れば使い回す）。"""
+    out = "%s.from%g.wav" % (os.path.splitext(path)[0], sec)
+    if not os.path.exists(out) or os.path.getmtime(out) < os.path.getmtime(path):
+        import subprocess
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", str(sec), "-i",
+                        path, "-ac", "1", out], check=True)
+    return out
+
+
 async def prepare(session, want):
     """(音符, テンポ, 見出し) を返す。歌えなければ LookupError。"""
     songs = await server_tools._songs(session)
@@ -292,7 +313,20 @@ async def prepare(session, want):
     # 切り出す**（歌詞だけ減らすと 1 音が伸びて「対応していない」で弾かれる。
     # 実測 2026-08-08: 筒香が 39 モーラ / 32 秒 = 0.83 秒で歌えなくなった）
     # 注意書き（※…）は音源で歌われていないので、対応付けにも入れない
-    all_lines = sheet_song.drop_notes(list(songs.get(key, [])))
+    if key in SUNG_FROM_SEC:
+        from_sec, with_tail = SUNG_FROM_SEC[key]
+        path = await asyncio.to_thread(_cut_from, path, from_sec)
+        # 前奏を切った音源には先頭の掛け声が無い。歌う行からあとだけで合わせる
+        all_lines = sheet_song.drop_notes(list(songs.get(key, [])))
+        all_lines = all_lines[next((i for i, ln in enumerate(all_lines)
+                                    if ln in sung_lines), 0):]
+        if not with_tail:
+            while all_lines and all_lines[-1] not in sung_lines:
+                all_lines.pop()
+        key_seg = key + "_from%g" % from_sec
+    else:
+        all_lines = sheet_song.drop_notes(list(songs.get(key, [])))
+        key_seg = key
     all_morae = moras("".join(all_lines))
     morae = moras(text)
     if not morae:
@@ -308,13 +342,13 @@ async def prepare(session, want):
             break
         tail += len(moras(ln))
     if head or tail:
-        notes, tempo = await notes_by_morae(key, path, all_morae)
+        notes, tempo = await notes_by_morae(key_seg, path, all_morae)
         end = len(notes) - tail if tail else len(notes)
         notes = notes[head:end]
         log.info("%s: 掛け声を除いて %d〜%d 音を歌う（全 %d モーラ）",
                  key, head, end, len(all_morae))
     else:
-        notes, tempo = await notes_by_morae(key, path, morae)
+        notes, tempo = await notes_by_morae(key_seg, path, morae)
     # 🔴 音源が歌詞を 1 対 1 で覆っていない曲は歌わない。DP は必ずモーラ数だけ
     # 音符を作るので、覆っていない曲では 1 音が異様に伸びて歌にならない。
     # 実測（2026-08-06・13 曲）: 12 曲は 0.22〜0.58 秒/モーラに固まり、
