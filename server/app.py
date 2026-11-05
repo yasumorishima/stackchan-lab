@@ -2318,6 +2318,32 @@ async def health(request):
                               "llm": LLM_BACKEND, "tts": TTS_BACKEND})
 
 
+# 🔴 長く話しかけないと、最初の認識が極端に遅くなる（本番 2026-11-05 07:09:
+# 0.82 秒の音声に 7.66 秒＝ふだんの 15 倍。21:18 は認識が終わる前に本体が
+# 切って「はい、スタックちゃん」に返事が無かった）。Pi は共有機で、使って
+# いない間にモデルのメモリが追い出される。ときどき短い無音を認識させて
+# 温めておく（1 回 0.1 秒程度）
+STT_KEEPWARM_SEC = float(os.environ.get("STT_KEEPWARM_SEC", "120"))
+
+
+async def keep_stt_warm():
+    import array
+    import random
+    rnd = random.Random(0)
+    quiet = array.array("h", (rnd.randint(-60, 60)
+                              for _ in range(UP_RATE // 2))).tobytes()
+    while STT_KEEPWARM_SEC > 0:
+        t0 = time.monotonic()
+        try:
+            await local_stt.transcribe(STT_BACKEND, quiet, UP_RATE)
+        except Exception as e:
+            log.warning("認識の温めに失敗: %s: %s", type(e).__name__, e)
+        dt = time.monotonic() - t0
+        if dt > 1.0:
+            log.info("認識の温めに %.2f 秒かかった（冷えていた）", dt)
+        await asyncio.sleep(STT_KEEPWARM_SEC)
+
+
 async def on_startup(app):
     app["http"] = aiohttp.ClientSession()
     app["sockets"] = weakref.WeakSet()
@@ -2326,6 +2352,7 @@ async def on_startup(app):
         # 初回発話でモデル読み込みを待たせない
         await asyncio.to_thread(local_stt.warmup, STT_BACKEND)
         log.info("local stt warmed up: %s", STT_BACKEND)
+        app["stt_warm"] = asyncio.create_task(keep_stt_warm())
 
 
 async def on_shutdown(app):
@@ -2344,6 +2371,8 @@ async def on_shutdown(app):
 
 
 async def on_cleanup(app):
+    if app.get("stt_warm"):
+        app["stt_warm"].cancel()
     await app["http"].close()
 
 
