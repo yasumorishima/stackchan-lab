@@ -241,25 +241,72 @@ async def _prepare_sheet(key, songs):
     return notes, tempo, key
 
 
-# 🔴 前奏が「同じ旋律を掛け声で歌う」形の曲は、全歌詞を曲全体へ均等に
+# 🔴 前奏と歌で歌詞が違う曲（前奏は掛け声の歌詞）は、全歌詞を曲全体へ均等に
 # 合わせると歌の頭が前奏に食い込む（user 実機 2026-11-05「牧と筒香は前奏が
-# 違う歌詞なのに、歌おうとして間違ってる」）。音源で歌が始まる秒を曲ごとに
-# 持ち、そこから後ろだけを歌詞に合わせる。
+# 違う歌詞なのに、歌おうとして間違ってる」「前奏も正しい歌詞で歌えばいい」）。
+# 音源で歌が始まる秒を曲ごとに持ち、**前奏は掛け声の行、そこから後ろは歌の
+# 行**と分けて合わせ、両方歌う。
 # 牧: 2.8〜9 秒の旋律が 16.7 秒からもう一度出る（音高の並びが一致）＝後半が歌。
 # 筒香: 13.8 秒からの長い音のあと 15.7 秒から歌（音量も 16 秒台で一段上がる）
 # 値は (歌が始まる秒, 最後のコールも音源にあるか)。牧の後半は 8.5 秒で
-# 歌詞 25 モーラ＝前半の掛け声と同じ 1 音 0.34 秒になり、コールの入る余地が無い
+# 歌詞 25 モーラ＝前奏と同じ 1 音 0.34 秒になり、コールの入る余地が無い
 SUNG_FROM_SEC = {"牧秀悟": (16.6, False), "筒香嘉智": (15.6, True)}
 
 
-def _cut_from(path, sec):
-    """音源の `sec` 秒から後ろを wav に切り出して置く（一度作れば使い回す）。"""
-    out = "%s.from%g.wav" % (os.path.splitext(path)[0], sec)
+def _cut(path, start, end=None):
+    """音源の start〜end 秒を wav に切り出して置く（一度作れば使い回す）。"""
+    out = "%s.cut%g-%s.wav" % (os.path.splitext(path)[0], start,
+                               "%g" % end if end is not None else "end")
     if not os.path.exists(out) or os.path.getmtime(out) < os.path.getmtime(path):
         import subprocess
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", str(sec), "-i",
-                        path, "-ac", "1", out], check=True)
+        cmd = ["ffmpeg", "-v", "error", "-y", "-ss", str(start), "-i", path]
+        if end is not None:
+            cmd += ["-t", str(end - start)]
+        subprocess.run(cmd + ["-ac", "1", out], check=True)
     return out
+
+
+async def _prepare_two_parts(key, path, songs, sung_lines):
+    """前奏（掛け声の行）と歌（歌の行）を別々に音源へ合わせて、続けて歌う。"""
+    from_sec, with_tail = SUNG_FROM_SEC[key]
+    # sung_lines は助詞の読みを直した後の行なので、こちらも直してから比べる
+    lines = [sheet_song.read_particles(x) for x in
+             sheet_song.drop_notes(list(songs.get(key, [])))]
+    first = next((i for i, ln in enumerate(lines) if ln in sung_lines), 0)
+    intro = lines[:first]
+    body = lines[first:]
+    if not with_tail:
+        while body and body[-1] not in sung_lines:
+            body.pop()
+    tail = 0
+    for ln in reversed(body):
+        if ln in sung_lines:
+            break
+        tail += len(moras(ln))
+    notes = []
+    tempo = None
+    if intro:
+        n1, tempo = await notes_by_morae(
+            key + "_intro%g" % from_sec,
+            await asyncio.to_thread(_cut, path, 0, from_sec),
+            moras("".join(intro)))
+        notes += n1
+    n2, t2 = await notes_by_morae(
+        key + "_from%g" % from_sec,
+        await asyncio.to_thread(_cut, path, from_sec),
+        moras("".join(body)))
+    if tempo is not None and abs(t2 - tempo) > 1e-6:
+        raise LookupError("前奏と歌でテンポの単位が違う")
+    notes += n2[:len(n2) - tail] if tail else n2
+    n_morae = len(moras("".join(intro))) + len(n2) - tail
+    spm = sum(n[1] for n in notes) * 0.01 / max(n_morae, 1)
+    if spm > MAX_SEC_PER_MORA:
+        log.info("%s は 1 音 %.2f 秒＝歌詞と音源が対応していないので歌わない",
+                 key, spm)
+        raise LookupError("歌詞と音源が合っていない")
+    log.info("%s: 前奏 %d 行と歌 %d 行を %.1f 秒で分けて歌う（%d 音・1 音 %.2f 秒）",
+             key, len(intro), len(body), from_sec, len(notes), spm)
+    return notes, t2, key
 
 
 async def prepare(session, want):
@@ -314,19 +361,9 @@ async def prepare(session, want):
     # 実測 2026-08-08: 筒香が 39 モーラ / 32 秒 = 0.83 秒で歌えなくなった）
     # 注意書き（※…）は音源で歌われていないので、対応付けにも入れない
     if key in SUNG_FROM_SEC:
-        from_sec, with_tail = SUNG_FROM_SEC[key]
-        path = await asyncio.to_thread(_cut_from, path, from_sec)
-        # 前奏を切った音源には先頭の掛け声が無い。歌う行からあとだけで合わせる
-        all_lines = sheet_song.drop_notes(list(songs.get(key, [])))
-        all_lines = all_lines[next((i for i, ln in enumerate(all_lines)
-                                    if ln in sung_lines), 0):]
-        if not with_tail:
-            while all_lines and all_lines[-1] not in sung_lines:
-                all_lines.pop()
-        key_seg = key + "_from%g" % from_sec
-    else:
-        all_lines = sheet_song.drop_notes(list(songs.get(key, [])))
-        key_seg = key
+        return await _prepare_two_parts(key, path, songs, sung_lines)
+    all_lines = sheet_song.drop_notes(list(songs.get(key, [])))
+    key_seg = key
     all_morae = moras("".join(all_lines))
     morae = moras(text)
     if not morae:
