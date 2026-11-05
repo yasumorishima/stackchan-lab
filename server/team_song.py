@@ -154,6 +154,16 @@ def build(title, sheet_dir, moras):
     if not notes:
         raise LookupError("歌う範囲に音符が無い")
     sheet = dict(sheet, notes=notes)
+    if spec.get("per_note"):
+        # 譜面の音符 1 つずつに字を書いた曲（掛け声と歌が混ざる曲は、行を
+        # フレーズに配る自動の割り振りでは合わない）
+        try:
+            out, tempo = sheet_song.per_note(sheet, spec["per_note"])
+        except ValueError as e:
+            log.warning("%s: %s", title, e)
+            raise LookupError("譜面に歌詞が乗らない")
+        log.info("%s: 譜面に 1 音ずつ歌う（音符 %d）", title, len(notes))
+        return out, tempo
     try:
         out, tempo, nm, _call = sheet_song.build(
             sheet, spec["lines"], joined(moras), title, as_is=True)

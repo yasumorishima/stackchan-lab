@@ -491,6 +491,31 @@ def _long_mora_index(ms):
     return len(ms) - 1
 
 
+def per_note(sheet, spec):
+    """譜面の音符 1 つずつに歌詞を書いた歌い方で歌う（並びは音符の順）。
+
+    「ー」は前の音の伸ばし。同じ高さで続く音なら前の音にくっつけ、
+    高さが変わるなら前の母音のまま次の高さへ移る（「せー」が 3 音にまたがる）。
+    """
+    toks = [x for x in spec.replace("/", " ").split()]
+    notes = sorted(sheet["notes"], key=lambda n: n["t16"])
+    if len(toks) != len(notes):
+        raise ValueError("歌い方の字の数 %d が音符 %d と合わない"
+                          % (len(toks), len(notes)))
+    out, t = [], notes[0]["t16"]
+    for n, tok in zip(notes, toks):
+        if n["t16"] > t:
+            out.append([None, n["t16"] - t, ""])
+        pitch = to_pitch(n["semi"])
+        if (tok == "ー" and out and out[-1][0] == pitch
+                and n["t16"] == t):
+            out[-1][1] += n["len16"]
+        else:
+            out.append([pitch, n["len16"], tok])
+        t = n["t16"] + n["len16"]
+    return out, 240.0 / sheet["sec_per_bar"]
+
+
 def build(sheet, lines, moras, name="", as_is=False):
     """(音符, テンポ, モーラ数, コール行) を返す。
 
