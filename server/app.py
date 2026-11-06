@@ -1999,7 +1999,11 @@ async def ws_handler(request: web.Request):
             spoken.append(s)
             if not pcm:
                 continue
-            chunks = split_for_barge(pcm)
+            # 🔴 歌は途中で切って割り込みを聞かない。切れ目で歌が止まる上に、
+            # その窓で拾った音（歌の残響や周りの声）で残りをやめていた
+            # （user 実機 2026-11-06「柴田 最後まで歌わない」＝ 10.3 秒の歌が
+            # 6.4 秒で止まった）
+            chunks = [pcm] if made else split_for_barge(pcm)
             if len(chunks) > 1:
                 log.info("この文を %d 片に分けて、間で割り込みを聞く", len(chunks))
             for chunk in chunks:
