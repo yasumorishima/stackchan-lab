@@ -152,6 +152,8 @@ def sheet_source(name):
 # 2 = DP でモーラ数に区切る（2026-08-06〜）
 SEG_VERSION = 2
 # 1 音がこれより長い曲は、音源が歌詞を覆っていない＝歌わない（秒）
+# 1 にすると、譜面の無い曲も原曲の音源から採って歌う（旋律が合わないので普段は 0）
+FROM_AUDIO = os.environ.get("SING_FROM_AUDIO", "0") == "1"
 MAX_SEC_PER_MORA = float(os.environ.get("SING_MAX_SEC_PER_MORA", "0.8"))
 
 
@@ -428,6 +430,12 @@ async def prepare(session, want):
     # 繰り返しの見立てが怪しい曲は置かない（判定を置き場で表す）
     if sheet_source(key):
         return await _prepare_sheet(key, songs)
+    if not FROM_AUDIO:
+        # 🔴 譜面の無い曲は歌わない。原曲の音源は歌の部分に旋律の楽器が無く
+        # （伴奏とベースだけ）、音から採るとベースを拾って出鱈目な旋律になる
+        # （user 実機 2026-11-06「筒香 適当な歌」「森敬斗 適当な歌」）
+        log.info("%s は譜面がまだ無いので歌わない", key)
+        raise LookupError("譜面がまだ無い")
 
     # 置いてもらった音源（配布ページに無い選手はこれしか手が無い）
     path = local_audio(key)
@@ -513,15 +521,15 @@ async def singable(session):
     songs = await server_tools._songs(session)
     table = await audio_index(session)
     out = []
-    for name in table:
+    for name in table if FROM_AUDIO else []:
         key = await asyncio.to_thread(server_tools._find_player,
                                       songs, name)
         if key and songs.get(key) and _cached_ok(name):
             out.append(key)
-    for key, src in _REUSE.items():
+    for key, src in (_REUSE.items() if FROM_AUDIO else []):
         if songs.get(key) and match_player(table, src):
             out.append(key)
-    for key in songs:                       # 手元に置いてもらった音源
+    for key in (songs if FROM_AUDIO else []):   # 手元に置いてもらった音源
         if songs.get(key) and local_audio(key):
             out.append(key)
     for key in songs:                       # 譜面から起こした旋律
