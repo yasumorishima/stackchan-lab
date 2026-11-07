@@ -165,6 +165,10 @@ BARGE_LISTEN_WAIT = float(os.environ.get("BARGE_LISTEN_WAIT", "2.5"))
 SPEAK_TAIL_SEC = float(os.environ.get("SPEAK_TAIL_SEC", "0.8"))
 # こちらが話した直後なら相槌にも返事をする猶予 [s]
 FILLER_FOLLOWUP_SEC = float(os.environ.get("FILLER_FOLLOWUP_SEC", "15"))
+# 話し始めの閾値の何倍に届かない声を「遠くの小さな音」とみなすか。実ログ
+# （11/4〜11/7・590 件）で話しかけは 2.5 倍以上、テレビや周りの声の聞き違い
+# （「これ」「現場」）は 2.1 倍以下だった
+QUIET_RATIO = float(os.environ.get("QUIET_RATIO", "2.2"))
 
 # 環境音や独り言を sherpa が書き起こしがちな相槌。単体では話しかけと見なさない
 FILLER_WORDS = frozenset((
@@ -183,8 +187,8 @@ WAKE_WORDS = ("スタック", "すたっく", "スタッグ", "すたっぐ", "�
 
 
 def worth_answering(text: str, last_spoke_age: float,
-                    filler_streak: int = 0, first_of_session: bool = False
-                    ) -> bool:
+                    filler_streak: int = 0, first_of_session: bool = False,
+                    loudness: float = 99.0) -> bool:
     """認識結果に返事をすべきか。
 
     実機のマイクは常時開いていて、環境音や独り言が「うん」「はあ」のような
@@ -198,6 +202,12 @@ def worth_answering(text: str, last_spoke_age: float,
         return False
     if any(w in t for w in WAKE_WORDS):
         return True                       # 名前を呼ばれた＝話しかけ
+    if loudness < QUIET_RATIO and last_spoke_age > FILLER_FOLLOWUP_SEC:
+        # 🔴 遠くの小さな音の聞き違いに返事しない。周りの声が「これ」「現場」に
+        # なり、前の話の続きとして歌い出したり本体の様子を話したりしていた
+        # （user 実機 2026-11-07「いまのロボットの状況を勝手に話すのはなぜ」）。
+        # 名前を呼ぶか、こちらが話した直後の返事なら通る
+        return False
     if t in FILLER_WORDS or len(t) <= 1:
         # その接続で最初の一言なら、まだ会話が無い＝相槌ではありえない。
         # 実ログで止めた 162 件は全部 会話の途中＝ここを通しても取りこぼしは
@@ -2059,6 +2069,7 @@ async def ws_handler(request: web.Request):
         return await mcp.call(name, args)
 
     async def handle_utterance(pcm, stream):
+        loud = state.get("utt_loud", 99.0)
         if len(pcm) < UP_RATE * 2 * 0.3:
             log.info("utterance too short (%d bytes), ignored", len(pcm))
             return
@@ -2080,9 +2091,9 @@ async def ws_handler(request: web.Request):
             state["filler_streak"] = streak + 1 if _is_filler(text) else 0
             first = not state.get("heard_any")
             state["heard_any"] = True
-            if not worth_answering(text, age, streak, first):
-                log.info("相槌・空認識には返答しない（前回の発話から %.0f 秒）: %r",
-                         age, text)
+            if not worth_answering(text, age, streak, first, loud):
+                log.info("相槌・空認識には返答しない（前回の発話から %.0f 秒・"
+                         "声の大きさ 閾値の %.1f 倍）: %r", age, loud, text)
                 return
             await send_json({"type": "stt", "text": text})
             state["history"] = trim_history(state["history"] + [stamped_user(text)])
@@ -2254,6 +2265,7 @@ async def ws_handler(request: web.Request):
 
     def finish_listening():
         state["listening"] = False
+        state["utt_loud"] = state["max_rms"] / max(vad_threshold(state), 1.0)
         # 閾値を実機の音量に合わせるための材料。推測で決めない
         log.info("この発話の最大音量 rms=%.0f（話し始めの閾値 %.0f / "
                  "続きの閾値 %.0f / 静けさ %.0f）",
