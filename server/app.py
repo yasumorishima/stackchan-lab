@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import socket
 import struct
@@ -344,6 +345,10 @@ SYSTEM_PROMPT = os.environ.get(
 # 落ちた。同じ履歴の再現で本文 215 字 → 読み上げ 51 字）。声の長さを
 # 決めているのは字数の方なので、文の数はそれを邪魔しない位置まで広げる
 MAX_SENTENCES = int(os.environ.get("MAX_SENTENCES", "12"))
+# 答えの 1 文目がこれより遅いなら、先に「ちょっと待ってね」と言って間を空けない
+# （普段は話し終わりから 1.4 秒・認識 0.3 秒を引くと 1.1 秒。遅い回だけ言う）
+THINK_SEC = float(os.environ.get("THINK_SEC", "1.8"))
+THINK_FILLERS = ("ちょっと待ってね。", "いま調べてるよ。", "うーんと、ちょっと待ってね。")
 # 字数を広げたのは、網羅した答え（燃油サーチャージの全方面で 177 字、
 # 渡航情報の世界集計で 79 字）が途中で切れないため
 MAX_REPLY_CHARS = int(os.environ.get("MAX_REPLY_CHARS", "240"))
@@ -2171,17 +2176,34 @@ async def ws_handler(request: web.Request):
             asked = team_song.request(text) or sing_request_name(text)
             if asked and await sing_without_llm(asked):
                 return
+            filler = None
             if asked:
                 task = asyncio.create_task(respond(
                     session, state["history"], tools=tools,
                     call_tool=call_tool))
+                done, _ = await asyncio.wait({task}, timeout=THINK_SEC)
+                if not done:
+                    # 歌の用意が遅いときも黙らない（歌の前の一言は後で言う）
+                    log.info("歌の用意に %.1f 秒以上かかるので間をつなぐ", THINK_SEC)
+                    await speak(random.choice(THINK_FILLERS))
                 first = None
             else:
                 queue = asyncio.Queue()
                 feed = SentenceFeed(queue)
                 task = asyncio.create_task(respond_feeding(
                     session, state["history"], tools, call_tool, feed))
-                first = await queue.get()
+                job = asyncio.ensure_future(queue.get())
+                filler = None
+                done, _ = await asyncio.wait({job}, timeout=THINK_SEC)
+                if done:
+                    first = job.result()
+                else:
+                    # 🔴 黙って待たせない。1 文目が遅ければ先に一言かけ、同じ読み上げの
+                    # 続きで答える（tts を止めないので本体は聞きに戻らない）
+                    # （user 2026-11-14「考え中とか、いま考えてるよ、とか、間を開けなければいいだけ」）
+                    log.info("答えに %.1f 秒以上かかるので間をつなぐ", THINK_SEC)
+                    first = random.choice(THINK_FILLERS)
+                    filler = {"job": job, "first": None}
 
             async def _no_deny(src):
                 """歌を用意できている間は否定的な文を読まない。"""
@@ -2196,17 +2218,37 @@ async def ws_handler(request: web.Request):
                 log.info("歌は用意できているので最初の文を差し替えた: %r", first)
                 first = fix_reading("%sを歌うね。" % server_tools.song_label(
                     state["song"]["name"]))
+            async def _filler_then_answer():
+                """つなぎの一言のあと、答えの 1 文目を待って同じ読み上げで続ける。"""
+                yield first
+                nxt = await filler["job"]
+                filler["first"] = nxt
+                if nxt is None:
+                    return            # 本文が出なかった。答えは下の別経路で言う
+                if state.get("song") and NEGATIVE_SONG_RE.search(nxt):
+                    nxt = fix_reading("%sを歌うね。" % server_tools.song_label(
+                        state["song"]["name"]))
+                async for x in _aiter_queue(queue, nxt):
+                    yield x
+
             if first is not None:
                 await send_json({"type": "llm", "emotion": "happy",
                                  "text": "😀"})
+                src = (_filler_then_answer() if filler
+                       else _aiter_queue(queue, first))
                 try:
-                    await speak(source=_no_deny(_aiter_queue(queue, first)))
+                    await speak(source=_no_deny(src))
                 finally:
                     # 歌は読み上げのあと。ここで降ろす（読み上げが例外で
                     # 落ちても次の発話に持ち越さない）
-                    song = state.pop("song", None)
+                    # つなぎだけで本文が出なかった時は、下で一言添えてから歌う
+                    silent = filler and filler["first"] is None
+                    song = None if silent else state.pop("song", None)
                     if song:
                         await sing_song(song)
+                if filler and filler["first"] is None:
+                    first = None
+            if first is not None:
                 reply, trace = await task
                 log.info("LLM: %s", reply)
                 # モデルが「歌うね」と言いながら道具を呼ばないことがある
