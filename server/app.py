@@ -348,7 +348,36 @@ MAX_SENTENCES = int(os.environ.get("MAX_SENTENCES", "12"))
 # 答えの 1 文目がこれより遅いなら、先に「ちょっと待ってね」と言って間を空けない
 # （普段は話し終わりから 1.4 秒・認識 0.3 秒を引くと 1.1 秒。遅い回だけ言う）
 THINK_SEC = float(os.environ.get("THINK_SEC", "1.8"))
-THINK_FILLERS = ("ちょっと待ってね。", "いま調べてるよ。", "うーんと、ちょっと待ってね。")
+THINK_FILLERS = ("確認してるよ、ちょっと待ってね。", "いま調べてるよ、少し時間かかるよ。",
+                 "うーんと、ちょっと待ってね。")
+# まだ答えが出なければ、調べ終わるまで豆知識で間をつなぐ（データは取らない・手元の文だけ）
+# （user 2026-11-14「確認してるよ、ちょっと時間かかるよ、それまで豆知識、とか、適当に話せばいい」）
+# 🔴 足すときは確かな話だけ。1 文は読点ごとに短く
+TRIVIA = (
+    "横浜スタジアムは、1978年にできたんだよ。",
+    "横浜の港は、1859年に開港したんだよ。",
+    "ベイスターズは、1998年と2024年に日本一になったよ。",
+    "野球のボールの縫い目は、108個あるんだって。",
+    "富士山の高さは、3776メートルだよ。",
+    "タコの心臓は、3つあるんだって。",
+    "キリンの首の骨の数は、人と同じ7個なんだって。",
+    "シロクマの毛の下の皮膚は、黒いんだって。",
+    "金星は、地球と逆向きに自転しているんだよ。",
+    "地球から月までは、およそ38万キロメートルだよ。",
+    "ハチミツは腐りにくくて、とても長く保存できるんだって。",
+    "ペンギンは鳥だけど、空は飛べないんだよね。",
+    "雷が光ってから音が聞こえるまでの秒数で、だいたいの距離が分かるよ。",
+    "バナナは、植物の分け方だとベリーの仲間なんだって。",
+)
+TRIVIA_WAIT_SEC = float(os.environ.get("TRIVIA_WAIT_SEC", "2.0"))
+_trivia_at = [random.randrange(len(TRIVIA))]
+
+
+def next_trivia(first: bool) -> str:
+    """順番に 1 つ（同じ話を続けない）。"""
+    i = _trivia_at[0] % len(TRIVIA)
+    _trivia_at[0] += 1
+    return ("待ってる間に豆知識。" if first else "もう一つ。") + TRIVIA[i]
 # 字数を広げたのは、網羅した答え（燃油サーチャージの全方面で 177 字、
 # 渡航情報の世界集計で 79 字）が途中で切れないため
 MAX_REPLY_CHARS = int(os.environ.get("MAX_REPLY_CHARS", "240"))
@@ -2221,8 +2250,18 @@ async def ws_handler(request: web.Request):
             async def _filler_then_answer():
                 """つなぎの一言のあと、答えの 1 文目を待って同じ読み上げで続ける。"""
                 yield first
-                nxt = await filler["job"]
+                talked = 0
+                while True:
+                    done, _ = await asyncio.wait({filler["job"]},
+                                                 timeout=TRIVIA_WAIT_SEC)
+                    if done:
+                        break
+                    yield next_trivia(talked == 0)
+                    talked += 1
+                nxt = filler["job"].result()
                 filler["first"] = nxt
+                if talked and nxt is not None:
+                    nxt = "お待たせ。" + nxt
                 if nxt is None:
                     return            # 本文が出なかった。答えは下の別経路で言う
                 if state.get("song") and NEGATIVE_SONG_RE.search(nxt):
