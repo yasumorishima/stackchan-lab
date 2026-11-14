@@ -5,3 +5,4 @@ test_sheet_bars.py
 test_team_song.py
 test_barge.py
 test_sing_e2e.py
+test_filler.py
