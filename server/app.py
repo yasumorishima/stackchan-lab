@@ -2483,6 +2483,17 @@ async def on_startup(app):
         log.info("local stt warmed up: %s", STT_BACKEND)
         app["stt_warm"] = asyncio.create_task(keep_stt_warm())
     app["yomi_warm"] = asyncio.create_task(warm_song_readings(app["http"]))
+    app["fuel_warm"] = asyncio.create_task(keep_fuel_fresh(app["http"]))
+
+
+async def keep_fuel_fresh(session):
+    """燃油サーチャージの表を裏で取っておく（先方は毎回 13〜15 秒）。1 時間ごとに見る"""
+    while True:
+        try:
+            await server_tools.refresh_fuel(session)
+        except Exception as e:
+            log.warning("燃油の先取りに失敗: %s: %s", type(e).__name__, e)
+        await asyncio.sleep(3600)
 
 
 async def warm_song_readings(session):
@@ -2519,8 +2530,9 @@ async def on_shutdown(app):
 
 
 async def on_cleanup(app):
-    if app.get("stt_warm"):
-        app["stt_warm"].cancel()
+    for k in ("stt_warm", "fuel_warm", "yomi_warm"):
+        if app.get(k):
+            app[k].cancel()
     await app["http"].close()
 
 
