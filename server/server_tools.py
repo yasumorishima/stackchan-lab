@@ -42,6 +42,7 @@ DEFAULT_PLACE = os.environ.get("WEATHER_PLACE", "横浜")
 CACHE_TTL = float(os.environ.get("WEATHER_CACHE_TTL", "600"))
 # 取得先が落ちている時に古い値で答える上限 [s]。これを超えたら黙って古い値を読まない
 STALE_MAX = float(os.environ.get("WEATHER_STALE_MAX", "21600"))
+FORECAST_TIMEOUT = float(os.environ.get("WEATHER_TIMEOUT", "4"))
 MAX_PLACE_LEN = 40      # LLM が返す引数は信用しない
 CACHE_MAX = 64
 
@@ -166,17 +167,23 @@ async def _forecast(session, lat: float, lon: float):
         "forecast_days": WEEK_DAYS,
     })
     last = ""
-    for attempt in range(3):
+    # 🔴 待たせすぎない。15 秒×3 回だと応答の無いときに 50 秒黙っていた
+    # （user 実機 2026-11-14「明日の天気、聞いたのに、すごい時間差」）。
+    # 普段は 1 秒かからない。1 回 4 秒まで、使える前の値があれば 1 回で諦めて前の値で答える
+    usable = hit and time.monotonic() - hit[0] <= STALE_MAX
+    for attempt in range(1 if usable else 2):
         if attempt:
-            await asyncio.sleep(0.6 * attempt)
+            await asyncio.sleep(0.3)
+        async def fetch():
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=FORECAST_TIMEOUT)) as r:
+                return r.status, await r.json()
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-                body = await r.json()
-                if r.status == 200:
-                    _forecast_cache[ck] = (time.monotonic(), body)
-                    _trim(_forecast_cache)
-                    return body, 0.0
-                last = "http %d %s" % (r.status, str(body)[:120])
+            status, body = await asyncio.wait_for(fetch(), FORECAST_TIMEOUT + 0.5)
+            if status == 200:
+                _forecast_cache[ck] = (time.monotonic(), body)
+                _trim(_forecast_cache)
+                return body, 0.0
+            last = "http %d %s" % (status, str(body)[:120])
         except Exception as e:
             last = "%s: %s" % (type(e).__name__, e)
         log.warning("open-meteo retry %d (%s)", attempt + 1, last)
