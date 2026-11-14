@@ -202,6 +202,17 @@ def worth_answering(text: str, last_spoke_age: float,
         return False
     if any(w in t for w in WAKE_WORDS):
         return True                       # 名前を呼ばれた＝話しかけ
+    if len(t) <= 1:
+        # 1 字（「あ」「お」「ど」）は言葉ではない。11 月の実ログ 65 件は全部
+        # 物音か言いかけで、返事が「どうしたのかな？」の独り言を呼んでいた
+        # （user 実機 2026-11-14「いつも不安定で、アレクサより使いづらい」）
+        return False
+    if (loudness < QUIET_RATIO and len(t) <= 2
+            and last_spoke_age <= FILLER_FOLLOWUP_SEC):
+        # 🔴 話した直後でも、小さな 2 字（「パパ」「あれ」「うん」）は周りの声。
+        # 返事 → 次の物音に返事、と独り言が続いていた（11-14 10:01）。
+        # 小さくても 3 字以上（「今日のニュース」1.2 倍）は話しかけとして通す
+        return False
     if loudness < QUIET_RATIO and last_spoke_age > FILLER_FOLLOWUP_SEC:
         # 🔴 遠くの小さな音の聞き違いに返事しない。周りの声が「これ」「現場」に
         # なり、前の話の続きとして歌い出したり本体の様子を話したりしていた
