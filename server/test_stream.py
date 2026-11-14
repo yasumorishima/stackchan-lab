@@ -78,6 +78,27 @@ async def main():
     parts = await drain("")
     check("空でも終わる", parts == [], repr(parts))
 
+    # 7) 表は句点が無くても 1 行ずつ読み始める・見出しと区切り行は読まない
+    #    （実機 2026-11-14「今日の株価」: 表が全部そろうまで 7 秒黙った）
+    table = ("今日の株価はこんな感じだよ：\n| 指数 | 終値 |\n|---|---|\n"
+             "| 日経平均 | 61,142円 |\n| ダウ | 52,348ドル |\n")
+    q = asyncio.Queue()
+    feed = app.SentenceFeed(q)
+    first = None
+    for i in range(0, len(table), 7):
+        await feed.add(table[i:i + 7])
+        if first is None and not q.empty():
+            first = i
+    await feed.close()
+    parts = [x async for x in app._aiter_queue(q)]
+    check("表は全部そろう前に読み始める", first is not None and first < len(table) - 20,
+          repr(first))
+    check("表の見出し・区切りは読まない",
+          not any("指数" in p or "---" in p or "|" in p for p in parts), repr(parts))
+    check("表の最後の行まで読む", any("ダウ" in p for p in parts), repr(parts))
+    parts = await drain("- 日経平均: 61,142円\n- ダウ: 52,348ドル")
+    check("箇条書きの最後の行も読む", any("ダウ" in p for p in parts), repr(parts))
+
 asyncio.run(main())
 print("")
 print("%d/%d" % (ok, ok + ng))

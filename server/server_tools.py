@@ -3173,4 +3173,19 @@ def has(name: str) -> bool:
 
 async def call(session, name: str, args: dict, ctx=None) -> str:
     """ctx = 呼び出しの文脈（発話・直前に調べた日）。無くても動く。"""
-    return await HANDLERS[name](session, args or {}, ctx)
+    if name in SLOW_OK:
+        return await HANDLERS[name](session, args or {}, ctx)
+    # 🔴 会話を待たせない。普段 1〜2 秒の取得が、先方の不調で 50 秒かかった
+    # （user 実機 2026-11-14「会話そんな時間かかるの」）。上限を超えたら謝って次へ
+    try:
+        return await asyncio.wait_for(HANDLERS[name](session, args or {}, ctx),
+                                      TOOL_MAX_SEC)
+    except asyncio.TimeoutError:
+        log.warning("tool %s: %.0f 秒で応答が無いので打ち切る", name, TOOL_MAX_SEC)
+        return "error: 調べる先が今は応答しません。少したってから聞いてください"
+
+
+TOOL_MAX_SEC = float(os.environ.get("TOOL_MAX_SEC", "8"))
+# 上限をかけない道具: 手元で計算する歌・MLB の表と、先方が毎回遅い燃油（実測 13〜15 秒・12 時間覚える）
+SLOW_OK = {"sing_cheer_song", "get_cheer_song", "ask_mlb_stats", "get_fuel_surcharge",
+           "get_llm_quota"}

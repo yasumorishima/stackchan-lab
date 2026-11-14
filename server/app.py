@@ -612,11 +612,34 @@ class SentenceFeed:
     async def add(self, delta: str):
         self.buf += delta
         while not self.closed:
-            m = re.search("[。．！？!?]", self.buf)
+            # 改行も文の切れ目にする。表や箇条書きには句点が無く、全部そろうまで
+            # 黙っていた（実機 2026-11-14「今日の株価」で 7 秒黙った）
+            m = re.search("[。．！？!?\n]", self.buf)
             if not m:
                 return
             s, self.buf = self.buf[:m.end()], self.buf[m.end():]
+            if s.endswith("\n"):
+                self.by_line = True
+                s = self._table_line(s.strip())
+                if not s:
+                    continue
             await self._emit(s)
+
+    def _table_line(self, line: str) -> str:
+        """表の 1 行を読める形にする。見出し行（次が --- の行）は読まない。"""
+        if "|" not in line:
+            head, self.head = getattr(self, "head", ""), ""
+            if not line:
+                return head + "。" if head else ""
+            return (head + "。" if head else "") + line
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
+            self.head = ""                    # 区切り行＝前の行は見出しだった
+            return ""
+        head, self.head = getattr(self, "head", ""), "、".join(c for c in cells if c)
+        if not head:
+            return ""                         # 次の行を見て見出しか決める
+        return head + "。"
 
     async def _emit(self, s: str):
         s = clean_reply(s)
@@ -639,7 +662,10 @@ class SentenceFeed:
         """流し終わり。言いかけの末尾を必要なら出して、終わりを知らせる。"""
         tail = self.buf.strip()
         self.buf = ""
-        if tail and not self.said and not self.closed:
+        if getattr(self, "by_line", False) and not self.closed:
+            # 行で区切って読んできた（表・箇条書き）なら最後の行も 1 行ぶん
+            tail = self._table_line(tail) + self._table_line("")
+        if tail and (not self.said or getattr(self, "by_line", False)) and not self.closed:
             await self._emit(tail)
         elif tail:
             log.info("言いかけの %d 字は読まない: %r", len(tail), tail[:40])
@@ -1399,7 +1425,7 @@ LIST_COLON_RE = re.compile("(?<=[" + _JA + "）)])[：:]" + _SP + "*")
 # 言い切りの後ろのコロンまで「〜は、」にすると「こんな感じですは、」に
 # なる（2026-08-03 の燃油サーチャージ全方面の再現で実測）。言い切りと
 # 閉じ括弧の後ろは句点にして、そこで文を閉じる
-DECL_END_RE = re.compile("(?:です|ます|でした|ました|だった|である|ですね|ますね)$")
+DECL_END_RE = re.compile("(?:です|ます|でした|ました|だった|である|ですね|ますね|だよ|だね|だよね|よ|ね)$")
 # 生成が固有名詞を書き崩すことがある（2026-08-03 実機の
 # 「ナスディック総合指数」「カンボジ国」）。読みでなく綴りの取り違えで、
 # 声にすると別の語に聞こえるので、聞いて分かる形に戻す
