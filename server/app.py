@@ -1703,6 +1703,11 @@ async def respond(session, history, tools=None, call_tool=None, feed=None):
                    "content": str(result)}
             msgs.append(out)
             trace.append(out)
+        if sang:
+            # 歌を用意できたら、もう一度モデルに聞かない（その本文は読まずに
+            # 「◯◯の応援歌を歌うね。」へ差し替えるので、往復の 1 秒が無駄だった。
+            # 実機 2026-11-09 18:02・user 2026-11-14「なんで調べないの？」）
+            return "", trace
     return "うまく答えられませんでした。", trace
 
 
@@ -2246,6 +2251,8 @@ async def ws_handler(request: web.Request):
                     reply = fix_reading("%sを歌うね。" % server_tools.song_label(
                         queued["name"]))
                     log.info("本文が無いので歌の一言に差し替えた")
+                elif not reply:
+                    reply = FALLBACK_REPLY
                 log.info("LLM: %s", reply)
                 await send_json({"type": "llm", "emotion": "happy",
                                  "text": "😀"})
@@ -2475,6 +2482,25 @@ async def on_startup(app):
         await asyncio.to_thread(local_stt.warmup, STT_BACKEND)
         log.info("local stt warmed up: %s", STT_BACKEND)
         app["stt_warm"] = asyncio.create_task(keep_stt_warm())
+    app["yomi_warm"] = asyncio.create_task(warm_song_readings(app["http"]))
+
+
+async def warm_song_readings(session):
+    """応援歌の見出しの読みを起動時に引いておく。
+
+    聞き違いの名前（「滝秀吾」）を読みで当てるとき、全選手の読みをその場で
+    1 人ずつ Open JTalk に聞いていて 5.3 秒黙った（実機 2026-11-09 18:02・
+    user 2026-11-14「なんで調べないの？」）。起動直後に裏で済ませておく
+    """
+    try:
+        t0 = time.monotonic()
+        songs = await server_tools._songs(session)
+        names = list(songs)
+        await asyncio.to_thread(lambda: [server_tools._yomi(n) for n in names])
+        log.info("応援歌の見出し %d 件の読みを先に引いた（%.1f 秒）",
+                 len(names), time.monotonic() - t0)
+    except Exception:
+        log.exception("応援歌の読みの先引きに失敗（聞かれた時に引く）")
 
 
 async def on_shutdown(app):

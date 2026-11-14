@@ -2508,6 +2508,9 @@ def _parse_songs(html: str) -> dict:
     return out
 
 
+_song_refresh = []
+
+
 async def _songs_fetch(session):
     async with session.get(SONG_URL, headers=NPB_UA,
                            timeout=aiohttp.ClientTimeout(total=15)) as r:
@@ -2523,6 +2526,17 @@ async def _songs(session):
     """取れない時は古い歌詞で答える（歌詞はめったに変わらない）。"""
     now = time.monotonic()
     if _song_cache and now - _song_cache[0][0] < SONG_TTL:
+        return _song_cache[0][1]
+    if _song_cache:
+        # 古くなっていても手元の歌詞ですぐ答え、取り直しは裏で（会話を待たせない。
+        # 公式ページは 15 秒待つことがある・user 2026-11-14）
+        if not _song_refresh or _song_refresh[0].done():
+            async def refresh():
+                try:
+                    await _songs_fetch(session)
+                except Exception as e:
+                    log.warning("cheer song refresh failed: %s: %s", type(e).__name__, e)
+            _song_refresh[:] = [asyncio.create_task(refresh())]
         return _song_cache[0][1]
     try:
         return await _songs_fetch(session)
