@@ -1631,6 +1631,24 @@ def _fuel_rows(table_html):
     return out
 
 
+async def refresh_fuel(session) -> None:
+    """燃油の表を前もって取っておく（先方は毎回 13〜15 秒かかる・実測）。
+
+    覚える期限の半分を過ぎたら取り直すので、聞かれた時は手元の表ですぐ答えられる
+    （user 2026-11-14「会話そんな時間かかるの」）
+    """
+    if _fuel_cache and time.monotonic() - _fuel_cache[0][0] < FUEL_CACHE_TTL / 2:
+        return
+    old = _fuel_cache[0] if _fuel_cache else None
+    if old:
+        _fuel_cache[0] = (old[0] - FUEL_CACHE_TTL, old[1])   # 期限切れに見せて取り直させる
+    try:
+        await get_fuel_surcharge(session, {}, None)
+    finally:
+        if old and _fuel_cache and _fuel_cache[0][1] is old[1]:
+            _fuel_cache[0] = old          # 取れなかった。時刻を戻す
+
+
 async def get_fuel_surcharge(session, args, ctx=None) -> str:
     dest = str((args or {}).get("destination") or "").strip()
     zone = ""
