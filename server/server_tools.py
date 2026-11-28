@@ -756,8 +756,11 @@ async def get_news(session, args, ctx=None) -> str:
             else:
                 return "error: いまニュースを取れませんでした（取得先が応答しません）"
     age = now - ts
-    stale = " ※%d分前の情報" % int(age / 60) if age > 900 else ""
-    return "主なニュースは、" + "、".join(titles[:NEWS_COUNT]) + "、以上です。" + stale
+    stale = "%d分前の情報です。" % int(age / 60) if age > 900 else ""
+    # この文はモデルを通さずそのまま読む（app.READ_AS_IS_TOOLS）。見出しごとに
+    # 文を切り、読み上げの切れ目で割り込みを聞けるようにする
+    return ("主なニュースです。" + "".join(
+        t.rstrip("。") + "。" for t in titles[:NEWS_COUNT]) + "以上です。" + stale)
 
 
 # ---- 地震情報（気象庁） ------------------------------------------------------

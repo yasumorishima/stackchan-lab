@@ -99,6 +99,37 @@ async def main():
     parts = await drain("- 日経平均: 61,142円\n- ダウ: 52,348ドル")
     check("箇条書きの最後の行も読む", any("ダウ" in p for p in parts), repr(parts))
 
+    # 8) ニュースはモデルに書き直させず、見出しをそのまま読む・もう一度聞かない
+    #    （実機 2026-11-28: 「ICC（国際刑事警察）」と言い換えて中身を作った）
+    news = "主なニュースです。警察 ICC赤根所長の安全確保。西武 高橋光成 1年契約で合意。以上です。"
+    asked = []
+
+    async def fake_chat(session, msgs, tools=None, on_delta=None, **kw):
+        asked.append(len(msgs))
+        return {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "get_news", "arguments": "{}"}}]}
+
+    async def fake_tool(name, args):
+        return news
+
+    real_chat, real_backend = app.sakura_chat, app.LLM_BACKEND
+    app.sakura_chat, app.LLM_BACKEND = fake_chat, "sakura"
+    try:
+        q = asyncio.Queue()
+        feed = app.SentenceFeed(q)
+        reply, _ = await app.respond(None, [{"role": "user", "content": "ニュース"}],
+                                     tools=[], call_tool=fake_tool, feed=feed)
+        await feed.close()
+        parts = [x async for x in app._aiter_queue(q)]
+    finally:
+        app.sakura_chat, app.LLM_BACKEND = real_chat, real_backend
+    check("ニュースはモデルにもう一度聞かない", len(asked) == 1, repr(asked))
+    check("ニュースの見出しをそのまま読む",
+          "ICC赤根所長" in "".join(parts) and "国際刑事" not in "".join(parts),
+          repr(parts))
+    check("見出しごとに文を切る", len(parts) >= 3, repr(parts))
+
 asyncio.run(main())
 print("")
 print("%d/%d" % (ok, ok + ng))
