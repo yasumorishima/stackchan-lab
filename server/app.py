@@ -1624,6 +1624,10 @@ def dedupe_sentences(parts):
 
 # 返ってきた言葉をそのまま読む道具。繰り返しを畳むと中身が壊れる
 VERBATIM_TOOLS = {"get_cheer_song"}
+# 結果をモデルに書き直させず、そのまま読んで答えにする道具。
+# ニュースの見出しを言い換えさせると中身を作った（実機 2026-11-28 09:40
+# 「ICC（国際刑事警察）」＝正しくは国際刑事裁判所）。もう一度聞く往復も省ける
+READ_AS_IS_TOOLS = {"get_news"}
 
 
 def shorten_reply(text: str, verbatim: bool = False) -> str:
@@ -1744,6 +1748,15 @@ async def respond(session, history, tools=None, call_tool=None, feed=None):
                    "content": str(result)}
             msgs.append(out)
             trace.append(out)
+        as_is = [str(t.get("content") or "") for t in trace[-len(calls):]]
+        if (all((c.get("function") or {}).get("name") in READ_AS_IS_TOOLS
+                for c in calls)
+                and not any(r.startswith("error") for r in as_is)):
+            text = "".join(as_is)
+            log.info("道具の結果をそのまま読む: %s", text[:60])
+            if feed is not None:
+                await feed.add(clean_reply(text) + "\n")
+            return shorten_reply(clean_reply(text), True), trace
         if sang:
             # 歌を用意できたら、もう一度モデルに聞かない（その本文は読まずに
             # 「◯◯の応援歌を歌うね。」へ差し替えるので、往復の 1 秒が無駄だった。
