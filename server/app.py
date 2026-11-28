@@ -644,6 +644,7 @@ class SentenceFeed:
         self.closed = False
 
     async def add(self, delta: str):
+        self.raw = getattr(self, "raw", "") + delta   # 再生試験（replay_log.py）用
         self.buf += delta
         while not self.closed:
             # 改行も文の切れ目にする。表や箇条書きには句点が無く、全部そろうまで
@@ -1559,7 +1560,8 @@ def drop_latin_heavy(text: str) -> str:
 _GARB = r"(?:[…‥\\\u200b\u200c\u200d\ufeff]|\.{2,})"
 DEGENERATE_RE = re.compile(_GARB + r"(?:\s*" + _GARB + r"){4,}")
 # 演出の「……」は 1 個に畳む。不可視文字とバックスラッシュは常に落とす
-INVISIBLE_RE = re.compile("[\u200b\u200c\u200d\ufeff\\\\]")
+# 制御文字（生成の末尾に NUL が付くことがある・実機 2026-11-28）も落とす
+INVISIBLE_RE = re.compile("[\u200b\u200c\u200d\ufeff\\\\\x00-\x08\x0b-\x1f\x7f]")
 ELLIPSIS_RUN_RE = re.compile(r"(?:[…‥]|\.{2,})(?:\s*(?:[…‥]|\.{2,}))+")
 
 
@@ -1582,6 +1584,11 @@ def clean_reply(text) -> str:
     # 壊れた生成（点線の羅列）は応答ごと捨てる。空になった応答は
     # 呼び出し側が FALLBACK_REPLY（もう一度お願いします）に置き換えて読む
     if DEGENERATE_RE.search(text):
+        return ""
+    # 文字化け（U+FFFD）の混じった文は読めない。Open JTalk が落ちて黙る間が空いた
+    # （実機 2026-11-28「今の主なニュースは… 譽�…」）。その文だけ捨てる
+    if "\ufffd" in text:
+        log.warning("文字化けの文は読まない: %r", text[:40])
         return ""
     text = INVISIBLE_RE.sub("", text)
     text = ELLIPSIS_RUN_RE.sub("…", text)
@@ -2290,6 +2297,9 @@ async def ws_handler(request: web.Request):
             if first is not None:
                 reply, trace = await task
                 log.info("LLM: %s", reply)
+                if not asked:
+                    # 流した生の本文（改行込み）。replay_log.py が今の版に流し直して比べる
+                    log.info("LLM 生: %r", getattr(feed, "raw", ""))
                 # モデルが「歌うね」と言いながら道具を呼ばないことがある
                 # （実測 16:14 / 16:28）。頼まれていたらこちらで呼ぶ
                 if song is None:
